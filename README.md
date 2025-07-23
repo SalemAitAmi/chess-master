@@ -1,8 +1,10 @@
 # Chess Master
 
-A chess application built with React
+A chess engine built with React.
 
 **Live Demo**: [https://salemaitami.github.io/chess-master/](https://salemaitami.github.io/chess-master/)
+
+[chess-master-img.png](https://postimg.cc/9zrMg4PY)
 
 ## Summary
 
