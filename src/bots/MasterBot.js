@@ -170,7 +170,6 @@ export class MasterBot extends BaseBotPlayer {
     }
   }
 
-  // ... rest of the MasterBot implementation remains the same ...
   findQuickTacticalWin(board, enPassantTarget, castlingRights, kingMoved, rookMoved) {
     const moves = this.getAllValidMoves(board, this.color, enPassantTarget, castlingRights, kingMoved, rookMoved);
     const orderedMoves = this.orderMovesAdvanced(moves, board, this.color, 0);
@@ -383,7 +382,6 @@ export class MasterBot extends BaseBotPlayer {
     });
   }
 
-  // ... rest of the evaluation methods remain the same ...
   evaluateBoard(board) {
     let score = 0;
     
