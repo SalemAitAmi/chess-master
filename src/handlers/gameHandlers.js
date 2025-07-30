@@ -60,13 +60,13 @@ export const createGameHandlers = (gameState) => {
     }
   };
 
-  const handleBotMove = (currentBoard, botColor) => {
+  const handleBotMove = async (currentBoard, botColor) => {
     if (!currentBot || botColor !== currentBot.color) return;
 
     setIsThinking(true);
     
-    setTimeout(() => {
-      const botMove = currentBot.selectMove(
+    try {
+      const botMove = await currentBot.selectMove(
         currentBoard,
         enPassantTarget,
         castlingRights,
@@ -107,6 +107,11 @@ export const createGameHandlers = (gameState) => {
         setSelected(null);
         setIsThinking(false);
 
+        // Track the bot's move for opening book
+        if (currentBot.trackMove) {
+          currentBot.trackMove(botMove);
+        }
+
         const opponentInCheck = isInCheck(newBoard, "white");
         const opponentHasMoves = hasValidMoves(
           "white",
@@ -120,11 +125,18 @@ export const createGameHandlers = (gameState) => {
         if (opponentInCheck && !opponentHasMoves) {
           setGameOver(true);
           setWinner(currentBot.name);
+        } else if (!opponentHasMoves) {
+          // Stalemate
+          setGameOver(true);
+          setWinner("Draw");
         }
       } else {
         setIsThinking(false);
       }
-    }, 500 + Math.random() * 1000);
+    } catch (error) {
+      console.error("Bot move error:", error);
+      setIsThinking(false);
+    }
   };
 
   const updateCastlingRights = (piece, fromRow, fromCol, color) => {
@@ -179,6 +191,7 @@ export const createGameHandlers = (gameState) => {
     const piece = board[row][col];
     const isWhiteTurn = turn === "white";
 
+    // If no piece is selected
     if (!selected) {
       if (
         piece &&
@@ -212,7 +225,45 @@ export const createGameHandlers = (gameState) => {
       return;
     }
 
+    // If a piece is already selected
     const { row: fromRow, col: fromCol, moves } = selected;
+    
+    // Check if clicking on another piece of the same color (single-click piece switch)
+    if (
+      piece &&
+      ((isWhiteTurn && isWhite(piece)) || (!isWhiteTurn && isBlack(piece))) &&
+      (row !== fromRow || col !== fromCol)
+    ) {
+      const moves = getValidMoves(
+        row,
+        col,
+        board,
+        true,
+        enPassantTarget,
+        castlingRights,
+        kingMoved,
+        rookMoved
+      ).filter(([toRow, toCol]) => {
+        const { board: simulatedBoard } = simulateMove(
+          row,
+          col,
+          toRow,
+          toCol,
+          board,
+          enPassantTarget
+        );
+        return !isInCheck(simulatedBoard, turn);
+      });
+
+      if (moves.length > 0) {
+        setSelected({ row, col, moves });
+      } else {
+        setSelected(null);
+      }
+      return;
+    }
+
+    // Check if it's a valid move
     const validMove = moves.some(([r, c]) => r === row && c === col);
 
     if (validMove) {
@@ -251,9 +302,10 @@ export const createGameHandlers = (gameState) => {
       setTurn(isWhiteTurn ? "black" : "white");
       setSelected(null);
 
-      // Track move for Master Bot's opening book
-      if (gameMode === 'bot' && currentBot.setLastOpponentMove) {
-        currentBot.setLastOpponentMove({ from: [fromRow, fromCol], to: [row, col] });
+      // Track move for bot's opening book
+      if (gameMode === 'bot' && currentBot.trackMove) {
+        const move = { from: [fromRow, fromCol], to: [row, col], piece: piece };
+        currentBot.trackMove(move);
       }
 
       const nextTurnColor = isWhiteTurn ? "black" : "white";
@@ -270,10 +322,15 @@ export const createGameHandlers = (gameState) => {
       if (opponentInCheck && !opponentHasMoves) {
         setGameOver(true);
         setWinner(isWhiteTurn ? "White" : "Black");
+      } else if (!opponentHasMoves) {
+        // Stalemate
+        setGameOver(true);
+        setWinner("Draw");
       } else if (gameMode === 'bot' && nextTurnColor === currentBot.color) {
         setTimeout(() => handleBotMove(newBoard, nextTurnColor), 500);
       }
     } else {
+      // Deselect if clicking elsewhere
       setSelected(null);
     }
   };
@@ -287,11 +344,25 @@ export const createGameHandlers = (gameState) => {
     }
   };
 
+  const handleRestart = () => {
+    if (currentBot && currentBot.reset) {
+      currentBot.reset();
+    }
+    resetGame();
+  };
+
+  const handleBackToMenu = () => {
+    if (currentBot && currentBot.reset) {
+      currentBot.reset();
+    }
+    resetToMenu();
+  };
+
   return {
     handleClick,
     handlePromotion,
     handleSurrender,
-    handleRestart: resetGame,
-    handleBackToMenu: resetToMenu,
+    handleRestart,
+    handleBackToMenu,
   };
 };

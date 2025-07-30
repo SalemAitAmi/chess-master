@@ -17,15 +17,27 @@ const ChessBoard = ({ board, selected, lastMove, onSquareClick }) => {
             ((lastMove.from[0] === r && lastMove.from[1] === c) ||
               (lastMove.to[0] === r && lastMove.to[1] === c));
 
+          // Determine square color priority
+          // 1. Selected piece (blue)
+          // 2. Valid move (green) - takes precedence over last move
+          // 3. Last move (yellow) - only if not a valid move
+          // 4. Default board color
+          let squareClass = (r + c) % 2 === 0 ? "bg-amber-100" : "bg-amber-700";
+          
+          if (isSelected) {
+            squareClass = "bg-blue-400 shadow-inner";
+          } else if (isValidMove) {
+            squareClass = "bg-green-400 shadow-inner";
+          } else if (isLastMove) {
+            squareClass = "bg-yellow-300 shadow-inner";
+          }
+
           return (
             <div
               key={`${r}-${c}`}
               className={`flex items-center justify-center w-[64px] h-[64px] cursor-pointer border border-gray-600
                 transition-all duration-200 ease-in-out
-                ${(r + c) % 2 === 0 ? "bg-amber-100" : "bg-amber-700"}
-                ${isSelected ? "bg-blue-400 shadow-inner" : ""}
-                ${isValidMove ? "bg-green-400 shadow-inner" : ""}
-                ${isLastMove ? "bg-yellow-300 shadow-inner" : ""}
+                ${squareClass}
                 hover:${isValidMove ? "bg-green-500" : "brightness-110"}`}
               onClick={() => onSquareClick(r, c)}
             >
