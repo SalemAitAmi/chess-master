@@ -1,8 +1,14 @@
-import React from "react";
-import { pieceIcons } from "../constants/gameConstants";
+import { pieceIcons, PIECES } from "../constants/gameConstants";
 
 const PromotionModal = ({ promotion, onPromotion }) => {
   if (!promotion) return null;
+
+  const promotionOptions = [
+    { type: PIECES.QUEEN, notation: 'q' },
+    { type: PIECES.ROOK, notation: 'r' },
+    { type: PIECES.BISHOP, notation: 'b' },
+    { type: PIECES.KNIGHT, notation: 'n' }
+  ];
 
   return (
     <div
@@ -14,21 +20,17 @@ const PromotionModal = ({ promotion, onPromotion }) => {
         Promote Pawn
       </div>
       <div className="flex gap-4">
-        {["q", "r", "b", "n"].map((pieceType) => (
+        {promotionOptions.map(({ type, notation }) => (
           <button
-            key={pieceType}
-            onClick={() => onPromotion(pieceType)}
+            key={type}
+            onClick={() => onPromotion(notation)}
             className="w-14 h-14 flex items-center justify-center bg-gray-800 
               rounded-lg hover:bg-gray-700 transition-all duration-200
               shadow-md hover:shadow-lg border border-gray-600"
           >
             <i
-              className={`fas ${pieceIcons[pieceType]} 
-                ${
-                  promotion.color === "w"
-                    ? "text-gray-100"
-                    : "text-gray-900"
-                } 
+              className={`fas ${pieceIcons[type]} 
+                ${promotion.color === "w" ? "text-gray-100" : "text-gray-900"} 
                 text-3xl drop-shadow-md`}
             />
           </button>

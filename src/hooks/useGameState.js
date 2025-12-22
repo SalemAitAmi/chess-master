@@ -1,78 +1,60 @@
 import { useState } from "react";
-import { 
-  initialBoard, 
-  initialCastlingRights, 
-  initialKingMoved, 
-  initialRookMoved 
-} from "../constants/gameConstants";
+import { Board } from "../utils/boardStructure";
 
 export const useGameState = () => {
-  const [board, setBoard] = useState(initialBoard);
+  const [boardObj, setBoardObj] = useState(() => new Board());
   const [selected, setSelected] = useState(null);
-  const [turn, setTurn] = useState("white");
   const [gameOver, setGameOver] = useState(false);
   const [winner, setWinner] = useState(null);
   const [lastMove, setLastMove] = useState(null);
-  const [enPassantTarget, setEnPassantTarget] = useState(null);
   const [promotion, setPromotion] = useState(null);
-  const [castlingRights, setCastlingRights] = useState(initialCastlingRights);
-  const [kingMoved, setKingMoved] = useState(initialKingMoved);
-  const [rookMoved, setRookMoved] = useState(initialRookMoved);
-  const [gameMode, setGameMode] = useState(null); // 'local', 'bot', 'online'
-  const [currentBot, setCurrentBot] = useState(null);
-  const [isThinking, setIsThinking] = useState(false);
+  const [gameMode, setGameMode] = useState(null);
+
+  // Compatibility getter
+  const turn = boardObj.gameState.active_color;
+
+  const setBoard = (newBoard) => {
+    if (newBoard instanceof Board) {
+      setBoardObj(newBoard);
+    } else {
+      console.error("setBoard requires a Board instance");
+    }
+  };
 
   const resetGame = () => {
-    setBoard(initialBoard);
+    setBoardObj(new Board());
     setSelected(null);
-    setTurn("white");
     setGameOver(false);
     setWinner(null);
     setLastMove(null);
-    setEnPassantTarget(null);
     setPromotion(null);
-    setCastlingRights(initialCastlingRights);
-    setKingMoved(initialKingMoved);
-    setRookMoved(initialRookMoved);
-    setIsThinking(false);
   };
 
   const resetToMenu = () => {
     resetGame();
     setGameMode(null);
-    setCurrentBot(null);
   };
 
+  const canUndo = () => boardObj.canUndo();
+
   return {
-    board,
+    boardObj,
     setBoard,
     selected,
     setSelected,
     turn,
-    setTurn,
     gameOver,
     setGameOver,
     winner,
     setWinner,
     lastMove,
     setLastMove,
-    enPassantTarget,
-    setEnPassantTarget,
     promotion,
     setPromotion,
-    castlingRights,
-    setCastlingRights,
-    kingMoved,
-    setKingMoved,
-    rookMoved,
-    setRookMoved,
     gameMode,
     setGameMode,
-    currentBot,
-    setCurrentBot,
-    isThinking,
-    setIsThinking,
     resetGame,
     resetToMenu,
+    canUndo,
   };
 };

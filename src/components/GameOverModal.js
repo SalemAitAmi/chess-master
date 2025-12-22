@@ -1,5 +1,3 @@
-import React from "react";
-
 const GameOverModal = ({ gameOver, winner, onRestart }) => {
   if (!gameOver) return null;
 

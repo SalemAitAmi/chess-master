@@ -1,368 +1,224 @@
-import { isWhite, isBlack } from "../utils/chessUtils";
+import { getPieceAt } from "../utils/chessUtils";
 import { getValidMoves, simulateMove, isInCheck, hasValidMoves } from "../utils/chessLogic";
+import { PIECES, SQUARE_NAMES } from "../constants/gameConstants";
+import { rowColToIndex, indexToRowCol } from "../utils/bitboard";
+import { HumanPlayer, ComputerPlayer } from '../players/Player';
 
 export const createGameHandlers = (gameState) => {
   const {
-    board,
+    boardObj,
     setBoard,
     selected,
     setSelected,
     turn,
     setTurn,
+    gameOver,
     setGameOver,
     setWinner,
     setLastMove,
-    enPassantTarget,
-    setEnPassantTarget,
     promotion,
     setPromotion,
-    castlingRights,
-    setCastlingRights,
-    kingMoved,
-    setKingMoved,
-    rookMoved,
-    setRookMoved,
     gameMode,
-    currentBot,
     setIsThinking,
     resetGame,
     resetToMenu,
+    playerColor,
   } = gameState;
+
+  // Initialize players based on game mode
+  let whitePlayer = null;
+  let blackPlayer = null;
+
+  const initializePlayers = () => {
+    if (gameMode === 'local') {
+      whitePlayer = new HumanPlayer("white", boardObj);
+      blackPlayer = new HumanPlayer("black", boardObj);
+    } else if (gameMode === 'vs-computer') {
+      if (playerColor === "white") {
+        whitePlayer = new HumanPlayer("white", boardObj);
+        blackPlayer = new ComputerPlayer("black", boardObj);
+      } else {
+        whitePlayer = new ComputerPlayer("white", boardObj);
+        blackPlayer = new HumanPlayer("black", boardObj);
+      }
+    }
+  };
+
+  // Call this when game mode is set
+  if (gameMode) {
+    initializePlayers();
+  }
 
   const handlePromotion = (pieceType) => {
     if (!promotion) return;
 
-    const newBoard = [...promotion.board];
-    const { row, col, color } = promotion;
-    newBoard[row][col] = `${color}${pieceType}`;
+    const { fromRow, fromCol, toRow, toCol, board: promotionBoard } = promotion;
+    const fromIndex = rowColToIndex(fromRow, fromCol);
+    const toIndex = rowColToIndex(toRow, toCol);
+    
+    // Map piece type character to PIECES constant
+    const pieceMap = {
+      'q': PIECES.QUEEN,
+      'r': PIECES.ROOK,
+      'b': PIECES.BISHOP,
+      'n': PIECES.KNIGHT
+    };
+    
+    const newBoard = promotionBoard.clone();
+    newBoard.makeMove(fromIndex, toIndex, pieceMap[pieceType]);
 
     setBoard(newBoard);
-    setTurn(color === "w" ? "black" : "white");
     setSelected(null);
     setPromotion(null);
 
-    const nextTurnColor = color === "w" ? "black" : "white";
+    const nextTurnColor = newBoard.gameState.active_color;
+    
     const opponentInCheck = isInCheck(newBoard, nextTurnColor);
-    const opponentHasMoves = hasValidMoves(
-      nextTurnColor,
-      newBoard,
-      enPassantTarget,
-      castlingRights,
-      kingMoved,
-      rookMoved
-    );
+    const opponentHasMoves = hasValidMoves(nextTurnColor, newBoard);
 
-    if (opponentInCheck && !opponentHasMoves) {
+    if (!opponentHasMoves) {
       setGameOver(true);
-      setWinner(color === "w" ? "White" : "Black");
-    } else if (gameMode === 'bot' && nextTurnColor === currentBot.color) {
-      setTimeout(() => handleBotMove(newBoard, nextTurnColor), 500);
-    }
-  };
-
-  const handleBotMove = async (currentBoard, botColor) => {
-    if (!currentBot || botColor !== currentBot.color) return;
-
-    setIsThinking(true);
-    
-    try {
-      const botMove = await currentBot.selectMove(
-        currentBoard,
-        enPassantTarget,
-        castlingRights,
-        kingMoved,
-        rookMoved
-      );
-
-      if (botMove) {
-        const [fromRow, fromCol] = botMove.from;
-        const [toRow, toCol] = botMove.to;
-        
-        const { board: newBoard, needsPromotion } = simulateMove(
-          fromRow,
-          fromCol,
-          toRow,
-          toCol,
-          currentBoard,
-          enPassantTarget
-        );
-
-        const piece = currentBoard[fromRow][fromCol];
-        
-        updateCastlingRights(piece, fromRow, fromCol, botColor);
-
-        if (needsPromotion) {
-          newBoard[toRow][toCol] = `${botColor[0]}q`;
-        }
-
-        if (piece[1] === "p" && Math.abs(fromRow - toRow) === 2) {
-          setEnPassantTarget([toRow + (isWhite(piece) ? 1 : -1), toCol]);
-        } else {
-          setEnPassantTarget(null);
-        }
-
-        setBoard(newBoard);
-        setLastMove({ from: [fromRow, fromCol], to: [toRow, toCol] });
-        setTurn("white");
-        setSelected(null);
-        setIsThinking(false);
-
-        // Track the bot's move for opening book
-        if (currentBot.trackMove) {
-          currentBot.trackMove(botMove);
-        }
-
-        const opponentInCheck = isInCheck(newBoard, "white");
-        const opponentHasMoves = hasValidMoves(
-          "white",
-          newBoard,
-          null,
-          castlingRights,
-          kingMoved,
-          rookMoved
-        );
-
-        if (opponentInCheck && !opponentHasMoves) {
-          setGameOver(true);
-          setWinner(currentBot.name);
-        } else if (!opponentHasMoves) {
-          // Stalemate
-          setGameOver(true);
-          setWinner("Draw");
-        }
+      if (opponentInCheck) {
+        setWinner(nextTurnColor === "white" ? "black" : "white");
       } else {
-        setIsThinking(false);
+        setWinner("draw");
       }
-    } catch (error) {
-      console.error("Bot move error:", error);
-      setIsThinking(false);
+    } else if (gameMode === "vs-computer" && 
+               ((nextTurnColor === "black" && playerColor === "white") ||
+                (nextTurnColor === "white" && playerColor === "black"))) {
+      setTimeout(makeComputerMove, 500);
     }
   };
 
-  const updateCastlingRights = (piece, fromRow, fromCol, color) => {
-    if (piece[1] === "k") {
-      setKingMoved((prev) => ({
-        ...prev,
-        [color]: true,
-      }));
-      setCastlingRights((prev) => ({
-        ...prev,
-        [color]: {
-          kingSide: false,
-          queenSide: false,
-        },
-      }));
-      console.log(`${color} king moved, castling rights removed`);
-    }
-    if (piece[1] === "r") {
-      const backRank = color === "white" ? 7 : 0;
-      if (fromRow === backRank) {
-        if (fromCol === 0) {
-          setRookMoved((prev) => ({
-            ...prev,
-            [color]: { ...prev[color], a1: color === "white", a8: color === "black" },
-          }));
-          setCastlingRights((prev) => ({
-            ...prev,
-            [color]: { ...prev[color], queenSide: false },
-          }));
-          console.log(`${color} queen-side rook moved, queen-side castling removed`);
-        }
-        if (fromCol === 7) {
-          setRookMoved((prev) => ({
-            ...prev,
-            [color]: { ...prev[color], h1: color === "white", h8: color === "black" },
-          }));
-          setCastlingRights((prev) => ({
-            ...prev,
-            [color]: { ...prev[color], kingSide: false },
-          }));
-          console.log(`${color} king-side rook moved, king-side castling removed`);
-        }
-      }
-    }
-  };
+  const makeMove = (fromRow, fromCol, toRow, toCol) => {
+    const piece = getPieceAt(boardObj, fromRow, fromCol);
+    if (!piece) return;
 
-  const handleClick = (row, col) => {
-    if (promotion) return;
-    
-    if (gameMode === 'bot' && turn === currentBot.color) return;
+    const currentColor = boardObj.gameState.active_color;
 
-    const piece = board[row][col];
-    const isWhiteTurn = turn === "white";
+    console.log(`Making move: ${SQUARE_NAMES[7-fromRow][fromCol]} to ${SQUARE_NAMES[7-toRow][toCol]}`);
 
-    // If no piece is selected
-    if (!selected) {
-      if (
-        piece &&
-        ((isWhiteTurn && isWhite(piece)) || (!isWhiteTurn && isBlack(piece)))
-      ) {
-        const moves = getValidMoves(
-          row,
-          col,
-          board,
-          true,
-          enPassantTarget,
-          castlingRights,
-          kingMoved,
-          rookMoved
-        ).filter(([toRow, toCol]) => {
-          const { board: simulatedBoard } = simulateMove(
-            row,
-            col,
-            toRow,
-            toCol,
-            board,
-            enPassantTarget
-          );
-          return !isInCheck(simulatedBoard, turn);
-        });
+    const result = simulateMove(fromRow, fromCol, toRow, toCol, boardObj);
 
-        if (moves.length > 0) {
-          setSelected({ row, col, moves });
-        }
-      }
-      return;
-    }
-
-    // If a piece is already selected
-    const { row: fromRow, col: fromCol, moves } = selected;
-    
-    // Check if clicking on another piece of the same color (single-click piece switch)
-    if (
-      piece &&
-      ((isWhiteTurn && isWhite(piece)) || (!isWhiteTurn && isBlack(piece))) &&
-      (row !== fromRow || col !== fromCol)
-    ) {
-      const moves = getValidMoves(
-        row,
-        col,
-        board,
-        true,
-        enPassantTarget,
-        castlingRights,
-        kingMoved,
-        rookMoved
-      ).filter(([toRow, toCol]) => {
-        const { board: simulatedBoard } = simulateMove(
-          row,
-          col,
-          toRow,
-          toCol,
-          board,
-          enPassantTarget
-        );
-        return !isInCheck(simulatedBoard, turn);
-      });
-
-      if (moves.length > 0) {
-        setSelected({ row, col, moves });
-      } else {
-        setSelected(null);
-      }
-      return;
-    }
-
-    // Check if it's a valid move
-    const validMove = moves.some(([r, c]) => r === row && c === col);
-
-    if (validMove) {
-      const { board: newBoard, needsPromotion } = simulateMove(
+    if (result.needsPromotion) {
+      setPromotion({
+        board: result.board,
         fromRow,
         fromCol,
-        row,
-        col,
-        board,
-        enPassantTarget
-      );
-      const piece = board[fromRow][fromCol];
-
-      updateCastlingRights(piece, fromRow, fromCol, isWhiteTurn ? "white" : "black");
-
-      if (needsPromotion) {
-        setPromotion({
-          board: newBoard,
-          row,
-          col,
-          color: isWhite(piece) ? "w" : "b",
-        });
-        setLastMove({ from: [fromRow, fromCol], to: [row, col] });
-        setEnPassantTarget(null);
-        return;
-      }
-
-      if (piece[1] === "p" && Math.abs(fromRow - row) === 2) {
-        setEnPassantTarget([row + (isWhite(piece) ? 1 : -1), col]);
-      } else {
-        setEnPassantTarget(null);
-      }
-
+        toRow,
+        toCol,
+        color: piece.color === "white" ? "w" : "b" // For the modal
+      });
+    } else {
+      const fromIndex = rowColToIndex(fromRow, fromCol);
+      const toIndex = rowColToIndex(toRow, toCol);
+      
+      const newBoard = boardObj.clone();
+      newBoard.makeMove(fromIndex, toIndex);
+      
       setBoard(newBoard);
-      setLastMove({ from: [fromRow, fromCol], to: [row, col] });
-      setTurn(isWhiteTurn ? "black" : "white");
+      setLastMove({ from: [fromRow, fromCol], to: [toRow, toCol] });
       setSelected(null);
 
-      // Track move for bot's opening book
-      if (gameMode === 'bot' && currentBot.trackMove) {
-        const move = { from: [fromRow, fromCol], to: [row, col], piece: piece };
-        currentBot.trackMove(move);
-      }
-
-      const nextTurnColor = isWhiteTurn ? "black" : "white";
+      // Check for checkmate or stalemate
+      const nextTurnColor = newBoard.gameState.active_color;
       const opponentInCheck = isInCheck(newBoard, nextTurnColor);
-      const opponentHasMoves = hasValidMoves(
-        nextTurnColor,
-        newBoard,
-        null,
-        castlingRights,
-        kingMoved,
-        rookMoved
-      );
+      const opponentHasMoves = hasValidMoves(nextTurnColor, newBoard);
 
-      if (opponentInCheck && !opponentHasMoves) {
+      if (!opponentHasMoves) {
         setGameOver(true);
-        setWinner(isWhiteTurn ? "White" : "Black");
-      } else if (!opponentHasMoves) {
-        // Stalemate
-        setGameOver(true);
-        setWinner("Draw");
-      } else if (gameMode === 'bot' && nextTurnColor === currentBot.color) {
-        setTimeout(() => handleBotMove(newBoard, nextTurnColor), 500);
+        if (opponentInCheck) {
+          setWinner(currentColor);
+        } else {
+          setWinner("draw");
+        }
+      } else if (gameMode === "vs-computer" && 
+                 ((nextTurnColor === "black" && playerColor === "white") ||
+                  (nextTurnColor === "white" && playerColor === "black"))) {
+        setTimeout(makeComputerMove, 500);
+      }
+    }
+  };
+
+  const makeComputerMove = async () => {
+    const computerPlayer = boardObj.gameState.active_color === "white" ? whitePlayer : blackPlayer;
+
+    if (!computerPlayer || !(computerPlayer instanceof ComputerPlayer)) return;
+    
+    setIsThinking(true);
+    computerPlayer.updateBoard(boardObj);
+    
+    const move = await computerPlayer.makeMove();
+    
+    if (move) {
+      makeMove(move.from[0], move.from[1], move.to[0], move.to[1]);
+    }
+    
+    setIsThinking(false);
+  };
+
+  const handleSquareClick = (row, col) => {
+    if (gameOver || promotion) return;
+    
+    const piece = getPieceAt(boardObj, row, col);
+    const currentColor = boardObj.gameState.active_color;
+
+    // In vs-computer mode, check if it's the human player's turn
+    if (gameMode === "vs-computer" && currentColor !== playerColor) return;
+
+    if (selected) {
+      const [selectedRow, selectedCol] = selected;
+      const selectedPiece = getPieceAt(boardObj, selectedRow, selectedCol);
+      
+      if (selectedPiece && selectedPiece.color === currentColor) {
+        const moves = getValidMoves(selectedRow, selectedCol, boardObj, true);
+        
+        const validMove = moves.find(([r, c]) => r === row && c === col);
+        
+        if (validMove) {
+          const result = simulateMove(selectedRow, selectedCol, row, col, boardObj);
+          
+          if (!isInCheck(result.board, currentColor)) {
+            makeMove(selectedRow, selectedCol, row, col);
+            return;
+          }
+        }
+      }
+      
+      if (piece && piece.color === currentColor) {
+        setSelected([row, col]);
+      } else {
+        setSelected(null);
       }
     } else {
-      // Deselect if clicking elsewhere
+      if (piece && piece.color === currentColor) {
+        setSelected([row, col]);
+      }
+    }
+  };
+
+  const handleUndo = () => {
+    if (boardObj.canUndo()) {
+      boardObj.undoMove();
+      setBoard(boardObj.clone()); // Force re-render
       setSelected(null);
+      
+      // Update last move display
+      const lastMove = boardObj.getLastMove();
+      if (lastMove) {
+        const fromRowCol = indexToRowCol(lastMove.from);
+        const toRowCol = indexToRowCol(lastMove.to);
+        setLastMove({ from: fromRowCol, to: toRowCol });
+      } else {
+        setLastMove(null);
+      }
     }
-  };
-
-  const handleSurrender = () => {
-    setGameOver(true);
-    if (gameMode === 'bot') {
-      setWinner(turn === "white" ? currentBot.name : "White");
-    } else {
-      setWinner(turn === "white" ? "Black" : "White");
-    }
-  };
-
-  const handleRestart = () => {
-    if (currentBot && currentBot.reset) {
-      currentBot.reset();
-    }
-    resetGame();
-  };
-
-  const handleBackToMenu = () => {
-    if (currentBot && currentBot.reset) {
-      currentBot.reset();
-    }
-    resetToMenu();
   };
 
   return {
-    handleClick,
+    handleSquareClick,
     handlePromotion,
-    handleSurrender,
-    handleRestart,
-    handleBackToMenu,
+    handleUndo,
+    initializePlayers,
   };
 };

@@ -1,357 +1,365 @@
-import { isWhite, isBlack, deepCopyBoard } from "./chessUtils";
+import { deepCopyBoard } from "./chessUtils";
+import { PIECES, CASTLING, PIECE_NAMES, SQUARE_NAMES } from '../constants/gameConstants';
+import { rowColToIndex, indexToRowCol, getPieceColor, colorToIndex } from './bitboard';
 
 export const isInCheck = (board, color) => {
-  let kingPos;
-  for (let r = 0; r < 8; r++) {
-    for (let c = 0; c < 8; c++) {
-      if (board[r][c] === `${color[0]}k`) {
-        kingPos = [r, c];
+  // Find king position
+  const colorIdx = colorToIndex(color);
+  const kingBB = board.bbPieces[colorIdx][PIECES.KING];
+  const kingSquare = kingBB.getLSB();
+  
+  if (kingSquare === -1) {
+    console.error("No king found!");
+    return false;
+  }
+  
+  const [kingRow, kingCol] = indexToRowCol(kingSquare);
+  const oppositeColor = color === "white" ? "black" : "white";
+  const oppositeColorIdx = colorToIndex(oppositeColor);
+  
+  // Check all opponent pieces
+  for (let pieceType = PIECES.KING; pieceType <= PIECES.PAWN; pieceType++) {
+    const pieceBB = board.bbPieces[oppositeColorIdx][pieceType].clone();
+    
+    while (!pieceBB.isEmpty()) {
+      const square = pieceBB.popLSB();
+      const [row, col] = indexToRowCol(square);
+      
+      // Get valid moves for this piece (without checking for castling to avoid recursion)
+      const moves = getValidMoves(row, col, board, false);
+      
+      // Check if any move attacks the king
+      if (moves.some(([mr, mc]) => mr === kingRow && mc === kingCol)) {
+        return true;
       }
     }
   }
-  for (let r = 0; r < 8; r++) {
-    for (let c = 0; c < 8; c++) {
-      if (
-        board[r][c] &&
-        (color === "white" ? isBlack(board[r][c]) : isWhite(board[r][c]))
-      ) {
-        if (
-          getValidMoves(r, c, board, false, null, {}, {}, {}).some(
-            ([mr, mc]) => mr === kingPos[0] && mc === kingPos[1]
-          )
-        ) {
+  
+  return false;
+};
+
+// Helper function to check if a square can be moved to
+const canMoveTo = (board, targetRow, targetCol, color) => {
+  if (targetRow < 0 || targetRow >= 8 || targetCol < 0 || targetCol >= 8) {
+    return false;
+  }
+  
+  const targetIndex = rowColToIndex(targetRow, targetCol);
+  const targetColor = getPieceColor(board.bbSide, targetIndex);
+  
+  // Can move to empty square or capture opponent piece
+  const oppositeColor = color === "white" ? "black" : "white";
+  return targetColor === null || targetColor === oppositeColor;
+};
+
+// Get valid pawn moves
+const getValidPawnMoves = (row, col, board, color) => {
+  const moves = [];
+  const oppositeColor = color === "white" ? "black" : "white";
+  const direction = color === "white" ? -1 : 1;
+  const startingRank = color === "white" ? 6 : 1;
+  const enPassantRank = color === "white" ? 3 : 4;
+  
+  // Forward moves
+  const oneSquareForward = row + direction;
+  if (oneSquareForward >= 0 && oneSquareForward < 8) {
+    const forwardIndex = rowColToIndex(oneSquareForward, col);
+    if (getPieceColor(board.bbSide, forwardIndex) === null) {
+      moves.push([oneSquareForward, col]);
+      
+      // Double push from starting position
+      if (row === startingRank) {
+        const twoSquaresForward = row + (2 * direction);
+        const doublePushIndex = rowColToIndex(twoSquaresForward, col);
+        if (getPieceColor(board.bbSide, doublePushIndex) === null) {
+          moves.push([twoSquaresForward, col]);
+        }
+      }
+    }
+  }
+  
+  // Diagonal captures
+  for (const dcol of [-1, 1]) {
+    const targetRow = row + direction;
+    const targetCol = col + dcol;
+    
+    if (targetRow >= 0 && targetRow < 8 && targetCol >= 0 && targetCol < 8) {
+      const targetIndex = rowColToIndex(targetRow, targetCol);
+      const targetColor = getPieceColor(board.bbSide, targetIndex);
+      
+      if (targetColor === oppositeColor) {
+        moves.push([targetRow, targetCol]);
+      }
+    }
+  }
+  
+  // En passant
+  if (row === enPassantRank && board.gameState.en_passant_sq !== -1) {
+    const [epRow, epCol] = indexToRowCol(board.gameState.en_passant_sq);
+    
+    // The en passant square is where the enemy pawn passed over
+    // We need to check if we're adjacent to the enemy pawn
+    if (Math.abs(epCol - col) === 1) {
+      // The enemy pawn is on the same rank as us
+      const enemyPawnIndex = rowColToIndex(row, epCol);
+      
+      // Verify there's an enemy pawn at the expected position
+      if (getPieceColor(board.bbSide, enemyPawnIndex) === oppositeColor &&
+          board.pieceList[enemyPawnIndex] === PIECES.PAWN) {
+        // We move diagonally forward to capture
+        const captureRow = row + direction;
+        moves.push([captureRow, epCol]);
+        console.log(`En passant move available: from ${SQUARE_NAMES[7-row][col]} to ${SQUARE_NAMES[7-captureRow][epCol]}`);
+      }
+    }
+  }
+  
+  return moves;
+};
+
+// Get valid rook moves
+const getValidRookMoves = (row, col, board, color) => {
+  const moves = [];
+  const directions = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+  const oppositeColor = color === "white" ? "black" : "white";
+  
+  for (const [dr, dc] of directions) {
+    let r = row + dr, c = col + dc;
+    while (r >= 0 && r < 8 && c >= 0 && c < 8) {
+      const targetIndex = rowColToIndex(r, c);
+      const targetColor = getPieceColor(board.bbSide, targetIndex);
+      
+      if (targetColor === null) {
+        moves.push([r, c]);
+      } else {
+        if (targetColor === oppositeColor) {
+          moves.push([r, c]);
+        }
+        break;
+      }
+      r += dr;
+      c += dc;
+    }
+  }
+  
+  return moves;
+};
+
+// Get valid knight moves
+const getValidKnightMoves = (row, col, board, color) => {
+  const moves = [];
+  const knightMoves = [
+    [2, 1], [2, -1], [-2, 1], [-2, -1],
+    [1, 2], [1, -2], [-1, 2], [-1, -2]
+  ];
+  
+  for (const [dr, dc] of knightMoves) {
+    const targetRow = row + dr;
+    const targetCol = col + dc;
+    
+    if (canMoveTo(board, targetRow, targetCol, color)) {
+      moves.push([targetRow, targetCol]);
+    }
+  }
+  
+  return moves;
+};
+
+// Get valid bishop moves
+const getValidBishopMoves = (row, col, board, color) => {
+  const moves = [];
+  const directions = [[1, 1], [1, -1], [-1, 1], [-1, -1]];
+  const oppositeColor = color === "white" ? "black" : "white";
+  
+  for (const [dr, dc] of directions) {
+    let r = row + dr, c = col + dc;
+    while (r >= 0 && r < 8 && c >= 0 && c < 8) {
+      const targetIndex = rowColToIndex(r, c);
+      const targetColor = getPieceColor(board.bbSide, targetIndex);
+      
+      if (targetColor === null) {
+        moves.push([r, c]);
+      } else {
+        if (targetColor === oppositeColor) {
+          moves.push([r, c]);
+        }
+        break;
+      }
+      r += dr;
+      c += dc;
+    }
+  }
+  
+  return moves;
+};
+
+// Get valid queen moves
+const getValidQueenMoves = (row, col, board, color) => {
+  // Queen moves like both rook and bishop
+  return [
+    ...getValidRookMoves(row, col, board, color),
+    ...getValidBishopMoves(row, col, board, color)
+  ];
+};
+
+// Get valid king moves
+const getValidKingMoves = (row, col, board, color, checkCastling = true) => {
+  const moves = [];
+  const kingMoves = [
+    [1, 0], [-1, 0], [0, 1], [0, -1],
+    [1, 1], [1, -1], [-1, 1], [-1, -1]
+  ];
+  
+  for (const [dr, dc] of kingMoves) {
+    const targetRow = row + dr;
+    const targetCol = col + dc;
+    
+    if (canMoveTo(board, targetRow, targetCol, color)) {
+      moves.push([targetRow, targetCol]);
+    }
+  }
+  
+  // Castling
+  if (checkCastling && board.gameState) {
+    const castling = board.gameState.castling;
+    const backRank = color === "white" ? 7 : 0;
+    
+    if (row === backRank && col === 4 && !isInCheck(board, color)) {
+      // King-side castling
+      const kingSideMask = color === "white" ? CASTLING.WHITE_KINGSIDE : CASTLING.BLACK_KINGSIDE;
+      if ((castling & kingSideMask) !== 0) {
+        // Check if path is clear
+        const f = rowColToIndex(backRank, 5);
+        const g = rowColToIndex(backRank, 6);
+        
+        if (!board.getOccupancy().getBit(f) && !board.getOccupancy().getBit(g)) {
+          // Check if squares king passes through are not under attack
+          const testBoard1 = deepCopyBoard(board);
+          const kingIndex = rowColToIndex(row, col);
+          testBoard1.makeMove(kingIndex, f);
+          
+          if (!isInCheck(testBoard1, color)) {
+            moves.push([backRank, 6]);
+          }
+        }
+      }
+      
+      // Queen-side castling
+      const queenSideMask = color === "white" ? CASTLING.WHITE_QUEENSIDE : CASTLING.BLACK_QUEENSIDE;
+      if ((castling & queenSideMask) !== 0) {
+        // Check if path is clear
+        const b = rowColToIndex(backRank, 1);
+        const c = rowColToIndex(backRank, 2);
+        const d = rowColToIndex(backRank, 3);
+        
+        if (!board.getOccupancy().getBit(b) && 
+            !board.getOccupancy().getBit(c) && 
+            !board.getOccupancy().getBit(d)) {
+          // Check if squares king passes through are not under attack
+          const testBoard1 = deepCopyBoard(board);
+          const kingIndex = rowColToIndex(row, col);
+          testBoard1.makeMove(kingIndex, d);
+          
+          if (!isInCheck(testBoard1, color)) {
+            moves.push([backRank, 2]);
+          }
+        }
+      }
+    }
+  }
+  
+  return moves;
+};
+
+// Main function to get valid moves - removed deprecated parameters
+export const getValidMoves = (row, col, board, checkCastling = true) => {
+  const index = rowColToIndex(row, col);
+  const piece = board.pieceList[index];
+  
+  if (piece === PIECES.NONE) {
+    return [];
+  }
+  
+  const color = getPieceColor(board.bbSide, index);
+  if (color === null) {
+    return [];
+  }
+  
+  console.log(`Getting valid moves for ${color} ${PIECE_NAMES[piece]} at ${SQUARE_NAMES[7-row][col]}`);
+  
+  let moves = [];
+  
+  switch (piece) {
+    case PIECES.PAWN:
+      moves = getValidPawnMoves(row, col, board, color);
+      break;
+      
+    case PIECES.ROOK:
+      moves = getValidRookMoves(row, col, board, color);
+      break;
+      
+    case PIECES.KNIGHT:
+      moves = getValidKnightMoves(row, col, board, color);
+      break;
+      
+    case PIECES.BISHOP:
+      moves = getValidBishopMoves(row, col, board, color);
+      break;
+      
+    case PIECES.QUEEN:
+      moves = getValidQueenMoves(row, col, board, color);
+      break;
+      
+    case PIECES.KING:
+      moves = getValidKingMoves(row, col, board, color, checkCastling);
+      break;
+  }
+  
+  return moves;
+};
+
+export const simulateMove = (fromRow, fromCol, toRow, toCol, board) => {
+  const newBoard = deepCopyBoard(board);
+  const fromIndex = rowColToIndex(fromRow, fromCol);
+  const toIndex = rowColToIndex(toRow, toCol);
+  const piece = newBoard.pieceList[fromIndex];
+  const color = getPieceColor(newBoard.bbSide, fromIndex);
+  
+  // Check for pawn promotion
+  if (piece === PIECES.PAWN && 
+      ((color === "white" && toRow === 0) || (color === "black" && toRow === 7))) {
+    return { board: newBoard, needsPromotion: true };
+  }
+  
+  // Make the move
+  newBoard.makeMove(fromIndex, toIndex);
+  
+  return { board: newBoard, needsPromotion: false };
+};
+
+export const hasValidMoves = (color, board) => {
+  const colorIdx = colorToIndex(color);
+  
+  // Check all pieces of the given color
+  for (let pieceType = PIECES.KING; pieceType <= PIECES.PAWN; pieceType++) {
+    const pieceBB = board.bbPieces[colorIdx][pieceType].clone();
+    
+    while (!pieceBB.isEmpty()) {
+      const square = pieceBB.popLSB();
+      const [row, col] = indexToRowCol(square);
+      
+      const moves = getValidMoves(row, col, board, true);
+      
+      // Check if any move is legal
+      for (const [toRow, toCol] of moves) {
+        const { board: simulatedBoard } = simulateMove(row, col, toRow, toCol, board);
+        
+        if (!isInCheck(simulatedBoard, color)) {
           return true;
         }
       }
     }
   }
-  return false;
-};
-
-export const getValidMoves = (
-  row,
-  col,
-  currentBoard,
-  checkCastling = true,
-  enPassantTarget,
-  castlingRights,
-  kingMoved,
-  rookMoved
-) => {
-  const piece = currentBoard[row][col];
-  if (!piece) return [];
-  const pieceType = piece[1];
-  const moves = [];
-
-  const addMove = (r, c) => {
-    if (r >= 0 && r < 8 && c >= 0 && c < 8) {
-      const target = currentBoard[r][c];
-      if (
-        !target ||
-        (isWhite(piece) && isBlack(target)) ||
-        (isBlack(piece) && isWhite(target))
-      ) {
-        moves.push([r, c]);
-      }
-    }
-  };
-
-  const addLineMoves = (dirs) => {
-    dirs.forEach(([dr, dc]) => {
-      let r = row + dr,
-        c = col + dc;
-      while (r >= 0 && r < 8 && c >= 0 && c < 8) {
-        const target = currentBoard[r][c];
-        if (!target) {
-          moves.push([r, c]);
-        } else {
-          if (
-            (isWhite(piece) && isBlack(target)) ||
-            (isBlack(piece) && isWhite(target))
-          ) {
-            moves.push([r, c]);
-          }
-          break;
-        }
-        r += dr;
-        c += dc;
-      }
-    });
-  };
-
-  switch (pieceType) {
-    case "p":
-      if (isWhite(piece)) {
-        if (row === 6 && !currentBoard[5][col] && !currentBoard[4][col])
-          moves.push([4, col]);
-        if (row > 0 && !currentBoard[row - 1][col])
-          moves.push([row - 1, col]);
-        if (row > 0 && col > 0 && isBlack(currentBoard[row - 1][col - 1]))
-          moves.push([row - 1, col - 1]);
-        if (row > 0 && col < 7 && isBlack(currentBoard[row - 1][col + 1]))
-          moves.push([row - 1, col + 1]);
-        // En passant
-        if (row === 3 && enPassantTarget) {
-          if (enPassantTarget[0] === 2 && enPassantTarget[1] === col - 1) {
-            moves.push([2, col - 1]);
-          }
-          if (enPassantTarget[0] === 2 && enPassantTarget[1] === col + 1) {
-            moves.push([2, col + 1]);
-          }
-        }
-      } else {
-        if (row === 1 && !currentBoard[2][col] && !currentBoard[3][col])
-          moves.push([3, col]);
-        if (row < 7 && !currentBoard[row + 1][col])
-          moves.push([row + 1, col]);
-        if (row < 7 && col > 0 && isWhite(currentBoard[row + 1][col - 1]))
-          moves.push([row + 1, col - 1]);
-        if (row < 7 && col < 7 && isWhite(currentBoard[row + 1][col + 1]))
-          moves.push([row + 1, col + 1]);
-        // En passant
-        if (row === 4 && enPassantTarget) {
-          if (enPassantTarget[0] === 5 && enPassantTarget[1] === col - 1) {
-            moves.push([5, col - 1]);
-          }
-          if (enPassantTarget[0] === 5 && enPassantTarget[1] === col + 1) {
-            moves.push([5, col + 1]);
-          }
-        }
-      }
-      break;
-    case "r":
-      addLineMoves([
-        [1, 0],
-        [-1, 0],
-        [0, 1],
-        [0, -1],
-      ]);
-      break;
-    case "n":
-      [
-        [2, 1],
-        [2, -1],
-        [-2, 1],
-        [-2, -1],
-        [1, 2],
-        [1, -2],
-        [-1, 2],
-        [-1, -2],
-      ].forEach(([dr, dc]) => addMove(row + dr, col + dc));
-      break;
-    case "b":
-      addLineMoves([
-        [1, 1],
-        [1, -1],
-        [-1, 1],
-        [-1, -1],
-      ]);
-      break;
-    case "q":
-      addLineMoves([
-        [1, 0],
-        [-1, 0],
-        [0, 1],
-        [0, -1],
-        [1, 1],
-        [1, -1],
-        [-1, 1],
-        [-1, -1],
-      ]);
-      break;
-    case "k":
-      [
-        [1, 0],
-        [-1, 0],
-        [0, 1],
-        [0, -1],
-        [1, 1],
-        [1, -1],
-        [-1, 1],
-        [-1, -1],
-      ].forEach(([dr, dc]) => addMove(row + dr, col + dc));
-
-      // Castling
-      if (checkCastling && castlingRights && kingMoved) {
-        const color = isWhite(piece) ? "white" : "black";
-        const backRank = isWhite(piece) ? 7 : 0;
-        
-        console.log(`Checking castling for ${color}:`, {
-          kingMoved: kingMoved[color],
-          castlingRights: castlingRights[color],
-          kingPosition: [row, col],
-          inCheck: isInCheck(currentBoard, color)
-        });
-
-        if (!kingMoved[color] && !isInCheck(currentBoard, color)) {
-          // King-side castling
-          if (
-            castlingRights[color] && 
-            castlingRights[color].kingSide &&
-            !currentBoard[backRank][5] &&
-            !currentBoard[backRank][6] &&
-            currentBoard[backRank][7] === `${color[0]}r`
-          ) {
-            console.log(`${color} king-side castling is structurally valid`);
-            
-            // Check if squares king passes through are not under attack
-            const testBoard1 = deepCopyBoard(currentBoard);
-            testBoard1[backRank][5] = piece;
-            testBoard1[backRank][4] = "";
-            
-            const testBoard2 = deepCopyBoard(currentBoard);
-            testBoard2[backRank][6] = piece;
-            testBoard2[backRank][4] = "";
-            
-            const square1Safe = !isInCheck(testBoard1, color);
-            const square2Safe = !isInCheck(testBoard2, color);
-            
-            console.log(`${color} king-side castling path safe:`, { square1Safe, square2Safe });
-            
-            if (square1Safe && square2Safe) {
-              moves.push([backRank, 6]);
-            }
-          }
-          
-          // Queen-side castling
-          if (
-            castlingRights[color] && 
-            castlingRights[color].queenSide &&
-            !currentBoard[backRank][1] &&
-            !currentBoard[backRank][2] &&
-            !currentBoard[backRank][3] &&
-            currentBoard[backRank][0] === `${color[0]}r`
-          ) {
-            console.log(`${color} queen-side castling is structurally valid`);
-            
-            // Check if squares king passes through are not under attack
-            const testBoard1 = deepCopyBoard(currentBoard);
-            testBoard1[backRank][3] = piece;
-            testBoard1[backRank][4] = "";
-            
-            const testBoard2 = deepCopyBoard(currentBoard);
-            testBoard2[backRank][2] = piece;
-            testBoard2[backRank][4] = "";
-            
-            const square1Safe = !isInCheck(testBoard1, color);
-            const square2Safe = !isInCheck(testBoard2, color);
-            
-            console.log(`${color} queen-side castling path safe:`, { square1Safe, square2Safe });
-            
-            if (square1Safe && square2Safe) {
-              moves.push([backRank, 2]);
-            }
-          }
-        }
-      }
-      break;
-  }
-  return moves;
-};
-
-export const simulateMove = (
-  fromRow,
-  fromCol,
-  toRow,
-  toCol,
-  currentBoard,
-  enPassantTarget
-) => {
-  const newBoard = deepCopyBoard(currentBoard);
-  const piece = newBoard[fromRow][fromCol];
-
-  // Handle en passant capture
-  if (piece[1] === "p" && enPassantTarget) {
-    if (
-      isWhite(piece) &&
-      toRow === 2 &&
-      toCol === enPassantTarget[1] &&
-      fromRow === 3
-    ) {
-      newBoard[3][toCol] = "";
-    }
-    if (
-      isBlack(piece) &&
-      toRow === 5 &&
-      toCol === enPassantTarget[1] &&
-      fromRow === 4
-    ) {
-      newBoard[4][toCol] = "";
-    }
-  }
-
-  // Handle castling
-  if (piece[1] === "k") {
-    const isWhiteKing = isWhite(piece);
-    const backRank = isWhiteKing ? 7 : 0;
-
-    // King-side castling
-    if (fromCol === 4 && toCol === 6) {
-      console.log(`Executing ${isWhiteKing ? 'white' : 'black'} king-side castling`);
-      newBoard[backRank][5] = newBoard[backRank][7];
-      newBoard[backRank][7] = "";
-    }
-    // Queen-side castling
-    if (fromCol === 4 && toCol === 2) {
-      console.log(`Executing ${isWhiteKing ? 'white' : 'black'} queen-side castling`);
-      newBoard[backRank][3] = newBoard[backRank][0];
-      newBoard[backRank][0] = "";
-    }
-  }
-
-  if (
-    piece[1] === "p" &&
-    ((isWhite(piece) && toRow === 0) || (isBlack(piece) && toRow === 7))
-  ) {
-    return { board: newBoard, needsPromotion: true };
-  }
-
-  newBoard[toRow][toCol] = piece;
-  newBoard[fromRow][fromCol] = "";
-  return { board: newBoard, needsPromotion: false };
-};
-
-export const hasValidMoves = (
-  color,
-  currentBoard,
-  enPassantTarget,
-  castlingRights,
-  kingMoved,
-  rookMoved
-) => {
-  for (let r = 0; r < 8; r++) {
-    for (let c = 0; c < 8; c++) {
-      const piece = currentBoard[r][c];
-      if (
-        piece &&
-        ((color === "white" && isWhite(piece)) ||
-          (color === "black" && isBlack(piece)))
-      ) {
-        const moves = getValidMoves(
-          r,
-          c,
-          currentBoard,
-          true,
-          enPassantTarget,
-          castlingRights,
-          kingMoved,
-          rookMoved
-        );
-        for (const [toRow, toCol] of moves) {
-          const { board: simulatedBoard } = simulateMove(
-            r,
-            c,
-            toRow,
-            toCol,
-            currentBoard,
-            enPassantTarget
-          );
-          if (!isInCheck(simulatedBoard, color)) {
-            return true;
-          }
-        }
-      }
-    }
-  }
+  
   return false;
 };
