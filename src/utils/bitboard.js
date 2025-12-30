@@ -1,4 +1,4 @@
-import { PIECES, WHITE_IDX, BLACK_IDX, SQUARE_NAMES, PIECE_NAMES } from '../constants/gameConstants';
+import { PIECES, WHITE_IDX, BLACK_IDX, SQUARE_NAMES } from '../constants/gameConstants';
 
 export function colorToIndex(color) {
   return color === "white" ? WHITE_IDX : BLACK_IDX;
@@ -38,7 +38,7 @@ export class BitBoard {
   // Check if bit is set at given square
   getBit(square) {
     if (square < 0 || square >= 64) {
-      console.error(`BitBoard.getBit: Invalid square ${square}`);
+      // console.error(`BitBoard.getBit: Invalid square ${square}`);
       return false;
     }
     if (square < 32) {
@@ -210,7 +210,7 @@ export function indexToRowCol(index) {
 
 // Initialize bitboards for starting position
 export function initializeBitboards() {
-  console.log("Initializing bitboards...");
+  // console.log("Initializing bitboards...");
   
   const bbPieces = {
     [WHITE_IDX]: {
@@ -271,7 +271,7 @@ export function initializeBitboards() {
 
 // Initialize piece list for starting position
 export function initializePieceList() {
-  console.log("Initializing piece list...");
+  // console.log("Initializing piece list...");
   const pieceList = new Array(64).fill(PIECES.NONE);
   
   // White pieces
@@ -303,12 +303,12 @@ export function initializePieceList() {
   }
   
   // Log piece positions with names
-  console.log("Piece list initialized. Non-empty squares:");
-  for (let i = 0; i < 64; i++) {
-    if (pieceList[i] !== PIECES.NONE) {
-      console.log(`Square ${i} (${indexToSquare(i)}): ${PIECE_NAMES[pieceList[i]]}`);
-    }
-  }
+  // console.log("Piece list initialized. Non-empty squares:");
+  // for (let i = 0; i < 64; i++) {
+  //   if (pieceList[i] !== PIECES.NONE) {
+  //     console.log(`Square ${i} (${indexToSquare(i)}): ${PIECE_NAMES[pieceList[i]]}`);
+  //   }
+  // }
   
   return pieceList;
 }
@@ -316,7 +316,7 @@ export function initializePieceList() {
 // Get color of piece at given square
 export function getPieceColor(bbSide, square) {
   if (square < 0 || square >= 64) {
-    console.error(`getPieceColor: Invalid square ${square}`);
+    // console.error(`getPieceColor: Invalid square ${square}`);
     return null;
   }
   if (bbSide[WHITE_IDX].getBit(square)) return "white";
@@ -327,7 +327,7 @@ export function getPieceColor(bbSide, square) {
 // Get piece type at given square
 export function getPieceAt(pieceList, square) {
   if (square < 0 || square >= 64) {
-    console.error(`getPieceAt: Invalid square ${square}`);
+    // console.error(`getPieceAt: Invalid square ${square}`);
     return PIECES.NONE;
   }
   return pieceList[square];

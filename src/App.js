@@ -4,21 +4,30 @@ import { createGameHandlers } from "./handlers/gameHandlers";
 import { isInCheck, getValidMoves, simulateMove } from "./utils/chessLogic";
 import { getPieceAt } from "./utils/chessUtils";
 import { SQUARE_NAMES } from "./constants/gameConstants";
+import { DIFFICULTY, downloadReport, downloadAllReports, getLatestReport } from "./players/BotPlayer";
 import ChessBoard from "./components/ChessBoard";
 import PromotionModal from "./components/PromotionModal";
 import GameOverModal from "./components/GameOverModal";
 import MainMenu from "./components/MainMenu";
 
+const DIFFICULTY_NAMES = {
+  [DIFFICULTY.ROOKIE]: 'Rookie',
+  [DIFFICULTY.CASUAL]: 'Casual',
+  [DIFFICULTY.STRATEGIC]: 'Strategic',
+  [DIFFICULTY.MASTER]: 'Master'
+};
+
 const ChessApp = () => {
   const gameState = useGameState();
   const [isThinking, setIsThinking] = useState(false);
   const [playerColor, setPlayerColor] = useState("white");
+  const [difficulty, setDifficulty] = useState(DIFFICULTY.CASUAL);
   const [gamesPlayed, setGamesPlayed] = useState(0);
+  const [playersInitialized, setPlayersInitialized] = useState(false);
   
   const {
     boardObj,
     selected,
-    setSelected,
     turn,
     gameOver,
     winner,
@@ -30,16 +39,20 @@ const ChessApp = () => {
     resetToMenu,
   } = gameState;
 
-  // Add isThinking and playerColor to gameState for handlers
-  const enhancedGameState = { ...gameState, setIsThinking, playerColor };
+  // Add isThinking, playerColor, and difficulty to gameState for handlers
+  const enhancedGameState = { ...gameState, setIsThinking, playerColor, difficulty };
 
-  const { handleSquareClick, handlePromotion, handleUndo, initializePlayers } = createGameHandlers(enhancedGameState);
+  const handlers = createGameHandlers(enhancedGameState);
+  const { handleSquareClick, handlePromotion, handleUndo, initializePlayers, resetPlayers, makeComputerMove } = handlers;
 
   // Calculate valid moves when a piece is selected
   const [selectedWithMoves, setSelectedWithMoves] = useState(null);
   
   // Use a ref to track the previous selected value
   const prevSelectedRef = useRef();
+  
+  // Track if initial bot move has been triggered
+  const initialBotMoveDone = useRef(false);
   
   useEffect(() => {
     // Only recalculate if selected actually changed
@@ -72,24 +85,38 @@ const ChessApp = () => {
     } else {
       setSelectedWithMoves(null);
     }
-  }, [selected, boardObj.gameState.active_color]);
+  }, [selected, boardObj.gameState.active_color, boardObj]);
 
   // Initialize players when game mode changes
   useEffect(() => {
-    if (gameMode && initializePlayers) {
+    if (gameMode) {
       initializePlayers();
+      setPlayersInitialized(true);
+      initialBotMoveDone.current = false;
+    } else {
+      resetPlayers();
+      setPlayersInitialized(false);
+      initialBotMoveDone.current = false;
     }
-  }, [gameMode, playerColor, initializePlayers]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gameMode, playerColor, difficulty]);
 
-  // Make computer move on game start if computer plays white
+  // Make computer move when it's bot's turn at game start
   useEffect(() => {
-    if (gameMode === 'vs-computer' && playerColor === "black" && turn === "white" && !gameOver) {
-      const handlers = createGameHandlers(enhancedGameState);
-      setTimeout(() => {
-        handlers.makeComputerMove?.();
-      }, 1000);
+    if (!gameMode || gameMode !== 'vs-computer' || !playersInitialized || gameOver) {
+      return;
     }
-  }, [gameMode, playerColor, turn]);
+    
+    // Bot plays first (player is black)
+    if (playerColor === "black" && turn === "white" && !initialBotMoveDone.current) {
+      initialBotMoveDone.current = true;
+      // Small delay to ensure everything is initialized
+      const timer = setTimeout(() => {
+        makeComputerMove();
+      }, 1000);
+      return () => clearTimeout(timer);
+    }
+  }, [gameMode, playerColor, turn, playersInitialized, gameOver, makeComputerMove]);
 
   // Show main menu if no game mode is selected
   if (!gameMode) {
@@ -100,14 +127,16 @@ const ChessApp = () => {
         }}
         playerColor={playerColor}
         setPlayerColor={setPlayerColor}
+        difficulty={difficulty}
+        setDifficulty={setDifficulty}
       />
     );
   }
 
   const handleSurrender = () => {
     // Set winner to the opponent
-    const winner = turn === "white" ? "black" : "white";
-    gameState.setWinner(winner);
+    const gameWinner = turn === "white" ? "black" : "white";
+    gameState.setWinner(gameWinner);
     gameState.setGameOver(true);
   };
 
@@ -117,10 +146,17 @@ const ChessApp = () => {
     if (gameMode === 'vs-computer') {
       setPlayerColor(prev => prev === "white" ? "black" : "white");
     }
+    initialBotMoveDone.current = false;
     resetGame();
   };
 
   const handleBackToMenu = () => {
+    // Reset everything when going back to menu
+    setGamesPlayed(0);
+    setPlayerColor("white");
+    setPlayersInitialized(false);
+    initialBotMoveDone.current = false;
+    resetPlayers();
     resetToMenu();
   };
 
@@ -154,7 +190,9 @@ const ChessApp = () => {
           Chess Game
         </h1>
         <div className="text-xl text-gray-300">
-          {gameMode === 'vs-computer' ? `Playing vs Computer as ${playerColor}` : 'Local Two Player'}
+          {gameMode === 'vs-computer' 
+            ? `Playing vs ${DIFFICULTY_NAMES[difficulty]} Bot as ${playerColor}` 
+            : 'Local Two Player'}
         </div>
         {gameMode === 'vs-computer' && gamesPlayed > 0 && (
           <div className="text-sm text-gray-400 mt-2">
@@ -166,7 +204,7 @@ const ChessApp = () => {
       <div className="mb-6 px-6 py-3 bg-gray-700 rounded-lg shadow-lg">
         <p className="text-xl font-semibold text-white">
           Current Turn:{" "}
-          <span className={`${turn === "white" ? "text-yellow-300" : "text-gray-800"}`}>
+          <span className={`${turn === "white" ? "text-yellow-300" : "text-gray-400"}`}>
             {turn === "white" ? "White" : "Black"}
           </span>
           {isInCheck(boardObj, boardObj.gameState.active_color) && (
@@ -180,7 +218,7 @@ const ChessApp = () => {
         )}
         {gameMode === 'vs-computer' && isThinking && (
           <p className="mt-2 text-gray-300 text-sm animate-pulse">
-            Computer is thinking...
+            {DIFFICULTY_NAMES[difficulty]} Bot is thinking...
           </p>
         )}
       </div>
@@ -206,8 +244,8 @@ const ChessApp = () => {
           <>
             <button
               onClick={handleUndo}
-              disabled={!boardObj.canUndo()}
-              className={`px-6 py-3 ${boardObj.canUndo() ? 'bg-blue-600 hover:bg-blue-700' : 'bg-gray-600 cursor-not-allowed'} 
+              disabled={!boardObj.canUndo() || isThinking}
+              className={`px-6 py-3 ${boardObj.canUndo() && !isThinking ? 'bg-blue-600 hover:bg-blue-700' : 'bg-gray-600 cursor-not-allowed'} 
                 text-white rounded-lg transition-all duration-200 shadow-md hover:shadow-lg text-lg font-semibold`}
             >
               Undo Move
@@ -215,14 +253,45 @@ const ChessApp = () => {
             
             <button
               onClick={handleSurrender}
-              className="px-6 py-3 bg-red-600 text-white rounded-lg hover:bg-red-700 
-                transition-all duration-200 shadow-md hover:shadow-lg text-lg font-semibold"
+              disabled={isThinking}
+              className={`px-6 py-3 ${isThinking ? 'bg-gray-600 cursor-not-allowed' : 'bg-red-600 hover:bg-red-700'} text-white rounded-lg 
+                transition-all duration-200 shadow-md hover:shadow-lg text-lg font-semibold`}
             >
               Surrender
             </button>
           </>
         )}
       </div>
+      
+      {/* Bot Analysis Download Buttons */}
+      {gameMode === 'vs-computer' && (
+        <div className="mt-4 flex gap-2">
+          <button
+            onClick={() => downloadReport('txt')}
+            disabled={!getLatestReport()}
+            className={`px-4 py-2 text-sm ${getLatestReport() ? 'bg-purple-600 hover:bg-purple-700' : 'bg-gray-600 cursor-not-allowed'} 
+              text-white rounded-lg transition-all duration-200 shadow-md`}
+          >
+            Download Last Decision (TXT)
+          </button>
+          <button
+            onClick={() => downloadReport('json')}
+            disabled={!getLatestReport()}
+            className={`px-4 py-2 text-sm ${getLatestReport() ? 'bg-purple-600 hover:bg-purple-700' : 'bg-gray-600 cursor-not-allowed'} 
+              text-white rounded-lg transition-all duration-200 shadow-md`}
+          >
+            Download Last Decision (JSON)
+          </button>
+          <button
+            onClick={() => downloadAllReports('txt')}
+            disabled={!getLatestReport()}
+            className={`px-4 py-2 text-sm ${getLatestReport() ? 'bg-indigo-600 hover:bg-indigo-700' : 'bg-gray-600 cursor-not-allowed'} 
+              text-white rounded-lg transition-all duration-200 shadow-md`}
+          >
+            Download All Decisions
+          </button>
+        </div>
+      )}
     </div>
   );
 };

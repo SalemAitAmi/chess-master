@@ -1,5 +1,5 @@
 import { deepCopyBoard } from "./chessUtils";
-import { PIECES, CASTLING, PIECE_NAMES, SQUARE_NAMES } from '../constants/gameConstants';
+import { PIECES, CASTLING } from '../constants/gameConstants';
 import { rowColToIndex, indexToRowCol, getPieceColor, colorToIndex } from './bitboard';
 
 export const isInCheck = (board, color) => {
@@ -9,7 +9,7 @@ export const isInCheck = (board, color) => {
   const kingSquare = kingBB.getLSB();
   
   if (kingSquare === -1) {
-    console.error("No king found!");
+    // console.error("No king found!");
     return false;
   }
   
@@ -95,7 +95,7 @@ const getValidPawnMoves = (row, col, board, color) => {
   
   // En passant
   if (row === enPassantRank && board.gameState.en_passant_sq !== -1) {
-    const [epRow, epCol] = indexToRowCol(board.gameState.en_passant_sq);
+    const [, epCol] = indexToRowCol(board.gameState.en_passant_sq);
     
     // The en passant square is where the enemy pawn passed over
     // We need to check if we're adjacent to the enemy pawn
@@ -109,7 +109,7 @@ const getValidPawnMoves = (row, col, board, color) => {
         // We move diagonally forward to capture
         const captureRow = row + direction;
         moves.push([captureRow, epCol]);
-        console.log(`En passant move available: from ${SQUARE_NAMES[7-row][col]} to ${SQUARE_NAMES[7-captureRow][epCol]}`);
+        // console.log(`En passant move available: from ${SQUARE_NAMES[7-row][col]} to ${SQUARE_NAMES[7-captureRow][epCol]}`);
       }
     }
   }
@@ -285,7 +285,7 @@ export const getValidMoves = (row, col, board, checkCastling = true) => {
     return [];
   }
   
-  console.log(`Getting valid moves for ${color} ${PIECE_NAMES[piece]} at ${SQUARE_NAMES[7-row][col]}`);
+  // console.log(`Getting valid moves for ${color} ${PIECE_NAMES[piece]} at ${SQUARE_NAMES[7-row][col]}`);
   
   let moves = [];
   
