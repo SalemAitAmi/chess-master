@@ -36,11 +36,29 @@ const DIFFICULTY_OPTIONS = [
   }
 ];
 
-const MainMenu = ({ onGameStart, playerColor, setPlayerColor, difficulty, setDifficulty }) => {
+const MainMenu = ({ 
+  onGameStart, 
+  playerColor, 
+  setPlayerColor, 
+  difficulty, 
+  setDifficulty,
+  onColosseumStart
+}) => {
   const [selectedMode, setSelectedMode] = useState(null);
+  const [whiteBot, setWhiteBot] = useState(DIFFICULTY.CASUAL);
+  const [blackBot, setBlackBot] = useState(DIFFICULTY.STRATEGIC);
+  const [maxRounds, setMaxRounds] = useState(1);
 
   const handleGameStart = () => {
-    if (selectedMode) {
+    if (selectedMode === 'colosseum') {
+      if (onColosseumStart) {
+        onColosseumStart({
+          whiteBot,
+          blackBot,
+          maxRounds
+        });
+      }
+    } else if (selectedMode) {
       onGameStart(selectedMode);
     }
   };
@@ -70,6 +88,20 @@ const MainMenu = ({ onGameStart, playerColor, setPlayerColor, difficulty, setDif
           >
             vs Computer
           </button>
+
+          <button
+            onClick={() => setSelectedMode('colosseum')}
+            className="px-8 py-4 bg-purple-600 text-white rounded-lg hover:bg-purple-700 
+              transition-all duration-200 shadow-lg hover:shadow-xl text-xl font-semibold
+              transform hover:scale-105"
+          >
+            <div className="flex items-center justify-center gap-2">
+              <span>⚔️</span>
+              <span>Colosseum</span>
+              <span>⚔️</span>
+            </div>
+            <div className="text-sm opacity-80 mt-1">Bot vs Bot</div>
+          </button>
           
           <button
             disabled
@@ -82,7 +114,9 @@ const MainMenu = ({ onGameStart, playerColor, setPlayerColor, difficulty, setDif
       ) : (
         <div className="flex flex-col gap-6 w-full max-w-2xl items-center px-4">
           <h2 className="text-3xl font-bold text-gray-100">
-            {selectedMode === 'local' ? 'Local Play' : 'Play vs Computer'}
+            {selectedMode === 'local' ? 'Local Play' : 
+             selectedMode === 'colosseum' ? '⚔️ Colosseum ⚔️' : 
+             'Play vs Computer'}
           </h2>
           
           {selectedMode === 'vs-computer' && (
@@ -140,6 +174,86 @@ const MainMenu = ({ onGameStart, playerColor, setPlayerColor, difficulty, setDif
               </div>
             </>
           )}
+
+          {selectedMode === 'colosseum' && (
+            <>
+              <p className="text-gray-400 text-center max-w-md">
+                Watch two bots battle it out! Select the difficulty for each side and the number of rounds to play.
+              </p>
+
+              {/* White Bot Selection */}
+              <div className="w-full">
+                <h3 className="text-xl font-semibold text-gray-300 mb-4 text-center">
+                  ⬜ White Bot
+                </h3>
+                <div className="grid grid-cols-2 gap-3">
+                  {DIFFICULTY_OPTIONS.map((option) => (
+                    <button
+                      key={`white-${option.level}`}
+                      onClick={() => setWhiteBot(option.level)}
+                      className={`p-3 rounded-lg font-semibold transition-all duration-200 text-left
+                        ${whiteBot === option.level 
+                          ? `${option.selectedColor} scale-105` 
+                          : `${option.color} text-white`}`}
+                    >
+                      <div className="flex justify-between items-center">
+                        <span>{option.name}</span>
+                        <span className="text-xs opacity-80">{option.elo}</span>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Black Bot Selection */}
+              <div className="w-full">
+                <h3 className="text-xl font-semibold text-gray-300 mb-4 text-center">
+                  ⬛ Black Bot
+                </h3>
+                <div className="grid grid-cols-2 gap-3">
+                  {DIFFICULTY_OPTIONS.map((option) => (
+                    <button
+                      key={`black-${option.level}`}
+                      onClick={() => setBlackBot(option.level)}
+                      className={`p-3 rounded-lg font-semibold transition-all duration-200 text-left
+                        ${blackBot === option.level 
+                          ? `${option.selectedColor} scale-105` 
+                          : `${option.color} text-white`}`}
+                    >
+                      <div className="flex justify-between items-center">
+                        <span>{option.name}</span>
+                        <span className="text-xs opacity-80">{option.elo}</span>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {/* Max Rounds Selection */}
+              <div className="w-full">
+                <h3 className="text-xl font-semibold text-gray-300 mb-4 text-center">
+                  Number of Rounds
+                </h3>
+                <div className="flex gap-3 justify-center flex-wrap">
+                  {[1, 3, 5, 10, 20].map((rounds) => (
+                    <button
+                      key={rounds}
+                      onClick={() => setMaxRounds(rounds)}
+                      className={`px-5 py-2 rounded-lg font-semibold transition-all duration-200
+                        ${maxRounds === rounds 
+                          ? "bg-purple-500 text-white shadow-lg scale-105" 
+                          : "bg-gray-600 text-gray-300 hover:bg-gray-500"}`}
+                    >
+                      {rounds}
+                    </button>
+                  ))}
+                </div>
+                <p className="text-gray-500 text-sm text-center mt-2">
+                  Colors will swap between rounds
+                </p>
+              </div>
+            </>
+          )}
           
           <div className="flex gap-4 mt-4">
             <button
@@ -147,7 +261,7 @@ const MainMenu = ({ onGameStart, playerColor, setPlayerColor, difficulty, setDif
               className="px-8 py-3 bg-green-600 text-white rounded-lg hover:bg-green-700 
                 transition-all duration-200 shadow-lg hover:shadow-xl text-lg font-semibold"
             >
-              Start Game
+              {selectedMode === 'colosseum' ? 'Start Battle' : 'Start Game'}
             </button>
             
             <button

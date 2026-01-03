@@ -2,6 +2,7 @@ import { Player } from './Player';
 import { PIECES, PIECE_NAMES } from '../constants/gameConstants';
 import { getValidMoves, simulateMove, isInCheck } from '../utils/chessLogic';
 import { indexToRowCol, colorToIndex, rowColToIndex } from '../utils/bitboard';
+import { boardToFen } from '../utils/chessUtils';
 import { Polyglot } from 'cm-polyglot/src/Polyglot.js';
 
 // =============================================================================
@@ -18,8 +19,9 @@ export const DIFFICULTY = {
 const DIFFICULTY_CONFIG = {
   [DIFFICULTY.ROOKIE]: {
     name: 'Rookie',
-    maxDepth: 2,
-    maxTime: 1000,
+    minDepth: 2,
+    maxDepth: 4,
+    maxTime: 15000,
     useQuiescence: false,
     quiescenceDepth: 0,
     useMoveOrdering: true,
@@ -32,6 +34,7 @@ const DIFFICULTY_CONFIG = {
     usePawnStructure: false,
     useKingSafety: false,
     useDevelopment: true,
+    usePawnPushBonus: true,
     blunderChance: 0.10,
     mistakeChance: 0.15,
     moveSelectionPool: 6,
@@ -39,8 +42,9 @@ const DIFFICULTY_CONFIG = {
   },
   [DIFFICULTY.CASUAL]: {
     name: 'Casual',
-    maxDepth: 3,
-    maxTime: 2000,
+    minDepth: 4,
+    maxDepth: 6,
+    maxTime: 15000,
     useQuiescence: true,
     quiescenceDepth: 3,
     useMoveOrdering: true,
@@ -53,6 +57,7 @@ const DIFFICULTY_CONFIG = {
     usePawnStructure: true,
     useKingSafety: false,
     useDevelopment: true,
+    usePawnPushBonus: true,
     blunderChance: 0.03,
     mistakeChance: 0.08,
     moveSelectionPool: 4,
@@ -60,8 +65,9 @@ const DIFFICULTY_CONFIG = {
   },
   [DIFFICULTY.STRATEGIC]: {
     name: 'Strategic',
-    maxDepth: 4,
-    maxTime: 3000,
+    minDepth: 6,
+    maxDepth: 8,
+    maxTime: 15000,
     useQuiescence: true,
     quiescenceDepth: 4,
     useMoveOrdering: true,
@@ -74,6 +80,7 @@ const DIFFICULTY_CONFIG = {
     usePawnStructure: true,
     useKingSafety: true,
     useDevelopment: true,
+    usePawnPushBonus: true,
     blunderChance: 0.0,
     mistakeChance: 0.02,
     moveSelectionPool: 3,
@@ -81,8 +88,9 @@ const DIFFICULTY_CONFIG = {
   },
   [DIFFICULTY.MASTER]: {
     name: 'Master',
-    maxDepth: 5,
-    maxTime: 5000,
+    minDepth: 8,
+    maxDepth: 10,
+    maxTime: 15000,
     useQuiescence: true,
     quiescenceDepth: 6,
     useMoveOrdering: true,
@@ -95,6 +103,7 @@ const DIFFICULTY_CONFIG = {
     usePawnStructure: true,
     useKingSafety: true,
     useDevelopment: true,
+    usePawnPushBonus: true,
     blunderChance: 0.0,
     mistakeChance: 0.0,
     moveSelectionPool: 1,
@@ -118,7 +127,7 @@ class DecisionReport {
     this.fen = null;
     this.moveNumber = 0;
     this.legalMoves = [];
-    this.openingBookAttempt = { tried: false, found: false, move: null };
+    this.openingBookAttempt = { tried: false, found: false, move: null, integratedIntoSearch: false };
     this.searchStats = {
       positionsEvaluated: 0,
       maxDepthReached: 0,
@@ -213,6 +222,7 @@ class DecisionReport {
     if (report.openingBook.move) {
       text += `Move: ${report.openingBook.move}\n`;
     }
+    text += `Integrated Into Search: ${report.openingBook.integratedIntoSearch}\n`;
     text += '\n';
     
     text += '─'.repeat(40) + '\n';
@@ -268,14 +278,19 @@ class DecisionReport {
 // Global report storage for download
 let latestReport = null;
 let reportHistory = [];
-const MAX_REPORT_HISTORY = 50;
+const MAX_REPORT_HISTORY = 100;
 
 export function getLatestReport() {
   return latestReport;
 }
 
 export function getReportHistory() {
-  return reportHistory;
+  return [...reportHistory];
+}
+
+export function clearReportHistory() {
+  reportHistory = [];
+  latestReport = null;
 }
 
 export function downloadReport(format = 'json') {
@@ -299,11 +314,21 @@ export function downloadReport(format = 'json') {
 export function downloadAllReports(format = 'json') {
   if (reportHistory.length === 0) return null;
   
+  // Sort reports by move number (first to last)
+  const sortedReports = [...reportHistory].sort((a, b) => {
+    const aReport = a.generateReport();
+    const bReport = b.generateReport();
+    // First sort by timestamp, then by move number
+    const timeCompare = new Date(aReport.meta.timestamp) - new Date(bReport.meta.timestamp);
+    if (timeCompare !== 0) return timeCompare;
+    return aReport.meta.moveNumber - bReport.meta.moveNumber;
+  });
+  
   let content;
   if (format === 'json') {
-    content = JSON.stringify(reportHistory.map(r => r.generateReport()), null, 2);
+    content = JSON.stringify(sortedReports.map(r => r.generateReport()), null, 2);
   } else {
-    content = reportHistory.map(r => r.toText()).join('\n\n');
+    content = sortedReports.map(r => r.toText()).join('\n\n');
   }
   
   const blob = new Blob([content], { type: format === 'json' ? 'application/json' : 'text/plain' });
@@ -671,16 +696,141 @@ class KingSafetyHeuristic extends EvaluationHeuristic {
   }
 }
 
+/**
+ * Pawn push bonus - encourages double pawn pushes in appropriate situations
+ */
+class PawnPushHeuristic extends EvaluationHeuristic {
+  constructor(weight = 1.0) {
+    super('PawnPush', weight);
+  }
+
+  evaluate(board, color, context) {
+    // This heuristic is applied during move ordering/selection, not static eval
+    this.lastScore = 0;
+    return 0;
+  }
+
+  /**
+   * Evaluate if a double pawn push is preferable
+   * @param {Object} move - The move object with from/to
+   * @param {Board} board - Current board state
+   * @param {string} color - The color making the move
+   * @returns {number} - Bonus score for this pawn push
+   */
+  evaluatePawnPush(move, board, color) {
+    if (move.piece !== PIECES.PAWN) return 0;
+    
+    const fromRow = move.from[0];
+    const toRow = move.to[0];
+    const col = move.from[1];
+    const colorIdx = colorToIndex(color);
+    const oppositeColorIdx = colorToIndex(color === 'white' ? 'black' : 'white');
+    
+    // Check if this is a double push
+    const isDoublePush = Math.abs(toRow - fromRow) === 2;
+    if (!isDoublePush) return 0;
+    
+    let bonus = 15; // Base bonus for double push - it's generally good
+    
+    // Extra bonus for central pawns (d and e files)
+    if (col === 3 || col === 4) {
+      bonus += 20;
+    }
+    
+    // Extra bonus for pawns attacking the center
+    if (col === 2 || col === 5) {
+      bonus += 10;
+    }
+    
+    // Check if the push would block a diagonal for our bishops
+    const bishopBB = board.bbPieces[colorIdx][PIECES.BISHOP].clone();
+    while (!bishopBB.isEmpty()) {
+      const bishopSquare = bishopBB.popLSB();
+      const [bishopRow, bishopCol] = indexToRowCol(bishopSquare);
+      
+      // Check if pawn would be directly in front of an undeveloped bishop
+      const backRank = color === 'white' ? 7 : 0;
+      if (bishopRow === backRank) {
+        // Bishop is still on back rank
+        const pawnInFront = (color === 'white' && toRow === 5) || (color === 'black' && toRow === 2);
+        if (pawnInFront && Math.abs(bishopCol - col) === 1) {
+          bonus -= 10; // Slight penalty for blocking undeveloped bishop's diagonal
+        }
+      }
+    }
+    
+    // Check if the push would block our own pieces' movement significantly
+    // E.g., blocking a knight's best outpost
+    // This is a simplified check - in reality we'd want more sophisticated analysis
+    
+    // Bonus for responding to King's Gambit (1.e4 e5 2.f4)
+    // If opponent pushed f-pawn, responding with d5 or exf4 is often good
+    const epSquare = board.gameState.en_passant_sq;
+    if (epSquare !== -1) {
+      // There's an en passant opportunity - the opponent just made a double push
+      // Our double push might be a good response
+      bonus += 5;
+    }
+    
+    // Check if we're answering opponent's center push
+    const opponentPawnBB = board.bbPieces[oppositeColorIdx][PIECES.PAWN];
+    const centralSquares = [
+      rowColToIndex(3, 3), rowColToIndex(3, 4), // d5, e5
+      rowColToIndex(4, 3), rowColToIndex(4, 4)  // d4, e4
+    ];
+    
+    let opponentControlsCenter = false;
+    for (const sq of centralSquares) {
+      if (opponentPawnBB.getBit(sq)) {
+        opponentControlsCenter = true;
+        break;
+      }
+    }
+    
+    // If opponent controls center, our central pawn push is more valuable
+    if (opponentControlsCenter && (col >= 2 && col <= 5)) {
+      bonus += 15;
+    }
+    
+    return bonus;
+  }
+}
+
 // =============================================================================
 // MOVE ORDERING
 // =============================================================================
+
+// Priority levels for move ordering
+const MOVE_PRIORITY = {
+  PROMOTION: 15000,         // Promotion is almost always best
+  WINNING_CAPTURE: 12000,   // Captures winning material
+  KILLER_MOVE: 10000,       // Killer moves from search
+  EQUAL_CAPTURE: 9000,      // Equal value captures
+  OPENING_BOOK: 8500,       // Opening book moves - good but below tactics
+  PAWN_DOUBLE_PUSH: 8000,   // Good double pawn pushes
+  LOSING_CAPTURE: 7000,     // Captures losing material
+  HISTORY: 0                // Added to base
+};
+
+// Maximum move number to query opening book (15 full moves = 30 half-moves)
+const MAX_OPENING_BOOK_MOVE = 15;
 
 class MVVLVAOrdering {
   getScore(move) {
     if (!move.capturedPiece) return 0;
     const victimValue = Player.PIECE_VALUES[move.capturedPiece] || 0;
     const attackerValue = Player.PIECE_VALUES[move.piece] || 0;
-    return 10000 + victimValue * 10 - attackerValue;
+    
+    // MVV-LVA: prioritize capturing valuable pieces with less valuable pieces
+    const captureScore = victimValue * 10 - attackerValue;
+    
+    if (captureScore > 0) {
+      return MOVE_PRIORITY.WINNING_CAPTURE + captureScore;
+    } else if (captureScore === 0) {
+      return MOVE_PRIORITY.EQUAL_CAPTURE;
+    } else {
+      return MOVE_PRIORITY.LOSING_CAPTURE + captureScore;
+    }
   }
 }
 
@@ -694,7 +844,7 @@ class KillerMoveOrdering {
     for (let i = 0; i < killers.length; i++) {
       const killer = killers[i];
       if (move.fromSquare === killer.fromSquare && move.toSquare === killer.toSquare) {
-        return 9000 - i * 100;
+        return MOVE_PRIORITY.KILLER_MOVE - i * 100;
       }
     }
     return 0;
@@ -765,55 +915,6 @@ async function loadOpeningBook() {
   return bookLoadPromise;
 }
 
-function boardToFen(board) {
-  let fen = '';
-  
-  for (let row = 0; row < 8; row++) {
-    let emptyCount = 0;
-    for (let col = 0; col < 8; col++) {
-      const square = rowColToIndex(row, col);
-      const piece = board.pieceList[square];
-      
-      if (piece === PIECES.NONE) {
-        emptyCount++;
-      } else {
-        if (emptyCount > 0) {
-          fen += emptyCount;
-          emptyCount = 0;
-        }
-        const colorIdx = board.bbSide[0].getBit(square) ? 0 : 1;
-        const pieceChar = ['K', 'Q', 'R', 'B', 'N', 'P'][piece];
-        fen += colorIdx === 0 ? pieceChar : pieceChar.toLowerCase();
-      }
-    }
-    if (emptyCount > 0) fen += emptyCount;
-    if (row < 7) fen += '/';
-  }
-  
-  fen += ' ' + (board.gameState.active_color === 'white' ? 'w' : 'b');
-  
-  let castling = '';
-  const CASTLING = { WHITE_KINGSIDE: 1, WHITE_QUEENSIDE: 2, BLACK_KINGSIDE: 4, BLACK_QUEENSIDE: 8 };
-  if (board.gameState.castling & CASTLING.WHITE_KINGSIDE) castling += 'K';
-  if (board.gameState.castling & CASTLING.WHITE_QUEENSIDE) castling += 'Q';
-  if (board.gameState.castling & CASTLING.BLACK_KINGSIDE) castling += 'k';
-  if (board.gameState.castling & CASTLING.BLACK_QUEENSIDE) castling += 'q';
-  fen += ' ' + (castling || '-');
-  
-  if (board.gameState.en_passant_sq !== -1) {
-    const file = String.fromCharCode('a'.charCodeAt(0) + (board.gameState.en_passant_sq % 8));
-    const rank = Math.floor(board.gameState.en_passant_sq / 8) + 1;
-    fen += ' ' + file + rank;
-  } else {
-    fen += ' -';
-  }
-  
-  fen += ' ' + board.gameState.half_move_clock;
-  fen += ' ' + board.gameState.full_move_count;
-  
-  return fen;
-}
-
 // =============================================================================
 // BOT PLAYER CLASS
 // =============================================================================
@@ -830,9 +931,13 @@ export class BotPlayer extends Player {
     this.maxDepthReached = 0;
     
     this.heuristics = this.initializeHeuristics();
+    this.pawnPushHeuristic = new PawnPushHeuristic();
     this.mvvlva = new MVVLVAOrdering();
     this.killerMoves = this.config.useKillerMoves ? new KillerMoveOrdering() : null;
     this.historyHeuristic = this.config.useHistoryHeuristic ? new HistoryHeuristic() : null;
+    
+    // Opening book move to prioritize
+    this.openingBookMove = null;
     
     this.report = new DecisionReport();
     
@@ -945,13 +1050,50 @@ export class BotPlayer extends Player {
     return moves;
   }
 
+  /**
+   * Check if a move matches the opening book move
+   */
+  isOpeningBookMove(move) {
+    if (!this.openingBookMove) return false;
+    return move.fromSquare === this.openingBookMove.fromSquare && 
+           move.toSquare === this.openingBookMove.toSquare;
+  }
+
   orderMoves(moves, ply) {
     const scored = moves.map(move => {
       let score = 0;
+      
+      // Opening book moves get highest priority
+      if (this.isOpeningBookMove(move)) {
+        score += MOVE_PRIORITY.OPENING_BOOK;
+      }
+      
+      // Capture scoring (MVV-LVA)
       score += this.mvvlva.getScore(move);
-      if (this.killerMoves) score += this.killerMoves.getScore(move, ply);
-      if (this.historyHeuristic) score += this.historyHeuristic.getScore(move);
-      if (move.isPromotion) score += 8000;
+      
+      // Killer moves
+      if (this.killerMoves) {
+        score += this.killerMoves.getScore(move, ply);
+      }
+      
+      // History heuristic
+      if (this.historyHeuristic) {
+        score += this.historyHeuristic.getScore(move);
+      }
+      
+      // Promotion bonus
+      if (move.isPromotion) {
+        score += MOVE_PRIORITY.PROMOTION;
+      }
+      
+      // Pawn double push bonus
+      if (this.config.usePawnPushBonus && move.piece === PIECES.PAWN) {
+        const pushBonus = this.pawnPushHeuristic.evaluatePawnPush(move, this.board, this.color);
+        if (pushBonus > 0) {
+          score += MOVE_PRIORITY.PAWN_DOUBLE_PUSH + pushBonus;
+        }
+      }
+      
       return { move, score };
     });
     
@@ -1012,19 +1154,36 @@ export class BotPlayer extends Player {
     this.positionCount++;
     this.maxDepthReached = Math.max(this.maxDepthReached, ply);
     
-    if (Date.now() - this.searchStartTime > this.config.maxTime) {
-      return { score: this.evaluate(board, color), move: null, timeout: true };
-    }
-    
     const oppositeColor = color === 'white' ? 'black' : 'white';
     const moves = this.getLegalMovesForColor(board, color);
     
+    // Check for terminal positions first (before timeout check)
     if (moves.length === 0) {
       if (isInCheck(board, color)) {
         const mateScore = 20000 - ply;
         return { score: color === this.color ? -mateScore : mateScore, move: null };
       }
       return { score: 0, move: null }; // Stalemate
+    }
+    
+    // Check timeout - but at root (ply=0) we must return a move
+    if (Date.now() - this.searchStartTime > this.config.maxTime) {
+      if (ply === 0) {
+        // At root, we MUST return a move - use the first ordered move with quick eval
+        const orderedMoves = this.orderMoves(moves, 0);
+        const firstMove = orderedMoves[0];
+        const { board: simBoard } = simulateMove(
+          firstMove.from[0], firstMove.from[1],
+          firstMove.to[0], firstMove.to[1],
+          board
+        );
+        return { 
+          score: this.evaluate(simBoard, this.color), 
+          move: firstMove, 
+          timeout: true 
+        };
+      }
+      return { score: this.evaluate(board, this.color), move: null, timeout: true };
     }
     
     if (depth === 0) {
@@ -1036,7 +1195,8 @@ export class BotPlayer extends Player {
     
     const orderedMoves = this.orderMoves(moves, ply);
     
-    let bestMove = null;
+    // Initialize bestMove to first move - ensures we always have a move at root
+    let bestMove = ply === 0 ? orderedMoves[0] : null;
     let bestScore = color === this.color ? -Infinity : Infinity;
     const isMaximizing = color === this.color;
     
@@ -1052,6 +1212,8 @@ export class BotPlayer extends Player {
       const result = this.minimax(newBoard, searchDepth, alpha, beta, oppositeColor, ply + 1);
       
       if (result.timeout) {
+        // On timeout, return whatever best move we've found so far
+        // At root level, bestMove is guaranteed non-null due to initialization above
         return { score: bestScore, move: bestMove, timeout: true };
       }
       
@@ -1087,12 +1249,20 @@ export class BotPlayer extends Player {
     let bestMove = null;
     let bestScore = this.color === 'white' ? -Infinity : Infinity;
     
-    for (let depth = 1; depth <= this.config.maxDepth; depth++) {
+    // Get legal moves for fallback - we need at least one move
+    const legalMoves = this.getLegalMovesForColor(board, this.color);
+    if (legalMoves.length === 0) {
+      return { score: 0, move: null };
+    }
+    
+    // Start from minDepth and go up to maxDepth
+    for (let depth = this.config.minDepth; depth <= this.config.maxDepth; depth++) {
       if (Date.now() - this.searchStartTime > this.config.maxTime * 0.7) break;
       
       const result = this.minimax(board, depth, -Infinity, Infinity, this.color);
       
-      if (!result.timeout && result.move) {
+      // Always update best move if we found one, even on timeout
+      if (result.move) {
         bestMove = result.move;
         bestScore = result.score;
         
@@ -1102,10 +1272,31 @@ export class BotPlayer extends Player {
       if (result.timeout) break;
     }
     
+    // If search didn't find a move (very rare - extreme time pressure), 
+    // fall back to first legal move rather than random
+    if (!bestMove && legalMoves.length > 0) {
+      // Use the ordered moves from our move ordering heuristics
+      const orderedMoves = this.orderMoves(legalMoves, 0);
+      bestMove = orderedMoves[0];
+      // Quick evaluation for the score
+      const { board: simBoard } = simulateMove(
+        bestMove.from[0], bestMove.from[1], 
+        bestMove.to[0], bestMove.to[1], 
+        board
+      );
+      bestScore = this.evaluate(simBoard, this.color);
+    }
+    
     return { score: bestScore, move: bestMove };
   }
 
-  async getOpeningBookMove(board, moves) {
+  async lookupOpeningBookMove(board, moves) {
+    // Don't query opening book after 15 full moves
+    const moveNumber = Math.floor(board.history.moves.length / 2) + 1;
+    if (moveNumber > MAX_OPENING_BOOK_MOVE) {
+      return null;
+    }
+    
     if (!this.config.useOpeningBook || !polyglotBook) {
       return null;
     }
@@ -1199,21 +1390,18 @@ export class BotPlayer extends Player {
     if (moves.length === 1) {
       this.report.selectedMove = this.report.formatMove(moves[0]);
       this.report.finalMove = this.report.formatMove(moves[0]);
-      latestReport = this.report;
-      reportHistory.push(this.report);
-      if (reportHistory.length > MAX_REPORT_HISTORY) reportHistory.shift();
+      this.storeReport();
       return { from: moves[0].from, to: moves[0].to };
     }
     
-    // Try opening book
-    const bookMove = await this.getOpeningBookMove(this.board, moves);
+    // Look up opening book move (but don't use it directly)
+    const bookMove = await this.lookupOpeningBookMove(this.board, moves);
     if (bookMove) {
-      this.report.selectedMove = this.report.formatMove(bookMove);
-      this.report.finalMove = this.report.formatMove(bookMove);
-      latestReport = this.report;
-      reportHistory.push(this.report);
-      if (reportHistory.length > MAX_REPORT_HISTORY) reportHistory.shift();
-      return { from: bookMove.from, to: bookMove.to };
+      // Store for move ordering priority
+      this.openingBookMove = bookMove;
+      this.report.openingBookAttempt.integratedIntoSearch = true;
+    } else {
+      this.openingBookMove = null;
     }
     
     // Reset search state
@@ -1238,31 +1426,48 @@ export class BotPlayer extends Player {
       positionsEvaluated: this.positionCount,
       maxDepthReached: this.maxDepthReached,
       timeSpentMs: timeElapsed,
-      nodesPerSecond: Math.round(this.positionCount / (timeElapsed / 1000))
+      nodesPerSecond: timeElapsed > 0 ? Math.round(this.positionCount / (timeElapsed / 1000)) : 0
     };
     
     let selectedMove = result.move;
     this.report.selectedMove = this.report.formatMove(selectedMove);
     this.report.selectedMoveScore = result.score;
     
-    // Apply imperfection
+    // Apply imperfection (only if we have a valid move from search)
     if (selectedMove && (this.config.blunderChance > 0 || this.config.mistakeChance > 0)) {
       selectedMove = this.applyImperfection(moves, selectedMove);
     }
     
-    // Fallback
+    // Fallback - should never happen now, but keep as safety net
     if (!selectedMove) {
-      selectedMove = moves[Math.floor(Math.random() * moves.length)];
+      console.warn('BotPlayer: Search returned no move, using first ordered move as fallback');
+      const orderedMoves = this.orderMoves(moves, 0);
+      selectedMove = orderedMoves[0];
     }
     
     this.report.finalMove = this.report.formatMove(selectedMove);
     
     // Store report
-    latestReport = this.report;
-    reportHistory.push(this.report);
-    if (reportHistory.length > MAX_REPORT_HISTORY) reportHistory.shift();
+    this.storeReport();
+    
+    // Clear opening book move for next turn
+    this.openingBookMove = null;
     
     return { from: selectedMove.from, to: selectedMove.to };
+  }
+
+  storeReport() {
+    // Create a copy of the report to store
+    const reportCopy = new DecisionReport();
+    Object.assign(reportCopy, this.report);
+    reportCopy.moveEvaluations = [...this.report.moveEvaluations];
+    reportCopy.openingBookAttempt = { ...this.report.openingBookAttempt };
+    reportCopy.searchStats = { ...this.report.searchStats };
+    reportCopy.imperfectionApplied = { ...this.report.imperfectionApplied };
+    
+    latestReport = reportCopy;
+    reportHistory.push(reportCopy);
+    if (reportHistory.length > MAX_REPORT_HISTORY) reportHistory.shift();
   }
 
   setDifficulty(difficulty) {
