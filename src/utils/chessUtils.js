@@ -1,5 +1,5 @@
-import { PIECES, CASTLING } from '../constants/gameConstants';
-import { getPieceColor, rowColToIndex, indexToRowCol } from './bitboard';
+import { PIECES, CASTLING } from '../constants/gameConstants.js';
+import { getPieceColor, rowColToIndex, indexToRowCol } from './bitboard.js';
 
 // Deep copy board (now returns a cloned Board object)
 export const deepCopyBoard = (board) => {

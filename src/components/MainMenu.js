@@ -5,6 +5,7 @@ const DIFFICULTY_OPTIONS = [
   {
     level: DIFFICULTY.ROOKIE,
     name: 'Rookie',
+    id: 'rookie',
     description: 'Just learning the ropes',
     elo: '~600',
     color: 'bg-green-600 hover:bg-green-700',
@@ -13,6 +14,7 @@ const DIFFICULTY_OPTIONS = [
   {
     level: DIFFICULTY.CASUAL,
     name: 'Casual',
+    id: 'casual',
     description: 'Knows the basics well',
     elo: '~1200',
     color: 'bg-yellow-600 hover:bg-yellow-700',
@@ -21,6 +23,7 @@ const DIFFICULTY_OPTIONS = [
   {
     level: DIFFICULTY.STRATEGIC,
     name: 'Strategic',
+    id: 'strategic',
     description: 'Thinks ahead strategically',
     elo: '~1800',
     color: 'bg-orange-600 hover:bg-orange-700',
@@ -29,12 +32,15 @@ const DIFFICULTY_OPTIONS = [
   {
     level: DIFFICULTY.MASTER,
     name: 'Master',
+    id: 'master',
     description: 'A formidable opponent',
     elo: '~2400',
     color: 'bg-red-600 hover:bg-red-700',
     selectedColor: 'bg-red-500 ring-2 ring-red-300'
   }
 ];
+
+const ROUND_OPTIONS = [1, 3, 5, 10, 20];
 
 const MainMenu = ({ 
   onGameStart, 
@@ -46,7 +52,7 @@ const MainMenu = ({
 }) => {
   const [selectedMode, setSelectedMode] = useState(null);
   const [whiteBot, setWhiteBot] = useState(DIFFICULTY.CASUAL);
-  const [blackBot, setBlackBot] = useState(DIFFICULTY.STRATEGIC);
+  const [blackBot, setBlackBot] = useState(DIFFICULTY.CASUAL);
   const [maxRounds, setMaxRounds] = useState(1);
 
   const handleGameStart = () => {
@@ -72,6 +78,7 @@ const MainMenu = ({
       {!selectedMode ? (
         <div className="flex flex-col gap-6 w-80">
           <button
+            id="local-play-button"
             onClick={() => setSelectedMode('local')}
             className="px-8 py-4 bg-blue-600 text-white rounded-lg hover:bg-blue-700 
               transition-all duration-200 shadow-lg hover:shadow-xl text-xl font-semibold
@@ -81,6 +88,7 @@ const MainMenu = ({
           </button>
           
           <button
+            id="vs-computer-button"
             onClick={() => setSelectedMode('vs-computer')}
             className="px-8 py-4 bg-green-600 text-white rounded-lg hover:bg-green-700 
               transition-all duration-200 shadow-lg hover:shadow-xl text-xl font-semibold
@@ -90,6 +98,7 @@ const MainMenu = ({
           </button>
 
           <button
+            id="colosseum-button"
             onClick={() => setSelectedMode('colosseum')}
             className="px-8 py-4 bg-purple-600 text-white rounded-lg hover:bg-purple-700 
               transition-all duration-200 shadow-lg hover:shadow-xl text-xl font-semibold
@@ -104,6 +113,7 @@ const MainMenu = ({
           </button>
           
           <button
+            id="online-play-button"
             disabled
             className="px-8 py-4 bg-gray-600 text-gray-400 rounded-lg cursor-not-allowed
               text-xl font-semibold opacity-50"
@@ -112,7 +122,7 @@ const MainMenu = ({
           </button>
         </div>
       ) : (
-        <div className="flex flex-col gap-6 w-full max-w-2xl items-center px-4">
+        <div id="colosseum-config" className="flex flex-col gap-6 w-full max-w-2xl items-center px-4">
           <h2 className="text-3xl font-bold text-gray-100">
             {selectedMode === 'local' ? 'Local Play' : 
              selectedMode === 'colosseum' ? '⚔️ Colosseum ⚔️' : 
@@ -128,6 +138,7 @@ const MainMenu = ({
                 </h3>
                 <div className="flex gap-4 justify-center">
                   <button
+                    id="player-color-white"
                     onClick={() => setPlayerColor("white")}
                     className={`px-6 py-3 rounded-lg font-semibold transition-all duration-200
                       ${playerColor === "white" 
@@ -137,6 +148,7 @@ const MainMenu = ({
                     Play as White
                   </button>
                   <button
+                    id="player-color-black"
                     onClick={() => setPlayerColor("black")}
                     className={`px-6 py-3 rounded-lg font-semibold transition-all duration-200
                       ${playerColor === "black" 
@@ -157,6 +169,7 @@ const MainMenu = ({
                   {DIFFICULTY_OPTIONS.map((option) => (
                     <button
                       key={option.level}
+                      id={`difficulty-${option.id}`}
                       onClick={() => setDifficulty(option.level)}
                       className={`p-4 rounded-lg font-semibold transition-all duration-200 text-left
                         ${difficulty === option.level 
@@ -183,13 +196,14 @@ const MainMenu = ({
 
               {/* White Bot Selection */}
               <div className="w-full">
-                <h3 className="text-xl font-semibold text-gray-300 mb-4 text-center">
+                <h3 id="white-bot-label" className="text-xl font-semibold text-gray-300 mb-4 text-center">
                   ⬜ White Bot
                 </h3>
                 <div className="grid grid-cols-2 gap-3">
                   {DIFFICULTY_OPTIONS.map((option) => (
                     <button
                       key={`white-${option.level}`}
+                      id={`white-bot-${option.id}`}
                       onClick={() => setWhiteBot(option.level)}
                       className={`p-3 rounded-lg font-semibold transition-all duration-200 text-left
                         ${whiteBot === option.level 
@@ -207,13 +221,14 @@ const MainMenu = ({
 
               {/* Black Bot Selection */}
               <div className="w-full">
-                <h3 className="text-xl font-semibold text-gray-300 mb-4 text-center">
+                <h3 id="black-bot-label" className="text-xl font-semibold text-gray-300 mb-4 text-center">
                   ⬛ Black Bot
                 </h3>
                 <div className="grid grid-cols-2 gap-3">
                   {DIFFICULTY_OPTIONS.map((option) => (
                     <button
                       key={`black-${option.level}`}
+                      id={`black-bot-${option.id}`}
                       onClick={() => setBlackBot(option.level)}
                       className={`p-3 rounded-lg font-semibold transition-all duration-200 text-left
                         ${blackBot === option.level 
@@ -231,13 +246,14 @@ const MainMenu = ({
 
               {/* Max Rounds Selection */}
               <div className="w-full">
-                <h3 className="text-xl font-semibold text-gray-300 mb-4 text-center">
+                <h3 id="rounds-label" className="text-xl font-semibold text-gray-300 mb-4 text-center">
                   Number of Rounds
                 </h3>
                 <div className="flex gap-3 justify-center flex-wrap">
-                  {[1, 3, 5, 10, 20].map((rounds) => (
+                  {ROUND_OPTIONS.map((rounds) => (
                     <button
                       key={rounds}
+                      id={`rounds-${rounds}`}
                       onClick={() => setMaxRounds(rounds)}
                       className={`px-5 py-2 rounded-lg font-semibold transition-all duration-200
                         ${maxRounds === rounds 
@@ -257,6 +273,7 @@ const MainMenu = ({
           
           <div className="flex gap-4 mt-4">
             <button
+              id="start-battle-button"
               onClick={handleGameStart}
               className="px-8 py-3 bg-green-600 text-white rounded-lg hover:bg-green-700 
                 transition-all duration-200 shadow-lg hover:shadow-xl text-lg font-semibold"
@@ -265,6 +282,7 @@ const MainMenu = ({
             </button>
             
             <button
+              id="back-button"
               onClick={() => setSelectedMode(null)}
               className="px-8 py-3 bg-gray-600 text-white rounded-lg hover:bg-gray-700 
                 transition-all duration-200 shadow-lg hover:shadow-xl text-lg font-semibold"

@@ -78,12 +78,6 @@ The bot generates detailed decision reports for every move, including:
 
 ## Scripts
 
-### Colosseum CLI
-Run bot matches programmatically:
-```bash
-node scripts/colosseum-runner.mjs --white=casual --black=master --rounds=5
-```
-
 ### Decision Analyzer (Python)
 Analyze bot decision JSON files to identify heuristic issues:
 ```bash

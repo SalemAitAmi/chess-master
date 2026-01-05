@@ -1,4 +1,4 @@
-import { PIECES, WHITE_IDX, BLACK_IDX, SQUARE_NAMES } from '../constants/gameConstants';
+import { PIECES, WHITE_IDX, BLACK_IDX, SQUARE_NAMES } from '../constants/gameConstants.js';
 
 export function colorToIndex(color) {
   return color === "white" ? WHITE_IDX : BLACK_IDX;

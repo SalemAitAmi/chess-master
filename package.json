@@ -21,7 +21,9 @@
     "stop": "taskkill -F -IM node.exe",
     "build": "react-scripts build",
     "test": "react-scripts test",
-    "eject": "react-scripts eject"
+    "eject": "react-scripts eject",
+    "colosseum": "node scripts/colosseum-cli.mjs",
+    "colosseum:install": "npx playwright install"
   },
   "eslintConfig": {
     "extends": [
@@ -42,6 +44,7 @@
     ]
   },
   "devDependencies": {
-    "gh-pages": "^6.3.0"
+    "gh-pages": "^6.3.0",
+    "@playwright/test": "^1.40.0"
   }
 }

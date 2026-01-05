@@ -351,25 +351,40 @@ const ChessApp = () => {
     const draws = colosseumResults.filter(r => r.winner === 'draw').length;
     
     return (
-      <div className="mt-4 p-4 bg-gray-700 rounded-lg max-w-md">
+      <div id="colosseum-summary" className="mt-4 p-4 bg-gray-700 rounded-lg max-w-md">
         <h3 className="text-lg font-bold text-white mb-2">Match Results</h3>
         <div className="grid grid-cols-3 gap-4 text-center mb-3">
           <div>
-            <div className="text-2xl font-bold text-yellow-300">{whiteWins}</div>
+            <div id="colosseum-white-wins" className="text-2xl font-bold text-yellow-300">
+              {whiteWins}
+            </div>
             <div className="text-sm text-gray-400">White Wins</div>
           </div>
           <div>
-            <div className="text-2xl font-bold text-gray-400">{draws}</div>
+            <div id="colosseum-draws" className="text-2xl font-bold text-gray-400">
+              {draws}
+            </div>
             <div className="text-sm text-gray-400">Draws</div>
           </div>
           <div>
-            <div className="text-2xl font-bold text-gray-300">{blackWins}</div>
+            <div id="colosseum-black-wins" className="text-2xl font-bold text-gray-300">
+              {blackWins}
+            </div>
             <div className="text-sm text-gray-400">Black Wins</div>
           </div>
         </div>
-        <div className="text-xs text-gray-500 max-h-32 overflow-y-auto">
+        
+        {/* Hidden elements for Playwright to read current state */}
+        <span id="colosseum-current-round" className="hidden">
+          {currentRound + 1}
+        </span>
+        <span id="colosseum-max-rounds" className="hidden">
+          {colosseumConfig?.maxRounds || 0}
+        </span>
+        
+        <div id="colosseum-round-history" className="text-xs text-gray-500 max-h-32 overflow-y-auto">
           {colosseumResults.map((r, i) => (
-            <div key={i} className="py-1 border-b border-gray-600">
+            <div key={i} id={`round-result-${i + 1}`} className="py-1 border-b border-gray-600">
               Round {r.round}: {r.winner === 'draw' ? 'Draw' : `${r.winner} wins`} ({r.moves} moves)
             </div>
           ))}

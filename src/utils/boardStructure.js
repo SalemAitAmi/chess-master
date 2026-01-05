@@ -1,5 +1,5 @@
-import { CASTLING, PIECES, PIECE_NAMES, ZOBRIST_SEEDS } from '../constants/gameConstants';
-import { initializeBitboards, initializePieceList, squareToIndex, indexToSquare, getPieceColor, colorToIndex } from './bitboard';
+import { CASTLING, PIECES, PIECE_NAMES, ZOBRIST_SEEDS } from '../constants/gameConstants.js';
+import { initializeBitboards, initializePieceList, squareToIndex, indexToSquare, getPieceColor, colorToIndex } from './bitboard.js';
 
 // GameState object definition
 export class GameState {
@@ -62,7 +62,7 @@ export class History {
 // Main Board object
 export class Board {
   constructor() {
-    console.log("Creating new Board...");
+    //console.log("Creating new Board...");
     
     // Initialize bitboards
     const { bbPieces, bbSide } = initializeBitboards();
@@ -81,7 +81,7 @@ export class Board {
     // Calculate initial Zobrist key
     this.gameState.zobrist_key = this.zobristInit(this.gameState);
     
-    console.log("Board created successfully");
+    //console.log("Board created successfully");
   }
 
   // Initialize Zobrist hash from scratch (only called when zobrist_key is 0)
@@ -156,7 +156,7 @@ export class Board {
 
   // Make a move on the board
   makeMove(fromSquare, toSquare, promotionPiece = null) {
-    console.log(`Board.makeMove: ${indexToSquare(fromSquare)} -> ${indexToSquare(toSquare)}, promotion: ${promotionPiece ? PIECE_NAMES[promotionPiece] : 'none'}`);
+    //console.log(`Board.makeMove: ${indexToSquare(fromSquare)} -> ${indexToSquare(toSquare)}, promotion: ${promotionPiece ? PIECE_NAMES[promotionPiece] : 'none'}`);
     
     // Validate squares
     if (fromSquare < 0 || fromSquare >= 64 || toSquare < 0 || toSquare >= 64) {
@@ -189,7 +189,7 @@ export class Board {
     const movingColor = this.gameState.active_color;
     const oppositeColor = movingColor === "white" ? "black" : "white";
     
-    console.log(`Moving ${PIECE_NAMES[movingPiece]} (${movingColor}) from ${indexToSquare(fromSquare)} to ${indexToSquare(toSquare)}`);
+    //console.log(`Moving ${PIECE_NAMES[movingPiece]} (${movingColor}) from ${indexToSquare(fromSquare)} to ${indexToSquare(toSquare)}`);
     
     // Store the previous en passant square and castling rights for Zobrist updates
     const previousEnPassantSq = this.gameState.en_passant_sq;
@@ -208,7 +208,7 @@ export class Board {
 
     // Handle capture
     if (capturedPiece !==PIECES.NONE) {
-      console.log(`Capturing ${PIECE_NAMES[capturedPiece]} at ${indexToSquare(toSquare)}`);
+      //console.log(`Capturing ${PIECE_NAMES[capturedPiece]} at ${indexToSquare(toSquare)}`);
       
       // Zobrist: Remove captured piece
       this.gameState.zobrist_key ^= ZOBRIST_SEEDS.pieces[oppositeColorIdx][capturedPiece][toSquare];
@@ -241,7 +241,7 @@ export class Board {
           
           if (this.pieceList[captureSquare] === PIECES.PAWN && 
               getPieceColor(this.bbSide, captureSquare) === oppositeColor) {
-            console.log(`En passant capture: capturing pawn at square ${captureSquare} (${indexToSquare(captureSquare)})`);
+            //console.log(`En passant capture: capturing pawn at square ${captureSquare} (${indexToSquare(captureSquare)})`);
             
             // Zobrist: Remove captured en passant pawn
             this.gameState.zobrist_key ^= ZOBRIST_SEEDS.pieces[oppositeColorIdx][PIECES.PAWN][captureSquare];
@@ -264,13 +264,13 @@ export class Board {
       
       if (rankDiff === 2) {
         this.gameState.en_passant_sq = movingColor === "white" ? toSquare + 8 : toSquare - 8;
-        console.log(`En passant square set to ${this.gameState.en_passant_sq} (${indexToSquare(this.gameState.en_passant_sq)})`);
+        //console.log(`En passant square set to ${this.gameState.en_passant_sq} (${indexToSquare(this.gameState.en_passant_sq)})`);
       }
       
       // Promotion
       if ((movingColor === "white" && toRank === 7) || (movingColor === "black" && toRank === 0)) {
         finalPiece = promotionPiece || PIECES.QUEEN;
-        console.log(`Pawn promoted to ${PIECE_NAMES[finalPiece]}`);
+        //console.log(`Pawn promoted to ${PIECE_NAMES[finalPiece]}`);
       }
     } else {
       // Non-pawn move - clear en passant square
@@ -294,7 +294,7 @@ export class Board {
           // Kingside castling
           const rookFrom = rank * 8 + 7;
           const rookTo = rank * 8 + 5;
-          console.log(`Kingside castling: moving rook from ${rookFrom} to ${rookTo}`);
+          //console.log(`Kingside castling: moving rook from ${rookFrom} to ${rookTo}`);
           
           // Zobrist: Move rook for castling
           this.gameState.zobrist_key ^= ZOBRIST_SEEDS.pieces[movingColorIdx][PIECES.ROOK][rookFrom];
@@ -309,7 +309,7 @@ export class Board {
           // Queenside castling
           const rookFrom = rank * 8;
           const rookTo = rank * 8 + 3;
-          console.log(`Queenside castling: moving rook from ${rookFrom} to ${rookTo}`);
+          //console.log(`Queenside castling: moving rook from ${rookFrom} to ${rookTo}`);
           
           // Zobrist: Move rook for castling
           this.gameState.zobrist_key ^= ZOBRIST_SEEDS.pieces[movingColorIdx][PIECES.ROOK][rookFrom];
@@ -392,7 +392,7 @@ export class Board {
     // Switch active color
     this.gameState.active_color = oppositeColor;
     
-    console.log(`Move completed. New active color: ${this.gameState.active_color}`);
+    //console.log(`Move completed. New active color: ${this.gameState.active_color}`);
     
     return true;
   }
@@ -401,7 +401,7 @@ export class Board {
   undoMove() {
     if (this.history.length() === 0) return false;
     
-    console.log("Undoing last move...");
+    //console.log("Undoing last move...");
     
     const moveInfo = this.history.moves[this.history.moves.length - 1];
     if (!moveInfo) {
@@ -422,7 +422,7 @@ export class Board {
     const movingColorIdx = colorToIndex(movingColor);
     const oppositeColorIdx = colorToIndex(currentActiveColor);
     
-    console.log(`Undoing move: ${movingColor} piece from ${from} to ${to}`);
+    //console.log(`Undoing move: ${movingColor} piece from ${from} to ${to}`);
     
     // Remove the piece from destination first
     const pieceAtDestination = promotionPiece || movingPiece;
@@ -446,7 +446,7 @@ export class Board {
     
     // Restore en passant capture
     if (enPassantCapture !== null) {
-      console.log(`Restoring en passant captured pawn at ${enPassantCapture}`);
+      //console.log(`Restoring en passant captured pawn at ${enPassantCapture}`);
       this.bbPieces[oppositeColorIdx][PIECES.PAWN].setBit(enPassantCapture);
       this.bbSide[oppositeColorIdx].setBit(enPassantCapture);
       this.pieceList[enPassantCapture] = PIECES.PAWN;
@@ -454,14 +454,14 @@ export class Board {
     
     // Restore castling rook
     if (castlingRook) {
-      console.log(`Restoring castling rook from ${castlingRook.to} to ${castlingRook.from}`);
+      //console.log(`Restoring castling rook from ${castlingRook.to} to ${castlingRook.from}`);
       this.bbPieces[movingColorIdx][PIECES.ROOK].clearBit(castlingRook.to).setBit(castlingRook.from);
       this.bbSide[movingColorIdx].clearBit(castlingRook.to).setBit(castlingRook.from);
       this.pieceList[castlingRook.from] = PIECES.ROOK;
       this.pieceList[castlingRook.to] = PIECES.NONE;
     }
     
-    console.log(`Move undone successfully. Active color is now: ${this.gameState.active_color}`);
+    //console.log(`Move undone successfully. Active color is now: ${this.gameState.active_color}`);
     return true;
   }
 

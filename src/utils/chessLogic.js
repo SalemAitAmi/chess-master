@@ -1,6 +1,6 @@
-import { deepCopyBoard } from "./chessUtils";
-import { PIECES, CASTLING } from '../constants/gameConstants';
-import { rowColToIndex, indexToRowCol, getPieceColor, colorToIndex } from './bitboard';
+import { deepCopyBoard } from "./chessUtils.js";
+import { PIECES, CASTLING } from '../constants/gameConstants.js';
+import { rowColToIndex, indexToRowCol, getPieceColor, colorToIndex } from './bitboard.js';
 
 export const isInCheck = (board, color) => {
   // Find king position
