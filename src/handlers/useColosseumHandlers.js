@@ -1,8 +1,8 @@
 import { useEffect, useRef, useCallback } from "react";
 import { isInCheck, hasValidMoves } from "../utils/chessLogic";
 import { PIECES } from "../constants/gameConstants";
-import { rowColToIndex } from "../utils/bitboard";
-import { BotPlayer } from '../players/BotPlayer';
+import { rowColToIndex, colorToIndex } from "../utils/bitboard";
+import { BotPlayer, abortSearch } from '../players/BotPlayer';
 
 export const useColosseumHandlers = (
   gameState,
@@ -36,26 +36,71 @@ export const useColosseumHandlers = (
     const blackDifficulty = swapped ? config.whiteBot : config.blackBot;
     
     console.log('[Colosseum] Initializing bots for round', currentRound + 1);
-    console.log('[Colosseum] White bot difficulty:', whiteDifficulty);
-    console.log('[Colosseum] Black bot difficulty:', blackDifficulty);
     
     colosseumBotsRef.current.white = new BotPlayer('white', boardObj, whiteDifficulty);
     colosseumBotsRef.current.black = new BotPlayer('black', boardObj, blackDifficulty);
     isInitializedRef.current = true;
-    
-    console.log('[Colosseum] Bots initialized');
   }, [boardObj, config, currentRound]);
 
-  const executeMove = useCallback(async () => {
-    console.log('[Colosseum] executeMove called');
+  // Check for draw conditions
+  const checkForDraw = useCallback((board) => {
+    // 50-move rule
+    if (board.gameState.half_move_clock >= 100) {
+      return { isDraw: true, reason: '50-move rule' };
+    }
+    
+    // Threefold repetition
+    const currentZobrist = board.gameState.zobrist_key;
+    let count = 1;
+    for (let i = 0; i < board.history.states.length; i++) {
+      if (board.history.states[i].zobrist_key === currentZobrist) {
+        count++;
+        if (count >= 3) {
+          return { isDraw: true, reason: 'Threefold repetition' };
+        }
+      }
+    }
+    
+    // Insufficient material
+    const whiteIdx = colorToIndex('white');
+    const blackIdx = colorToIndex('black');
+    
+    const hasPawns = board.bbPieces[whiteIdx][PIECES.PAWN].popCount() > 0 ||
+                    board.bbPieces[blackIdx][PIECES.PAWN].popCount() > 0;
+    const hasQueens = board.bbPieces[whiteIdx][PIECES.QUEEN].popCount() > 0 ||
+                     board.bbPieces[blackIdx][PIECES.QUEEN].popCount() > 0;
+    const hasRooks = board.bbPieces[whiteIdx][PIECES.ROOK].popCount() > 0 ||
+                    board.bbPieces[blackIdx][PIECES.ROOK].popCount() > 0;
+    
+    if (!hasPawns && !hasQueens && !hasRooks) {
+      const whiteMinors = board.bbPieces[whiteIdx][PIECES.BISHOP].popCount() + 
+                         board.bbPieces[whiteIdx][PIECES.KNIGHT].popCount();
+      const blackMinors = board.bbPieces[blackIdx][PIECES.BISHOP].popCount() + 
+                         board.bbPieces[blackIdx][PIECES.KNIGHT].popCount();
+      
+      if (whiteMinors <= 1 && blackMinors <= 1) {
+        return { isDraw: true, reason: 'Insufficient material' };
+      }
+    }
+    
+    return { isDraw: false, reason: null };
+  }, []);
 
+  const executeMove = useCallback(async () => {
     if (gameOver || stopRequestedRef.current || isProcessingMoveRef.current) {
-      console.log('[Colosseum] executeMove blocked by conditions');
       return;
     }
 
     if (!colosseumBotsRef.current.white || !colosseumBotsRef.current.black) {
-      console.log('[Colosseum] Bots not initialized!');
+      return;
+    }
+
+    // Check for draw before making a move
+    const drawCheck = checkForDraw(boardObj);
+    if (drawCheck.isDraw) {
+      console.log('[Colosseum] Draw detected:', drawCheck.reason);
+      setGameOver(true);
+      setWinner('draw');
       return;
     }
 
@@ -64,21 +109,14 @@ export const useColosseumHandlers = (
       ? colosseumBotsRef.current.white 
       : colosseumBotsRef.current.black;
     
-    console.log('[Colosseum] Current turn:', currentColor);
-    
-    if (!currentBot) {
-      console.log('[Colosseum] No bot for current color!');
-      return;
-    }
+    if (!currentBot) return;
 
     isProcessingMoveRef.current = true;
 
     try {
       currentBot.updateBoard(boardObj);
       
-      console.log('[Colosseum] Requesting move from bot...');
       const move = await currentBot.makeMove();
-      console.log('[Colosseum] Bot returned move:', move);
       
       if (move && !stopRequestedRef.current) {
         const fromIndex = rowColToIndex(move.from[0], move.from[1]);
@@ -100,17 +138,25 @@ export const useColosseumHandlers = (
         setBoard(newBoard);
         setLastMove({ from: move.from, to: move.to });
         
+        // Check for draw after move
+        const postMoveDrawCheck = checkForDraw(newBoard);
+        if (postMoveDrawCheck.isDraw) {
+          console.log('[Colosseum] Draw after move:', postMoveDrawCheck.reason);
+          setGameOver(true);
+          setWinner('draw');
+          return;
+        }
+        
         const nextColor = newBoard.gameState.active_color;
         const opponentInCheck = isInCheck(newBoard, nextColor);
         const opponentHasMoves = hasValidMoves(nextColor, newBoard);
         
         if (!opponentHasMoves) {
-          console.log('[Colosseum] Game over detected');
           setGameOver(true);
           if (opponentInCheck) {
             setWinner(currentColor);
           } else {
-            setWinner("draw");
+            setWinner('draw');
           }
         }
       }
@@ -125,16 +171,14 @@ export const useColosseumHandlers = (
         stopRequestedRef.current = false;
       }
     }
-  }, [boardObj, gameOver, setBoard, setLastMove, setGameOver, setWinner]);
+  }, [boardObj, gameOver, setBoard, setLastMove, setGameOver, setWinner, checkForDraw]);
 
-  // Initialize bots when config changes or round changes
   useEffect(() => {
     if (config && isRunning) {
       initializeBots();
     }
     
     return () => {
-      // Cleanup on unmount
       if (moveTimeoutRef.current) {
         clearTimeout(moveTimeoutRef.current);
         moveTimeoutRef.current = null;
@@ -142,19 +186,16 @@ export const useColosseumHandlers = (
     };
   }, [config, currentRound, isRunning, initializeBots]);
 
-  // Execute moves continuously while game is running
   useEffect(() => {
     if (!isRunning || gameOver || !isInitializedRef.current) {
       return;
     }
 
-    // Schedule move execution
     const scheduleMove = () => {
-      if (!isProcessingMoveRef.current && !gameOver && isRunning) {
+      if (!isProcessingMoveRef.current && !gameOver && isRunning && !stopRequestedRef.current) {
         moveTimeoutRef.current = setTimeout(async () => {
           await executeMove();
-          // Schedule next move after current one completes
-          if (isRunning && !gameOver) {
+          if (isRunning && !gameOver && !stopRequestedRef.current) {
             scheduleMove();
           }
         }, 100);
@@ -176,19 +217,34 @@ export const useColosseumHandlers = (
     stopRequestedRef.current = true;
     setIsRunning(false);
     
+    // Abort any ongoing search
+    abortSearch();
+    
+    if (moveTimeoutRef.current) {
+      clearTimeout(moveTimeoutRef.current);
+      moveTimeoutRef.current = null;
+    }
+    
     if (isProcessingMoveRef.current) {
       onStopCallbackRef.current = callback;
+      // Give the search a moment to abort
+      setTimeout(() => {
+        if (onStopCallbackRef.current) {
+          onStopCallbackRef.current();
+          onStopCallbackRef.current = null;
+        }
+        isProcessingMoveRef.current = false;
+      }, 500);
     } else {
-      if (moveTimeoutRef.current) {
-        clearTimeout(moveTimeoutRef.current);
-        moveTimeoutRef.current = null;
-      }
       if (callback) callback();
     }
   }, [setIsRunning]);
 
   const cleanup = useCallback(() => {
     console.log('[Colosseum] Final cleanup');
+    stopRequestedRef.current = true;
+    abortSearch();
+    
     if (moveTimeoutRef.current) {
       clearTimeout(moveTimeoutRef.current);
       moveTimeoutRef.current = null;

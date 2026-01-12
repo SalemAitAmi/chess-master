@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import ChessBoard from "../components/ChessBoard";
 import PromotionModal from "../components/PromotionModal";
 import GameOverModal from "../components/GameOverModal";
@@ -28,6 +28,9 @@ const ColosseumPage = ({ gameState, config, onBackToMenu }) => {
   const [colosseumResults, setColosseumResults] = useState([]);
   const [isRunning, setIsRunning] = useState(true);
   const [isPendingAction, setIsPendingAction] = useState(false);
+  
+  // Use ref to track if we've already processed this game over
+  const gameOverProcessedRef = useRef(false);
 
   const handlers = useColosseumHandlers(
     gameState,
@@ -44,14 +47,23 @@ const ColosseumPage = ({ gameState, config, onBackToMenu }) => {
 
   useEffect(() => {
     clearReportHistory();
+    gameOverProcessedRef.current = false;
     return () => {
       cleanup();
     };
   }, [cleanup]);
 
+  // Reset the processed flag when a new round starts
+  useEffect(() => {
+    gameOverProcessedRef.current = false;
+  }, [currentRound]);
+
   // Handle game over and round progression
   useEffect(() => {
-    if (!gameOver || !config) return;
+    if (!gameOver || !config || gameOverProcessedRef.current) return;
+    
+    // Mark as processed to prevent duplicate handling
+    gameOverProcessedRef.current = true;
 
     const result = {
       round: currentRound + 1,
@@ -62,7 +74,13 @@ const ColosseumPage = ({ gameState, config, onBackToMenu }) => {
       fen: boardToFen(boardObj)
     };
     
-    setColosseumResults(prev => [...prev, result]);
+    setColosseumResults(prev => {
+      // Check if this round was already added
+      if (prev.some(r => r.round === result.round)) {
+        return prev;
+      }
+      return [...prev, result];
+    });
     
     if (currentRound + 1 < config.maxRounds && isRunning) {
       setTimeout(() => {
@@ -131,7 +149,7 @@ const ColosseumPage = ({ gameState, config, onBackToMenu }) => {
         
         <div id="colosseum-round-history" className="text-xs text-gray-500 max-h-32 overflow-y-auto">
           {colosseumResults.map((r, i) => (
-            <div key={i} id={`round-result-${i + 1}`} className="py-1 border-b border-gray-600">
+            <div key={`round-${r.round}`} id={`round-result-${r.round}`} className="py-1 border-b border-gray-600">
               Round {r.round}: {r.winner === 'draw' ? 'Draw' : `${r.winner} wins`} ({r.moves} moves)
             </div>
           ))}
@@ -179,9 +197,14 @@ const ColosseumPage = ({ gameState, config, onBackToMenu }) => {
             <span className="ml-2 text-red-500 font-bold animate-pulse">Check!</span>
           )}
         </p>
-        <p className="mt-2 text-gray-300 text-sm animate-pulse">
-          {turn === 'white' ? 'White' : 'Black'} Bot is thinking...
+        <p className="mt-2 text-gray-300 text-sm">
+          Move: {boardObj.history.moves.length} | 50-move clock: {boardObj.gameState.half_move_clock}
         </p>
+        {!gameOver && (
+          <p className="mt-1 text-gray-400 text-xs animate-pulse">
+            {turn === 'white' ? whiteName : blackName} is thinking...
+          </p>
+        )}
       </div>
 
       <ChessBoard

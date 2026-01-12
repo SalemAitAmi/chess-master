@@ -106,21 +106,15 @@ export class Player {
   // Check for threefold repetition
   hasThreefoldRepetition() {
     const currentZobrist = this.board.gameState.zobrist_key;
-    let count = 1; // Count includes current position
+    let count = 1; // Current position
     
-    // Check history for matching positions
-    // We only need to check positions with the same player to move
-    // Since half_move_clock resets on pawn moves and captures, we only need
-    // to check back to the last irreversible move
     const historyLength = this.board.history.states.length;
-    const maxLookback = Math.min(historyLength, this.board.gameState.half_move_clock);
     
-    // Check every other position (same player to move)
-    for (let i = historyLength - 2; i >= Math.max(0, historyLength - maxLookback); i -= 2) {
+    // Check ALL positions, not just reversible ones
+    for (let i = historyLength - 1; i >= 0; i--) {
       if (this.board.history.states[i].zobrist_key === currentZobrist) {
         count++;
         if (count >= 3) {
-          console.log("Threefold repetition detected!");
           return true;
         }
       }
