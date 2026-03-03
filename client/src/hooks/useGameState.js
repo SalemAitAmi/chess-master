@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useCallback } from "react";
 import { Board } from "../utils/boardStructure";
 
 export const useGameState = () => {
@@ -9,33 +9,42 @@ export const useGameState = () => {
   const [lastMove, setLastMove] = useState(null);
   const [promotion, setPromotion] = useState(null);
   const [gameMode, setGameMode] = useState(null);
+  const [moveHistory, setMoveHistory] = useState([]);
 
-  // Compatibility getter
   const turn = boardObj.gameState.active_color;
 
-  const setBoard = (newBoard) => {
+  const setBoard = useCallback((newBoard) => {
     if (newBoard instanceof Board) {
       setBoardObj(newBoard);
     } else {
       console.error("setBoard requires a Board instance");
     }
-  };
+  }, []);
 
-  const resetGame = () => {
+  const addMove = useCallback((moveStr) => {
+    setMoveHistory(prev => [...prev, moveStr]);
+  }, []);
+
+  const resetGame = useCallback(() => {
     setBoardObj(new Board());
     setSelected(null);
     setGameOver(false);
     setWinner(null);
     setLastMove(null);
     setPromotion(null);
-  };
+    setMoveHistory([]);
+  }, []);
 
-  const resetToMenu = () => {
+  const resetToMenu = useCallback(() => {
     resetGame();
     setGameMode(null);
-  };
+  }, [resetGame]);
 
-  const canUndo = () => boardObj.canUndo();
+  const canUndo = useCallback(() => boardObj.canUndo(), [boardObj]);
+
+  const getFen = useCallback(() => {
+    return boardObj.toFen ? boardObj.toFen() : null;
+  }, [boardObj]);
 
   return {
     boardObj,
@@ -53,8 +62,11 @@ export const useGameState = () => {
     setPromotion,
     gameMode,
     setGameMode,
+    moveHistory,
+    addMove,
     resetGame,
     resetToMenu,
     canUndo,
+    getFen,
   };
 };

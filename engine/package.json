@@ -1,0 +1,16 @@
+{
+  "name": "chess-engine",
+  "version": "1.0.0",
+  "description": "Modular chess engine with UCI protocol",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "dependencies": {
+    "pino": "^8.17.2",
+    "pino-pretty": "^10.3.1",
+    "ws": "^8.16.0"
+  }
+}

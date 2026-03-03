@@ -1,14 +1,13 @@
 {
   "homepage": "http://salemAitAmi.github.io/chess-master",
   "name": "chess-master",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "dependencies": {
     "@testing-library/dom": "^10.4.0",
     "@testing-library/jest-dom": "^6.6.3",
     "@testing-library/react": "^16.3.0",
     "@testing-library/user-event": "^13.5.0",
-    "cm-polyglot": "^1.1.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-scripts": "5.0.1",
@@ -18,12 +17,9 @@
     "start": "react-scripts start",
     "predeploy": "npm run build",
     "deploy": "gh-pages -d build",
-    "stop": "taskkill -F -IM node.exe",
     "build": "react-scripts build",
     "test": "react-scripts test",
-    "eject": "react-scripts eject",
-    "colosseum": "node scripts/colosseum-cli.mjs",
-    "colosseum:install": "npx playwright install"
+    "eject": "react-scripts eject"
   },
   "eslintConfig": {
     "extends": [
@@ -44,7 +40,6 @@
     ]
   },
   "devDependencies": {
-    "gh-pages": "^6.3.0",
-    "@playwright/test": "^1.40.0"
+    "gh-pages": "^6.3.0"
   }
 }
