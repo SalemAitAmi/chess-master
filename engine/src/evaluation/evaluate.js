@@ -1,170 +1,176 @@
 /**
- * Main evaluation orchestrator - combines all heuristics
+ * Evaluation orchestrator — called once per leaf / quiescence node.
+ *
+ * Allocation profile per evaluate() call:
+ *   - LOG.eval OFF: zero allocations. Score accumulates in a local.
+ *   - LOG.eval ON:  writes into reusable _breakdown / _context objects.
+ *
+ * Returns a shared result object; read .score immediately, don't retain.
  */
 
-import { PIECES } from '../core/constants.js';
-import { colorToIndex } from '../core/bitboard.js';
+import { PIECES, WHITE_IDX, BLACK_IDX } from '../core/constants.js';
 import { evaluateMaterial } from './material.js';
 import { evaluateCenterControl } from './centerControl.js';
 import { evaluateDevelopment } from './development.js';
 import { evaluatePawnStructure } from './pawnStructure.js';
 import { evaluateKingSafety } from './kingSafety.js';
-import logger from '../logging/logger.js';
+import logger, { LOG } from '../logging/logger.js';
+
+// Build-time stripping guard — see search.js for explanation.
+const __LOG__ = globalThis.__LOG__ ?? true;
+
+// Phase contribution per piece type. Module-level constants so the
+// old per-call `phaseWeights` object literal is gone.
+const PHASE_KNIGHT = 1;
+const PHASE_BISHOP = 1;
+const PHASE_ROOK   = 2;
+const PHASE_QUEEN  = 4;
+// 4 minors×1 + 4 rooks×2 + 2 queens×4 = 4+4+8+8 = 24
+const MAX_PHASE    = 24;
 
 export class Evaluator {
   constructor(config = {}) {
     this.config = {
-      useMaterial: config.useMaterial !== false,
+      useMaterial:      config.useMaterial      !== false,
       useCenterControl: config.useCenterControl !== false,
-      useDevelopment: config.useDevelopment !== false,
+      useDevelopment:   config.useDevelopment   !== false,
       usePawnStructure: config.usePawnStructure !== false,
-      useKingSafety: config.useKingSafety !== false,
+      useKingSafety:    config.useKingSafety    !== false,
       weights: {
-        material: config.weights?.material ?? 1.0,
+        material:      config.weights?.material      ?? 1.0,
         centerControl: config.weights?.centerControl ?? 1.0,
-        development: config.weights?.development ?? 1.0,
+        development:   config.weights?.development   ?? 1.0,
         pawnStructure: config.weights?.pawnStructure ?? 1.0,
-        kingSafety: config.weights?.kingSafety ?? 1.0
-      }
+        kingSafety:    config.weights?.kingSafety    ?? 1.0,
+      },
     };
-    
-    logger.eval('info', { config: this.config }, 'Evaluator initialized');
+
+    // ── Reusable output objects ──
+    // evaluate() writes into these instead of allocating per call. Safe
+    // because eval is synchronous and callers read .score immediately
+    // (search.js does `evaluator.evaluate(...).score` inline).
+    this._result    = { score: 0, breakdown: null, context: null };
+    this._breakdown = { material: 0, centerControl: 0, development: 0, pawnStructure: 0, kingSafety: 0 };
+    this._context   = { phase: 0, gamePhase: 0, endgameWeight: 0, moveCount: 0 };
   }
 
   /**
-   * Calculate game context (phase, move count, etc.)
+   * Raw phase: sum of piece-type weights over remaining material.
+   * Pure arithmetic + popCount; no allocation.
    */
-  getContext(board) {
-    const whiteIdx = colorToIndex('white');
-    const blackIdx = colorToIndex('black');
-    
-    // Calculate game phase based on remaining material
-    // Max phase = 24 (4 knights/bishops + 4 rooks + 2 queens = 4*1 + 4*2 + 2*4 = 24)
-    let phase = 0;
-    const phaseWeights = { 
-      [PIECES.KNIGHT]: 1, 
-      [PIECES.BISHOP]: 1, 
-      [PIECES.ROOK]: 2, 
-      [PIECES.QUEEN]: 4 
-    };
-    
-    for (const pieceType of [PIECES.KNIGHT, PIECES.BISHOP, PIECES.ROOK, PIECES.QUEEN]) {
-      const count = board.bbPieces[whiteIdx][pieceType].popCount() +
-                   board.bbPieces[blackIdx][pieceType].popCount();
-      phase += count * phaseWeights[pieceType];
-    }
-    
-    const maxPhase = 24;
-    // gamePhase: 1 = pure middlegame, 0 = pure endgame
-    const gamePhase = Math.min(1, phase / maxPhase);
-    const endgameWeight = 1 - gamePhase;
-    const moveCount = board.moveHistory?.length || 0;
-    
-    logger.eval('trace', {
-      phase,
-      maxPhase,
-      gamePhase: gamePhase.toFixed(3),
-      endgameWeight: endgameWeight.toFixed(3),
-      moveCount
-    }, `Game context: phase=${gamePhase.toFixed(2)}, moves=${moveCount}`);
-    
-    return { phase, gamePhase, endgameWeight, moveCount };
+  _computePhase(board) {
+    const wp = board.bbPieces[WHITE_IDX];
+    const bp = board.bbPieces[BLACK_IDX];
+    return (wp[PIECES.KNIGHT].popCount() + bp[PIECES.KNIGHT].popCount()) * PHASE_KNIGHT
+         + (wp[PIECES.BISHOP].popCount() + bp[PIECES.BISHOP].popCount()) * PHASE_BISHOP
+         + (wp[PIECES.ROOK  ].popCount() + bp[PIECES.ROOK  ].popCount()) * PHASE_ROOK
+         + (wp[PIECES.QUEEN ].popCount() + bp[PIECES.QUEEN ].popCount()) * PHASE_QUEEN;
   }
 
   /**
-   * Evaluate a position from the perspective of the given color
-   * @param {Board} board - Board to evaluate
-   * @param {string} color - Color to evaluate for
-   * @returns {Object} Evaluation result with score and breakdown
+   * Evaluate from `color`'s perspective.
+   * Returns the shared _result — read fields immediately, don't hold.
    */
   evaluate(board, color) {
-    const startTime = Date.now();
-    const context = this.getContext(board);
+    const cfg = this.config;
+    const w = cfg.weights;
+
+    // ── Phase scalars — no context object unless logging wants one ──
+    const phase = this._computePhase(board);
+    const gamePhase = phase >= MAX_PHASE ? 1 : phase / MAX_PHASE;   // 1=mg, 0=eg
+    const endgameWeight = 1 - gamePhase;
+
+    // Replaces `board.moveHistory?.length`. plyCount is the undo-stack depth.
+    // NOTE: during search this includes search plies, not just game plies —
+    // same behavior as the old moveHistory.length. Development bonus tapers
+    // a few plies early at high search depths. Pre-existing; fix later if
+    // it shows up in test results.
+    const moveCount = board.plyCount;
+
+    // ── Decide once whether we're producing a breakdown ──
+    // When eval logging is off, every `if (bd)` below is a null check that
+    // branch-predicts perfectly. The breakdown object is never touched.
+    const wantBreakdown = __LOG__ && LOG.eval;
+    const bd = wantBreakdown ? this._breakdown : null;
+
     let score = 0;
-    const breakdown = {};
-    
-    // Material + PST (always important, uses game phase)
-    if (this.config.useMaterial) {
-      const materialScore = evaluateMaterial(
-        board, color, 
-        this.config.weights.material,
-        context.gamePhase  // Pass game phase for PST interpolation
-      );
-      score += materialScore;
-      breakdown.material = materialScore;
+
+    // ── Heuristic accumulation ──
+    // Each block: compute, add, conditionally record. No intermediate objects.
+
+    if (cfg.useMaterial) {
+      const s = evaluateMaterial(board, color, w.material, gamePhase);
+      score += s;
+      if (bd) bd.material = s;
     }
-    
-    // Center control (less important in endgame)
-    if (this.config.useCenterControl) {
-      const centerWeight = this.config.weights.centerControl * (0.5 + 0.5 * context.gamePhase);
-      const centerScore = evaluateCenterControl(board, color, centerWeight);
-      score += centerScore;
-      breakdown.centerControl = centerScore;
+
+    if (cfg.useCenterControl) {
+      // Center matters less as pieces come off. Interpolate the weight.
+      const s = evaluateCenterControl(board, color, w.centerControl * (0.5 + 0.5 * gamePhase));
+      score += s;
+      if (bd) bd.centerControl = s;
     }
-    
-    // Development (only in opening, first ~20 moves)
-    if (this.config.useDevelopment) {
-      const devScore = evaluateDevelopment(
-        board, color, 
-        context.moveCount, 
-        this.config.weights.development
-      );
-      score += devScore;
-      breakdown.development = devScore;
+
+    if (cfg.useDevelopment) {
+      const s = evaluateDevelopment(board, color, moveCount, w.development);
+      score += s;
+      if (bd) bd.development = s;
     }
-    
-    // Pawn structure (always important)
-    if (this.config.usePawnStructure) {
-      const pawnScore = evaluatePawnStructure(
-        board, color, 
-        this.config.weights.pawnStructure
-      );
-      score += pawnScore;
-      breakdown.pawnStructure = pawnScore;
+
+    if (cfg.usePawnStructure) {
+      const s = evaluatePawnStructure(board, color, w.pawnStructure);
+      score += s;
+      if (bd) bd.pawnStructure = s;
     }
-    
-    // King safety (less important in endgame)
-    if (this.config.useKingSafety) {
-      const safetyScore = evaluateKingSafety(
-        board, color, 
-        context.endgameWeight, 
-        this.config.weights.kingSafety
-      );
-      score += safetyScore;
-      breakdown.kingSafety = safetyScore;
+
+    if (cfg.useKingSafety) {
+      const s = evaluateKingSafety(board, color, endgameWeight, w.kingSafety);
+      score += s;
+      if (bd) bd.kingSafety = s;
     }
-    
-    const evalTime = Date.now() - startTime;
-    
-    logger.evalBreakdown(board.toFen(), breakdown, score);
-    
-    logger.eval('debug', {
-      fen: board.toFen(),
-      color,
-      totalScore: score,
-      breakdown,
-      context: {
-        gamePhase: context.gamePhase.toFixed(2),
-        moveCount: context.moveCount
-      },
-      evalTimeMs: evalTime
-    }, `Evaluation: ${score} for ${color}`);
-    
-    return { score, breakdown, context };
+
+    // ── Trace — sampled inside evalPoint; toFen() is NOT called here.
+    //    The old code called board.toFen() twice per eval regardless of
+    //    log state. toFen() walks 64 squares and builds a ~80-char string. ──
+    if (wantBreakdown) {
+      logger.evalPoint(score, gamePhase);
+    }
+
+    // ── Populate shared result ──
+    const r = this._result;
+    r.score = score;
+
+    if (wantBreakdown) {
+      const ctx = this._context;
+      ctx.phase = phase;
+      ctx.gamePhase = gamePhase;
+      ctx.endgameWeight = endgameWeight;
+      ctx.moveCount = moveCount;
+      r.breakdown = bd;
+      r.context = ctx;
+    } else {
+      // Clear so stale references from a prior logged eval don't leak through.
+      r.breakdown = null;
+      r.context = null;
+    }
+
+    return r;
   }
+
+  // ───────── Config mutation — rare, unguarded logging is fine ─────────
 
   setHeuristic(name, enabled) {
     const key = 'use' + name.charAt(0).toUpperCase() + name.slice(1);
     if (key in this.config) {
       this.config[key] = enabled;
-      logger.eval('info', { heuristic: name, enabled }, `Heuristic ${name} ${enabled ? 'enabled' : 'disabled'}`);
+      if (LOG.eval) logger.eval('info', { heuristic: name, enabled }, `${name} ${enabled ? 'on' : 'off'}`);
     }
   }
 
   setWeight(name, weight) {
     if (name in this.config.weights) {
       this.config.weights[name] = weight;
-      logger.eval('info', { heuristic: name, weight }, `Weight for ${name} set to ${weight}`);
+      if (LOG.eval) logger.eval('info', { heuristic: name, weight }, `${name} weight=${weight}`);
     }
   }
 }

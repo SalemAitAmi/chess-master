@@ -1,744 +1,528 @@
 /**
- * Comprehensive logging system with turn-based JSON output
- * Errors are always escalated to console
+ * Zero-cost logging with bounded memory.
+ *
+ * Design contract:
+ *   1. When a category is disabled, the ONLY cost is a boolean read.
+ *      Callers MUST guard hot-path calls: `if (LOG.search) logger.searchNode(...)`
+ *   2. Turn summaries stream to NDJSON — append-only, never re-serialize history.
+ *   3. In-memory turn history is a ring buffer (default 8 turns).
+ *   4. Per-node logging is SAMPLED, not exhaustive. Cross-referencing uses
+ *      node counters, not per-node string IDs.
+ *   5. The entire logger can be swapped for a no-op via `installNoopLogger()`.
  */
 
-import pino from 'pino';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { 
-  LOG_CATEGORY, 
-  CATEGORY_NAMES, 
-  CATEGORY_FILES,
-  GAME_STAGE,
-  STAGE_FILES 
-} from './categories.js';
+import { LOG_CATEGORY, CATEGORY_NAMES, GAME_STAGE } from './categories.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const LOG_DIR = path.join(__dirname, '../../logs');
 const TURN_LOG_DIR = path.join(LOG_DIR, 'turns');
 
-// Ensure log directories exist
-for (const dir of [LOG_DIR, TURN_LOG_DIR]) {
-  if (!fs.existsSync(dir)) {
-    fs.mkdirSync(dir, { recursive: true });
+// ─────────────────────────────────────────────────────────────────────────────
+// Hot-path guard flags — read these BEFORE constructing log payloads.
+// These are plain properties on a frozen-shape object so V8 inlines the read.
+// ─────────────────────────────────────────────────────────────────────────────
+export const LOG = {
+  search: false,
+  eval: false,
+  moveOrder: false,
+  tt: false,
+  uci: false,
+  book: false,
+  heuristics: false,
+  moves: false,
+  pv: false,
+  time: false,
+  stage: false,
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Ring buffer — fixed memory footprint regardless of game length
+// ─────────────────────────────────────────────────────────────────────────────
+class RingBuffer {
+  constructor(capacity) {
+    this.capacity = capacity;
+    this.buffer = new Array(capacity);
+    this.head = 0;
+    this.size = 0;
+  }
+  push(item) {
+    this.buffer[this.head] = item;
+    this.head = (this.head + 1) % this.capacity;
+    if (this.size < this.capacity) this.size++;
+  }
+  toArray() {
+    if (this.size < this.capacity) return this.buffer.slice(0, this.size);
+    return [...this.buffer.slice(this.head), ...this.buffer.slice(0, this.head)];
+  }
+  clear() {
+    this.buffer.fill(undefined);
+    this.head = 0;
+    this.size = 0;
   }
 }
 
-/**
- * Generate unique session ID
- */
-function generateSessionId() {
-  return `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-}
-
-/**
- * Generate unique turn ID
- */
-function generateTurnId(turnNumber) {
-  return `turn_${turnNumber}_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
-}
-
-class EngineLogger {
-  constructor() {
-    this.enabledMask = LOG_CATEGORY.NONE;
-    this.loggers = new Map();
-    this.stageLoggers = new Map();
-    
-    // Session tracking
-    this.sessionId = generateSessionId();
-    this.gameId = null;
-    this.currentTurnNumber = 0;
-    this.currentTurnId = null;
-    this.currentStage = null;
-    this.currentSearchId = null;
-    
-    // Turn data accumulator
-    this.turnData = null;
-    
-    // Turn log file path (JSON)
-    this.turnLogPath = path.join(TURN_LOG_DIR, `game_${this.sessionId}.json`);
-    this.turnsArray = [];
-    
-    // Console logger for errors (always active)
-    this.consoleLogger = pino({
-      transport: {
-        target: 'pino-pretty',
-        options: {
-          colorize: true,
-          translateTime: 'HH:MM:ss.l',
-          ignore: 'pid,hostname'
-        }
-      }
-    });
-    
-    this._initializeLoggers();
-    this._initializeStageLoggers();
-    this._initializeTurnLog();
+// ─────────────────────────────────────────────────────────────────────────────
+// Sampled trace writer — writes every Nth call, drops the rest.
+// Prevents pino-style buffer blowup on per-node logging.
+// ─────────────────────────────────────────────────────────────────────────────
+class SampledWriter {
+  constructor(stream, sampleRate = 1000) {
+    this.stream = stream;
+    this.sampleRate = sampleRate;   // write 1 in N
+    this.counter = 0;
+    this.dropped = 0;
   }
-
-  _initializeLoggers() {
-    for (const [category, filename] of Object.entries(CATEGORY_FILES)) {
-      const categoryNum = parseInt(category);
-      const logPath = path.join(LOG_DIR, filename);
-      
-      const destination = pino.destination({
-        dest: logPath,
-        sync: false,
-        mkdir: true
-      });
-      
-      const logger = pino({
-        level: 'trace',
-        base: { 
-          category: CATEGORY_NAMES[categoryNum],
-          sessionId: this.sessionId
-        },
-        timestamp: pino.stdTimeFunctions.isoTime
-      }, destination);
-      
-      this.loggers.set(categoryNum, logger);
-    }
-  }
-
-  _initializeStageLoggers() {
-    const stageDir = path.join(LOG_DIR, 'stages');
-    if (!fs.existsSync(stageDir)) {
-      fs.mkdirSync(stageDir, { recursive: true });
-    }
-    
-    for (const [stage, filename] of Object.entries(STAGE_FILES)) {
-      const logPath = path.join(stageDir, filename);
-      
-      const destination = pino.destination({
-        dest: logPath,
-        sync: false,
-        mkdir: true
-      });
-      
-      const logger = pino({
-        level: 'trace',
-        base: { 
-          stage,
-          sessionId: this.sessionId
-        },
-        timestamp: pino.stdTimeFunctions.isoTime
-      }, destination);
-      
-      this.stageLoggers.set(stage, logger);
-    }
-  }
-
-  _initializeTurnLog() {
-    // Initialize empty turns array file
-    this._saveTurnsToFile();
-  }
-
-  _saveTurnsToFile() {
-    try {
-      const data = {
-        sessionId: this.sessionId,
-        gameId: this.gameId,
-        createdAt: new Date().toISOString(),
-        turns: this.turnsArray
-      };
-      fs.writeFileSync(this.turnLogPath, JSON.stringify(data, null, 2));
-    } catch (err) {
-      console.error(`[LOGGER ERROR] Failed to save turn log: ${err.message}`);
-    }
-  }
-
-  /**
-   * Start a new game
-   */
-  startNewGame(gameId = null) {
-    this.gameId = gameId || `game_${Date.now()}`;
-    this.currentTurnNumber = 0;
-    this.turnsArray = [];
-    this.turnLogPath = path.join(TURN_LOG_DIR, `${this.gameId}.json`);
-    this._saveTurnsToFile();
-    
-    console.log(`[LOGGER] New game started: ${this.gameId}`);
-    this.consoleLogger.info({ gameId: this.gameId, sessionId: this.sessionId }, 'New game started');
-  }
-
-  /**
-   * Start a new turn - call this at the beginning of each search
-   */
-  startTurn(fen, color, stageInfo) {
-    this.currentTurnNumber++;
-    this.currentTurnId = generateTurnId(this.currentTurnNumber);
-    this.currentStage = stageInfo?.stage || null;
-    this.currentSearchId = `search_${this.currentTurnId}`;
-    
-    // Initialize turn data accumulator
-    this.turnData = {
-      // Identification
-      turnId: this.currentTurnId,
-      searchId: this.currentSearchId,
-      sessionId: this.sessionId,
-      gameId: this.gameId,
-      turnNumber: this.currentTurnNumber,
-      timestamp: new Date().toISOString(),
-      
-      // Position
-      fen: fen,
-      color: color,
-      
-      // Stage info
-      stage: {
-        name: stageInfo?.stage || 'unknown',
-        fullMoveNumber: stageInfo?.fullMoveNumber || this.currentTurnNumber,
-        halfMoveCount: stageInfo?.halfMoveCount || 0,
-        materialPhase: stageInfo?.materialPhase || 0,
-        phasePercent: stageInfo?.phasePercent || 1,
-        priorities: stageInfo?.priorities || [],
-        stageReasons: stageInfo?.stageReasons || []
-      },
-      
-      // Will be populated during search
-      candidateMoves: [],
-      evaluation: {},
-      searchStats: {},
-      bestMove: null,
-      selectedMoveAnalysis: null,
-      
-      // Cross-references to other logs
-      logReferences: {
-        searchEntries: [],
-        evalEntries: [],
-        moveOrderEntries: [],
-        ttEntries: []
-      },
-      
-      // Warnings and issues
-      warnings: [],
-      errors: []
-    };
-    
-    return this.currentTurnId;
-  }
-
-  /**
-   * Record a candidate move with its evaluation
-   */
-  recordCandidateMove(move, score, orderScore, evalBreakdown, rank) {
-    if (!this.turnData) return;
-    
-    this.turnData.candidateMoves.push({
-      rank: rank,
-      move: move.algebraic,
-      fromSquare: move.fromSquare,
-      toSquare: move.toSquare,
-      piece: move.piece,
-      score: score,
-      orderScore: orderScore,
-      
-      // Move characteristics
-      isCapture: move.capturedPiece !== null,
-      capturedPiece: move.capturedPiece,
-      isPromotion: move.isPromotion || false,
-      promotionPiece: move.promotionPiece,
-      
-      // Move ordering factors
-      orderingFactors: {
-        isTTMove: move.isTTMove || false,
-        isKiller: move.isKiller || false,
-        isCounterMove: move.isCounterMove || false,
-        historyScore: move.historyScore || 0,
-        scoreBreakdown: move.scoreBreakdown || {}
-      },
-      
-      // Opening analysis if available
-      openingAnalysis: move.openingAnalysis || null,
-      
-      // Evaluation breakdown for position after this move
-      evalBreakdown: evalBreakdown || null
-    });
-  }
-
-  /**
-   * Record the selected best move and finalize turn data
-   */
-  finalizeTurn(bestMove, searchResult, evalResult, openingAnalysis = null) {
-    if (!this.turnData) {
-      console.error('[LOGGER ERROR] finalizeTurn called without startTurn');
+  write(obj) {
+    this.counter++;
+    if (this.counter % this.sampleRate !== 0) {
+      this.dropped++;
       return;
     }
-    
-    // Set best move
-    this.turnData.bestMove = {
-      move: bestMove?.algebraic || null,
-      fromSquare: bestMove?.fromSquare,
-      toSquare: bestMove?.toSquare,
-      score: searchResult?.score || 0,
-      depth: searchResult?.depth || 0,
-      source: searchResult?.source || 'search'
-    };
-    
-    // Search statistics
-    this.turnData.searchStats = {
-      nodes: searchResult?.nodes || 0,
-      qNodes: searchResult?.qNodes || 0,
-      depth: searchResult?.depth || 0,
-      time: searchResult?.time || 0,
-      nps: searchResult?.time > 0 ? Math.round((searchResult?.nodes || 0) / (searchResult.time / 1000)) : 0,
-      ttHits: searchResult?.stats?.ttHits || 0,
-      ttCutoffs: searchResult?.stats?.ttCutoffs || 0,
-      nullMoveCutoffs: searchResult?.stats?.nullMoveCutoffs || 0,
-      futilityCutoffs: searchResult?.stats?.futilityCutoffs || 0,
-      lmrSearches: searchResult?.stats?.lmrSearches || 0,
-      lmrResearches: searchResult?.stats?.lmrResearches || 0
-    };
-    
-    // Evaluation breakdown
-    this.turnData.evaluation = {
-      total: evalResult?.score || 0,
-      breakdown: evalResult?.breakdown || {},
-      gamePhase: evalResult?.context?.gamePhase || 1
-    };
-    
-    // Principal variation
-    this.turnData.pv = searchResult?.pv?.map(m => m.algebraic) || [];
-    
-    // Opening analysis
-    if (openingAnalysis) {
-      this.turnData.openingAnalysis = {
-        isOpening: openingAnalysis.isOpening,
-        violations: openingAnalysis.violations || [],
-        bonuses: openingAnalysis.bonuses || [],
-        totalPenalty: openingAnalysis.totalPenalty || 0,
-        totalBonus: openingAnalysis.totalBonus || 0
-      };
-      
-      // Add violations to warnings
-      if (openingAnalysis.violations?.length > 0) {
-        for (const v of openingAnalysis.violations) {
-          this.turnData.warnings.push({
-            type: 'opening_violation',
-            principle: v.principle,
-            description: v.description,
-            severity: v.severity,
-            penalty: v.penalty
-          });
-        }
-      }
-    }
-    
-    // Selected move analysis - detailed breakdown of why this move was chosen
-    const selectedCandidate = this.turnData.candidateMoves.find(
-      m => m.move === bestMove?.algebraic
-    );
-    
-    if (selectedCandidate) {
-      this.turnData.selectedMoveAnalysis = {
-        rank: selectedCandidate.rank,
-        scoreVsSecond: this.turnData.candidateMoves.length > 1 
-          ? selectedCandidate.score - this.turnData.candidateMoves[1]?.score 
-          : null,
-        orderScoreBreakdown: selectedCandidate.orderingFactors,
-        competingMoves: this.turnData.candidateMoves.slice(0, 5).map(m => ({
-          move: m.move,
-          score: m.score,
-          scoreDiff: selectedCandidate.score - m.score
-        }))
-      };
-    }
-    
-    // Sort candidate moves by score for easy analysis
-    this.turnData.candidateMoves.sort((a, b) => b.score - a.score);
-    
-    // Assign final ranks
-    this.turnData.candidateMoves.forEach((m, idx) => {
-      m.finalRank = idx + 1;
-    });
-    
-    // Add to turns array and save
-    this.turnsArray.push(this.turnData);
-    this._saveTurnsToFile();
-    
-    // Log summary to console
-    console.log(`[TURN ${this.currentTurnNumber}] ${bestMove?.algebraic || 'null'} (score: ${searchResult?.score}, depth: ${searchResult?.depth}, stage: ${this.turnData.stage.name})`);
-    
-    // Clear turn data
-    const completedTurnId = this.currentTurnId;
+    // Single-line JSON, no pretty-print — minimal serialization cost
+    this.stream.write(JSON.stringify(obj) + '\n');
+  }
+  writeAlways(obj) {
+    this.stream.write(JSON.stringify(obj) + '\n');
+  }
+  stats() {
+    return { written: this.counter - this.dropped, dropped: this.dropped };
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Main logger
+// ─────────────────────────────────────────────────────────────────────────────
+class EngineLogger {
+  constructor(opts = {}) {
+    this.enabledMask = LOG_CATEGORY.NONE;
+    this.turnRingSize = opts.turnRingSize ?? 8;
+    this.nodeSampleRate = opts.nodeSampleRate ?? 1000;
+    this.maxCandidatesPerTurn = opts.maxCandidatesPerTurn ?? 10;
+
+    this.sessionId = `s${Date.now().toString(36)}`;
+    this.gameId = null;
+    this.turnNumber = 0;
     this.turnData = null;
-    
-    return completedTurnId;
+
+    // Bounded in-memory history
+    this.recentTurns = new RingBuffer(this.turnRingSize);
+
+    // Lazy-init streams — don't open file handles unless logging is on
+    this._turnStream = null;
+    this._traceWriters = new Map();
   }
 
-  /**
-   * Add a warning to current turn
-   */
-  addTurnWarning(type, message, details = {}) {
-    if (this.turnData) {
-      this.turnData.warnings.push({
-        type,
-        message,
-        details,
-        timestamp: new Date().toISOString()
-      });
-    }
-    console.warn(`[TURN WARNING] ${type}: ${message}`);
-  }
-
-  /**
-   * Add an error to current turn and escalate to console
-   */
-  addTurnError(type, message, details = {}) {
-    if (this.turnData) {
-      this.turnData.errors.push({
-        type,
-        message,
-        details,
-        timestamp: new Date().toISOString()
-      });
-    }
-    console.error(`[TURN ERROR] ${type}: ${message}`);
-    if (details.stack) {
-      console.error(details.stack);
-    }
-  }
-
-  /**
-   * Add a log reference for cross-referencing
-   */
-  addLogReference(category, entryId) {
-    if (!this.turnData) return;
-    
-    const categoryName = CATEGORY_NAMES[category] || 'unknown';
-    const refArray = `${categoryName}Entries`;
-    
-    if (this.turnData.logReferences[refArray]) {
-      this.turnData.logReferences[refArray].push(entryId);
-    }
-  }
-
-  // ========== Standard Category Logging ==========
+  // ───────── Category control ─────────
 
   setEnabledCategories(mask) {
     this.enabledMask = mask;
-    console.log(`[LOGGER] Categories enabled: ${this._getMaskDescription(mask)}`);
-  }
-
-  enable(...categories) {
-    for (const cat of categories) {
-      this.enabledMask |= cat;
-    }
-  }
-
-  disable(...categories) {
-    for (const cat of categories) {
-      this.enabledMask &= ~cat;
-    }
+    // Sync the hot-path guard flags — this is the critical bit.
+    LOG.search     = (mask & LOG_CATEGORY.SEARCH) !== 0;
+    LOG.eval       = (mask & LOG_CATEGORY.EVAL) !== 0;
+    LOG.moveOrder  = (mask & LOG_CATEGORY.MOVE_ORDER) !== 0;
+    LOG.tt         = (mask & LOG_CATEGORY.TT) !== 0;
+    LOG.uci        = (mask & LOG_CATEGORY.UCI) !== 0;
+    LOG.book       = (mask & LOG_CATEGORY.BOOK) !== 0;
+    LOG.heuristics = (mask & LOG_CATEGORY.HEURISTICS) !== 0;
+    LOG.moves      = (mask & LOG_CATEGORY.MOVES) !== 0;
+    LOG.pv         = (mask & LOG_CATEGORY.PV) !== 0;
+    LOG.time       = (mask & LOG_CATEGORY.TIME) !== 0;
+    LOG.stage      = (mask & LOG_CATEGORY.STAGE) !== 0;
   }
 
   isEnabled(category) {
     return (this.enabledMask & category) !== 0;
   }
 
-  _getMaskDescription(mask) {
-    const enabled = [];
-    for (const [cat, name] of Object.entries(CATEGORY_NAMES)) {
-      if (mask & parseInt(cat)) {
-        enabled.push(name);
-      }
+  // ───────── Lazy stream init ─────────
+
+  _getTurnStream() {
+    if (this._turnStream) return this._turnStream;
+    fs.mkdirSync(TURN_LOG_DIR, { recursive: true });
+    const file = path.join(TURN_LOG_DIR, `${this.gameId || this.sessionId}.ndjson`);
+    // Append mode, 64KB OS buffer — bounded.
+    this._turnStream = fs.createWriteStream(file, { flags: 'a', highWaterMark: 64 * 1024 });
+    return this._turnStream;
+  }
+
+  _getTraceWriter(category) {
+    let w = this._traceWriters.get(category);
+    if (w) return w;
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    const name = CATEGORY_NAMES[category] || `cat${category}`;
+    const stream = fs.createWriteStream(
+      path.join(LOG_DIR, `${name}.ndjson`),
+      { flags: 'a', highWaterMark: 64 * 1024 }
+    );
+    w = new SampledWriter(stream, this.nodeSampleRate);
+    this._traceWriters.set(category, w);
+    return w;
+  }
+
+  // ───────── Game / turn lifecycle ─────────
+
+  startNewGame(gameId = null) {
+    // Close previous game's stream so we don't leak FDs across games
+    if (this._turnStream) {
+      this._turnStream.end();
+      this._turnStream = null;
     }
-    return enabled.length > 0 ? enabled.join(', ') : 'none';
+    this.gameId = gameId || `g${Date.now().toString(36)}`;
+    this.turnNumber = 0;
+    this.recentTurns.clear();
+  }
+
+  startTurn(fen, color, stageInfo) {
+    this.turnNumber++;
+    // Flat, pre-sized object — avoid dynamic shape changes that deopt V8
+    this.turnData = {
+      t: this.turnNumber,
+      ts: Date.now(),
+      fen,
+      color,
+      stage: stageInfo?.stage ?? null,
+      phase: stageInfo?.phasePercent ?? null,
+      // Bounded candidate list — we only keep top N
+      candidates: [],
+      best: null,
+      score: 0,
+      depth: 0,
+      nodes: 0,
+      qnodes: 0,
+      time: 0,
+      pv: null,
+      // Counters instead of per-node ID arrays — O(1) memory
+      nSearch: 0,
+      nEval: 0,
+      nOrder: 0,
+      warnings: null,  // lazy-alloc
+      errors: null,    // lazy-alloc
+    };
+    return this.turnNumber;
   }
 
   /**
-   * Core log method with error escalation
+   * Record a candidate — but only keep the top N by score.
+   * Uses a simple insertion into a bounded sorted array.
+   * O(k) per call where k = maxCandidatesPerTurn, not O(total candidates).
    */
-  log(category, level, data, message) {
-    // Always escalate errors to console
-    if (level === 'error' || level === 'fatal') {
-      console.error(`[${CATEGORY_NAMES[category]?.toUpperCase() || 'LOG'} ERROR] ${message}`);
-      if (data.error) console.error(`  Error: ${data.error}`);
-      if (data.stack) console.error(`  Stack: ${data.stack}`);
-      
-      // Add to turn errors if in a turn
-      this.addTurnError(CATEGORY_NAMES[category] || 'unknown', message, data);
-    }
-    
-    // Also escalate warnings to console
-    if (level === 'warn') {
-      console.warn(`[${CATEGORY_NAMES[category]?.toUpperCase() || 'LOG'} WARN] ${message}`);
-    }
-    
-    if (!this.isEnabled(category)) return;
-    
-    // Enrich with context
-    const enrichedData = {
-      ...data,
-      turnId: this.currentTurnId,
-      searchId: this.currentSearchId,
-      turnNumber: this.currentTurnNumber,
-      stage: this.currentStage,
-      sessionId: this.sessionId,
-      gameId: this.gameId
+  recordCandidateMove(move, score, orderScore, evalBreakdown) {
+    const td = this.turnData;
+    if (!td) return;
+
+    const cands = td.candidates;
+    const max = this.maxCandidatesPerTurn;
+
+    // Fast reject: list full and this score is worse than the worst kept
+    if (cands.length >= max && score <= cands[cands.length - 1].s) return;
+
+    // Build record — keep it flat and small. Skip evalBreakdown for
+    // non-top-3 to cap nested-object memory.
+    const keepBreakdown = cands.length < 3;
+    const rec = {
+      m: move.algebraic,
+      s: score,
+      o: orderScore,
+      cap: move.capturedPiece ?? null,
+      tt: move.isTTMove || false,
+      k: move.isKiller || false,
+      eb: keepBreakdown ? evalBreakdown : null,
     };
-    
-    const logger = this.loggers.get(category);
-    if (logger) {
-      logger[level](enrichedData, message);
+
+    // Insert sorted, trim to max
+    let i = cands.length;
+    while (i > 0 && cands[i - 1].s < score) i--;
+    cands.splice(i, 0, rec);
+    if (cands.length > max) cands.length = max;
+  }
+
+  finalizeTurn(bestMove, searchResult) {
+    const td = this.turnData;
+    if (!td) return;
+
+    td.best   = bestMove?.algebraic ?? null;
+    td.score  = searchResult?.score ?? 0;
+    td.depth  = searchResult?.depth ?? 0;
+    td.nodes  = searchResult?.nodes ?? 0;
+    td.qnodes = searchResult?.qNodes ?? 0;
+    td.time   = searchResult?.time ?? 0;
+    td.pv     = searchResult?.pv?.map(m => m.algebraic).join(' ') ?? null;
+
+    // Stream one NDJSON line — O(1) per turn, never re-serialize history
+    if (this.enabledMask !== LOG_CATEGORY.NONE) {
+      this._getTurnStream().write(JSON.stringify(td) + '\n');
     }
+
+    // Ring buffer handles eviction — old turn becomes GC-eligible
+    this.recentTurns.push(td);
+    this.turnData = null;
   }
 
-  // Category convenience methods
-  search(level, data, message) {
-    this.log(LOG_CATEGORY.SEARCH, level, data, message);
+  addTurnWarning(type, message) {
+    const td = this.turnData;
+    if (!td) return;
+    if (!td.warnings) td.warnings = [];
+    td.warnings.push({ type, message });
+    console.warn(`[T${this.turnNumber}] ${type}: ${message}`);
   }
 
-  eval(level, data, message) {
-    this.log(LOG_CATEGORY.EVAL, level, data, message);
+  addTurnError(type, message, details) {
+    const td = this.turnData;
+    if (td) {
+      if (!td.errors) td.errors = [];
+      td.errors.push({ type, message });
+    }
+    console.error(`[T${this.turnNumber}] ${type}: ${message}`);
+    if (details?.stack) console.error(details.stack);
   }
 
-  moveOrder(level, data, message) {
-    this.log(LOG_CATEGORY.MOVE_ORDER, level, data, message);
+  // ───────── Hot-path trace logging ─────────
+  // Callers MUST guard these with `if (LOG.search)` etc.
+  // These methods assume the guard already passed — no redundant check.
+
+  searchNode(depth, ply, alpha, beta, moveCount) {
+    const td = this.turnData;
+    if (td) td.nSearch++;   // O(1) counter, no string allocation
+
+    // Sampled write — 1 in N nodes actually hits disk
+    this._getTraceWriter(LOG_CATEGORY.SEARCH).write({
+      t: this.turnNumber, d: depth, p: ply, a: alpha, b: beta, mc: moveCount
+    });
   }
 
-  tt(level, data, message) {
-    this.log(LOG_CATEGORY.TT, level, data, message);
+  evalPoint(score, phase) {
+    const td = this.turnData;
+    if (td) td.nEval++;
+    this._getTraceWriter(LOG_CATEGORY.EVAL).write({
+      t: this.turnNumber, s: score, ph: phase
+    });
   }
+
+  moveOrderPoint(ply, topMove, topScore, count) {
+    const td = this.turnData;
+    if (td) td.nOrder++;
+    this._getTraceWriter(LOG_CATEGORY.MOVE_ORDER).write({
+      t: this.turnNumber, p: ply, m: topMove, s: topScore, c: count
+    });
+  }
+
+  // ───────── Non-hot-path logging (UCI, book, etc.) ─────────
+  // These fire per-command, not per-node, so no sampling needed.
 
   uci(level, data, message) {
-    this.log(LOG_CATEGORY.UCI, level, data, message);
+    if (level === 'error') {
+      console.error(`[UCI] ${message}`, data);
+      this.addTurnError('uci', message, data);
+      return;
+    }
+    if (level === 'warn') console.warn(`[UCI] ${message}`);
+    if (!LOG.uci) return;
+    this._getTraceWriter(LOG_CATEGORY.UCI).writeAlways({
+      t: this.turnNumber, lvl: level, msg: message, ...data
+    });
   }
 
   book(level, data, message) {
-    this.log(LOG_CATEGORY.BOOK, level, data, message);
+    if (!LOG.book) return;
+    this._getTraceWriter(LOG_CATEGORY.BOOK).writeAlways({
+      t: this.turnNumber, lvl: level, msg: message, ...data
+    });
   }
 
-  heuristics(level, data, message) {
-    this.log(LOG_CATEGORY.HEURISTICS, level, data, message);
-  }
+  // ───────── Introspection ─────────
 
-  moves(level, data, message) {
-    this.log(LOG_CATEGORY.MOVES, level, data, message);
-  }
+  getRecentTurns() { return this.recentTurns.toArray(); }
+  getCurrentTurn() { return this.turnData; }
 
-  pv(level, data, message) {
-    this.log(LOG_CATEGORY.PV, level, data, message);
-  }
-
-  time(level, data, message) {
-    this.log(LOG_CATEGORY.TIME, level, data, message);
-  }
-
-  stage(level, data, message) {
-    this.log(LOG_CATEGORY.STAGE, level, data, message);
-    
-    // Also log to stage-specific file
-    if (data.stage && this.stageLoggers.has(data.stage)) {
-      const stageLogger = this.stageLoggers.get(data.stage);
-      stageLogger[level]({
-        ...data,
-        turnId: this.currentTurnId,
-        turnNumber: this.currentTurnNumber
-      }, message);
+  getTraceStats() {
+    const out = {};
+    for (const [cat, w] of this._traceWriters) {
+      out[CATEGORY_NAMES[cat]] = w.stats();
     }
+    return out;
   }
 
-  // ========== Specialized Logging Methods ==========
+  // ───────── Legacy category methods ─────────
+  // Backward-compat shims for eval sub-modules that still use the old
+  // (level, data, message) signature. The guard check is INSIDE the method,
+  // so callers that don't guard still work — they just pay for argument
+  // construction. That's bounded damage; file I/O and retention are avoided.
+  //
+  // Hot-path callers should migrate to `if (LOG.x)` guards + evalPoint/
+  // searchNode/etc. These shims exist so un-migrated code doesn't crash.
 
-  searchNode(data) {
-    if (!this.isEnabled(LOG_CATEGORY.SEARCH)) return;
-    
-    const entryId = `sn_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`;
-    
-    const logger = this.loggers.get(LOG_CATEGORY.SEARCH);
-    logger.trace({
-      entryId,
-      turnId: this.currentTurnId,
-      searchId: this.currentSearchId,
-      turnNumber: this.currentTurnNumber,
-      stage: this.currentStage,
-      ...data
-    }, `Search node: depth=${data.depth} ply=${data.ply}`);
-    
-    this.addLogReference(LOG_CATEGORY.SEARCH, entryId);
+  _legacyLog(enabled, category, level, data, message) {
+    // Errors always surface regardless of category mask.
+    if (level === 'error') {
+      const name = CATEGORY_NAMES[category] || 'log';
+      console.error(`[${name.toUpperCase()}] ${message}`);
+      this.addTurnError(name, message, data);
+      return;
+    }
+    // Guard. The caller already allocated `data`, but we stop here:
+    // no spread, no stringify, no disk write.
+    if (!enabled) return;
+    if (level === 'warn') {
+      console.warn(`[${(CATEGORY_NAMES[category] || 'log').toUpperCase()}] ${message}`);
+    }
+    // writeAlways because these are typically info/debug, not per-node trace.
+    // If a sub-module IS calling this per-node, that module needs a guard.
+    this._getTraceWriter(category).writeAlways({
+      t: this.turnNumber, lvl: level, msg: message, ...data,
+    });
   }
 
-  moveOrderingDecision(moves, ply, context) {
-    if (!this.isEnabled(LOG_CATEGORY.MOVE_ORDER)) return;
-    
-    const entryId = `mo_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`;
-    
-    const logger = this.loggers.get(LOG_CATEGORY.MOVE_ORDER);
-    logger.debug({
-      entryId,
-      turnId: this.currentTurnId,
-      searchId: this.currentSearchId,
-      turnNumber: this.currentTurnNumber,
-      stage: this.currentStage,
-      ply,
-      moveCount: moves.length,
-      topMoves: moves.slice(0, 5).map(m => ({
-        move: m.algebraic,
-        score: m.orderScore,
-        breakdown: m.scoreBreakdown,
-        isKiller: m.isKiller,
-        isCapture: !!m.capturedPiece,
-        isPromotion: m.isPromotion,
-        isTTMove: m.isTTMove,
-        isCounterMove: m.isCounterMove,
-        historyScore: m.historyScore
-      })),
-      ...context
-    }, `Move ordering at ply ${ply}: ${moves.length} moves`);
-    
-    this.addLogReference(LOG_CATEGORY.MOVE_ORDER, entryId);
+  search(l, d, m)     { this._legacyLog(LOG.search,     LOG_CATEGORY.SEARCH,     l, d, m); }
+  eval(l, d, m)       { this._legacyLog(LOG.eval,       LOG_CATEGORY.EVAL,       l, d, m); }
+  moveOrder(l, d, m)  { this._legacyLog(LOG.moveOrder,  LOG_CATEGORY.MOVE_ORDER, l, d, m); }
+  tt(l, d, m)         { this._legacyLog(LOG.tt,         LOG_CATEGORY.TT,         l, d, m); }
+  heuristics(l, d, m) { this._legacyLog(LOG.heuristics, LOG_CATEGORY.HEURISTICS, l, d, m); }
+  moves(l, d, m)      { this._legacyLog(LOG.moves,      LOG_CATEGORY.MOVES,      l, d, m); }
+  pv(l, d, m)         { this._legacyLog(LOG.pv,         LOG_CATEGORY.PV,         l, d, m); }
+  time(l, d, m)       { this._legacyLog(LOG.time,       LOG_CATEGORY.TIME,       l, d, m); }
+  stage(l, d, m)      { this._legacyLog(LOG.stage,      LOG_CATEGORY.STAGE,      l, d, m); }
+
+  // ───────── Legacy specialized methods ─────────
+
+  /** Per-eval breakdown. Routed through the sampled writer since this
+   *  fires at every leaf when eval logging is on. */
+  evalBreakdown(fen, breakdown, total) {
+    if (!LOG.eval) return;
+    this._getTraceWriter(LOG_CATEGORY.EVAL).write({
+      t: this.turnNumber, fen, total, ...breakdown,
+    });
   }
 
-  evalBreakdown(position, breakdown, total) {
-    if (!this.isEnabled(LOG_CATEGORY.EVAL)) return;
-    
-    const entryId = `ev_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`;
-    
-    const logger = this.loggers.get(LOG_CATEGORY.EVAL);
-    logger.debug({
-      entryId,
-      turnId: this.currentTurnId,
-      searchId: this.currentSearchId,
-      turnNumber: this.currentTurnNumber,
-      stage: this.currentStage,
-      fen: position,
-      breakdown,
-      total
-    }, `Evaluation: ${total}`);
-    
-    this.addLogReference(LOG_CATEGORY.EVAL, entryId);
-  }
-
+  /** Per-heuristic trace. Sub-evaluators call this ~5× per eval. Sampled. */
   heuristicCalc(name, color, score, details) {
-    if (!this.isEnabled(LOG_CATEGORY.HEURISTICS)) return;
-    
-    const logger = this.loggers.get(LOG_CATEGORY.HEURISTICS);
-    logger.trace({
-      turnId: this.currentTurnId,
-      searchId: this.currentSearchId,
-      turnNumber: this.currentTurnNumber,
-      stage: this.currentStage,
-      heuristic: name,
-      color,
-      score,
-      ...details
-    }, `${name}: ${score} for ${color}`);
+    if (!LOG.heuristics) return;
+    this._getTraceWriter(LOG_CATEGORY.HEURISTICS).write({
+      t: this.turnNumber, h: name, c: color, s: score, ...details,
+    });
   }
 
-  logStageTransition(previousStage, newStage, details) {
-    console.log(`[STAGE] Transition: ${previousStage} -> ${newStage}`);
-    this.stage('info', {
-      previousStage,
-      newStage,
-      stage: newStage,
-      ...details
-    }, `Stage transition: ${previousStage} -> ${newStage}`);
+  /** Per-node move-ordering dump. Sampled; kept minimal. */
+  moveOrderingDecision(moves, ply, context) {
+    if (!LOG.moveOrder) return;
+    this._getTraceWriter(LOG_CATEGORY.MOVE_ORDER).write({
+      t: this.turnNumber, ply, n: moves.length,
+      top: moves[0]?.algebraic, topScore: moves[0]?.orderScore,
+    });
+  }
+
+  logStageTransition(prev, next, details) {
+    console.log(`[STAGE] ${prev} → ${next}`);
+    if (!LOG.stage) return;
+    this._getTraceWriter(LOG_CATEGORY.STAGE).writeAlways({
+      t: this.turnNumber, prev, next, ...details,
+    });
   }
 
   logOpeningViolation(move, violations, bonuses) {
-    if (!this.isEnabled(LOG_CATEGORY.STAGE)) return;
-    
-    const netAdjustment = bonuses.reduce((s, b) => s + b.bonus, 0) + 
-                          violations.reduce((s, v) => s + v.penalty, 0);
-    
-    console.warn(`[OPENING] ${move.algebraic}: ${violations.length} violations (net: ${netAdjustment})`);
-    
-    this.stage('warn', {
-      stage: GAME_STAGE.OPENING,
-      move: move.algebraic,
-      violations,
-      bonuses,
-      netAdjustment
-    }, `Opening principles: ${violations.length} violations, ${bonuses.length} bonuses`);
+    // Console-only; no file write needed. The turn warning covers persistence.
+    const net = (bonuses?.reduce((s, b) => s + b.bonus, 0) || 0) +
+                (violations?.reduce((s, v) => s + v.penalty, 0) || 0);
+    console.warn(`[OPENING] ${move.algebraic}: ${violations.length} violation(s), net ${net}`);
+    this.addTurnWarning('opening_violation', `${move.algebraic}: ${violations.length} violation(s)`);
   }
 
-  // ========== Utility Methods ==========
+  // ───────── Cleanup ─────────
 
   async flush() {
-    const flushPromises = [];
-    
-    for (const logger of this.loggers.values()) {
-      flushPromises.push(new Promise(resolve => {
-        logger.flush(resolve);
-      }));
+    const promises = [];
+    if (this._turnStream) {
+      promises.push(new Promise(r => this._turnStream.once('drain', r) || r()));
     }
-    
-    for (const logger of this.stageLoggers.values()) {
-      flushPromises.push(new Promise(resolve => {
-        logger.flush(resolve);
-      }));
+    for (const w of this._traceWriters.values()) {
+      promises.push(new Promise(r => w.stream.once('drain', r) || r()));
     }
-    
-    await Promise.all(flushPromises);
-    
-    // Save final turn log
-    this._saveTurnsToFile();
+    await Promise.race([Promise.all(promises), new Promise(r => setTimeout(r, 1000))]);
+  }
+
+  close() {
+    if (this._turnStream) { this._turnStream.end(); this._turnStream = null; }
+    for (const w of this._traceWriters.values()) w.stream.end();
+    this._traceWriters.clear();
   }
 
   clearLogs() {
-    // Clear category logs
-    for (const filename of Object.values(CATEGORY_FILES)) {
-      const logPath = path.join(LOG_DIR, filename);
-      if (fs.existsSync(logPath)) {
-        fs.writeFileSync(logPath, '');
+    this.close();
+    for (const dir of [LOG_DIR, TURN_LOG_DIR]) {
+      if (!fs.existsSync(dir)) continue;
+      for (const f of fs.readdirSync(dir)) {
+        const p = path.join(dir, f);
+        if (fs.statSync(p).isFile()) fs.unlinkSync(p);
       }
     }
-    
-    // Clear stage logs
-    const stageDir = path.join(LOG_DIR, 'stages');
-    for (const filename of Object.values(STAGE_FILES)) {
-      const logPath = path.join(stageDir, filename);
-      if (fs.existsSync(logPath)) {
-        fs.writeFileSync(logPath, '');
-      }
-    }
-    
-    // Clear turn logs
-    const turnFiles = fs.readdirSync(TURN_LOG_DIR);
-    for (const file of turnFiles) {
-      fs.unlinkSync(path.join(TURN_LOG_DIR, file));
-    }
-    
-    // Reset turns array
-    this.turnsArray = [];
-    this._saveTurnsToFile();
-    
-    console.log('[LOGGER] All log files cleared');
-  }
-
-  /**
-   * Get current turn data (for external analysis)
-   */
-  getCurrentTurnData() {
-    return this.turnData ? { ...this.turnData } : null;
-  }
-
-  /**
-   * Get all turns for current game
-   */
-  getAllTurns() {
-    return [...this.turnsArray];
-  }
-
-  /**
-   * Export turns to a specific file
-   */
-  exportTurns(filePath) {
-    const data = {
-      sessionId: this.sessionId,
-      gameId: this.gameId,
-      exportedAt: new Date().toISOString(),
-      turns: this.turnsArray
-    };
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
-    console.log(`[LOGGER] Turns exported to ${filePath}`);
+    this.recentTurns.clear();
   }
 }
 
-// Singleton instance
-const logger = new EngineLogger();
+// ─────────────────────────────────────────────────────────────────────────────
+// No-op logger — every method is an empty function.
+// Swap this in for production builds or perf benchmarks.
+// ─────────────────────────────────────────────────────────────────────────────
+class NoopLogger {
+  setEnabledCategories() {}
+  isEnabled() { return false; }
+  startNewGame() {}
+  startTurn() { return 0; }
+  recordCandidateMove() {}
+  finalizeTurn() {}
+  addTurnWarning() {}
+  addTurnError(type, msg, d) { console.error(`[${type}] ${msg}`); if (d?.stack) console.error(d.stack); }
+  searchNode() {}
+  evalPoint() {}
+  moveOrderPoint() {}
+  uci(level, data, msg) { if (level === 'error') console.error(`[UCI] ${msg}`, data); }
+  book() {}
+  getRecentTurns() { return []; }
+  getCurrentTurn() { return null; }
+  getTraceStats() { return {}; }
+  async flush() {}
+  close() {}
+  clearLogs() {}
+  _errOnly(label, level, msg) { if (level === 'error') console.error(`[${label}] ${msg}`); }
+  search(l, d, m)     { this._errOnly('SEARCH', l, m); }
+  eval(l, d, m)       { this._errOnly('EVAL', l, m); }
+  moveOrder(l, d, m)  { this._errOnly('MOVE_ORDER', l, m); }
+  tt(l, d, m)         { this._errOnly('TT', l, m); }
+  heuristics(l, d, m) { this._errOnly('HEURISTICS', l, m); }
+  moves(l, d, m)      { this._errOnly('MOVES', l, m); }
+  pv(l, d, m)         { this._errOnly('PV', l, m); }
+  time(l, d, m)       { this._errOnly('TIME', l, m); }
+  stage(l, d, m)      { this._errOnly('STAGE', l, m); }
+  // Legacy specialized — pure no-ops
+  evalBreakdown() {}
+  heuristicCalc() {}
+  moveOrderingDecision() {}
+  logStageTransition() {}
+  logOpeningViolation() {}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Singleton with runtime swap
+// ─────────────────────────────────────────────────────────────────────────────
+let _instance = new EngineLogger();
+
+export function installNoopLogger() {
+  _instance.close();
+  _instance = new NoopLogger();
+  for (const k of Object.keys(LOG)) LOG[k] = false;
+}
+
+export function installRealLogger(opts) {
+  if (_instance instanceof EngineLogger) _instance.close();
+  _instance = new EngineLogger(opts);
+}
+
+// Proxy so `import logger from ...` always sees the current instance
+const logger = new Proxy({}, {
+  get(_, prop) { return _instance[prop]; }
+});
+
 export default logger;
 export { LOG_CATEGORY, GAME_STAGE };

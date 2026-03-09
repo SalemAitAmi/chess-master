@@ -1,186 +1,158 @@
 /**
- * Quiescence search for tactical stability
- * Only searches captures and promotions to avoid horizon effect
+ * Quiescence search — extend captures/checks until the position is quiet.
+ *
+ * This is a negamax recursion like the main search. Stand-pat MUST be
+ * evaluated from the side-to-move's perspective (`color`), not a fixed
+ * root perspective. The previous version used `searchColor`, flipping
+ * the sign at odd q-plies and poisoning the TT across iterations.
  */
 
-import { PIECE_VALUES, PIECES } from '../core/constants.js';
+import { PIECE_VALUES, PIECES, SCORE } from '../core/constants.js';
 import { generateAllLegalMoves, isInCheck } from '../core/moveGeneration.js';
-import logger from '../logging/logger.js';
+import { LOG } from '../logging/logger.js';
+
+// Build-time stripping guard — see search.js.
+const __LOG__ = globalThis.__LOG__ ?? true;
+
+const DELTA_MARGIN     = 200;
+const DELTA_PER_MOVE   = 100;
+const SEE_PRUNE_MARGIN = -200;
 
 /**
- * Quiescence search - extends search until position is "quiet"
- * @param {Board} board - Current board state
- * @param {number} alpha - Alpha bound
- * @param {number} beta - Beta bound
- * @param {string} color - Side to move
- * @param {Evaluator} evaluator - Evaluation function
- * @param {string} searchColor - Original searching color (for eval perspective)
- * @param {number} depth - Current quiescence depth (starts at 0)
- * @param {number} maxDepth - Maximum quiescence depth
+ * @param {Board}     board
+ * @param {number}    alpha     Lower bound, this node's perspective
+ * @param {number}    beta      Upper bound, this node's perspective
+ * @param {string}    color     Side to move — eval perspective MUST match this
+ * @param {Evaluator} evaluator
+ * @param {number}    qDepth    Current q-ply (starts at 0)
+ * @param {number}    maxQDepth Cap on q-search depth
  */
-export function quiescenceSearch(board, alpha, beta, color, evaluator, searchColor, depth = 0, maxDepth = 8) {
-  // Get static evaluation (stand pat)
-  const evalResult = evaluator.evaluate(board, searchColor);
-  const standPat = evalResult.score;
-  
-  // Maximum depth reached
-  if (depth >= maxDepth) {
-    logger.search('trace', { 
-      depth, 
-      maxDepth, 
-      standPat 
-    }, 'Q-search max depth reached');
+export function quiescenceSearch(board, alpha, beta, color, evaluator, qDepth = 0, maxQDepth = 8) {
+  // ── Stand-pat ──
+  // Negamax rule: eval from THIS node's side-to-move. The parent negates.
+  // Using a fixed root-color here was the bug — at odd q-plies it returned
+  // the opponent's score into our alpha-beta window.
+  const standPat = evaluator.evaluate(board, color).score;
+
+  if (qDepth >= maxQDepth) {
     return standPat;
   }
-  
+
   const inCheck = isInCheck(board, color);
-  
-  // If in check, we must search all evasions (can't stand pat)
+
+  // Not in check → may stand pat (decline to capture).
   if (!inCheck) {
-    // Stand pat cutoff
+    // Fail-high: even doing nothing already beats beta.
     if (standPat >= beta) {
-      logger.search('trace', { 
-        depth, 
-        standPat, 
-        beta, 
-        cutoff: 'stand-pat-beta' 
-      }, 'Q-search stand pat beta cutoff');
       return beta;
     }
-    
-    // Update alpha with stand pat
     if (standPat > alpha) {
       alpha = standPat;
     }
-    
-    // Delta pruning - big delta for queen promotions
-    const DELTA_MARGIN = 200;
-    const BIG_DELTA = PIECE_VALUES[PIECES.QUEEN] + DELTA_MARGIN;
-    
-    if (standPat + BIG_DELTA < alpha) {
-      logger.search('trace', { 
-        depth, 
-        standPat, 
-        bigDelta: BIG_DELTA, 
-        alpha,
-        cutoff: 'delta' 
-      }, 'Q-search delta pruned');
+
+    // Big-delta: if even winning a queen can't reach alpha, nothing will.
+    // Saves exploring hopeless capture trees.
+    const bigDelta = PIECE_VALUES[PIECES.QUEEN] + DELTA_MARGIN;
+    if (standPat + bigDelta < alpha) {
       return alpha;
     }
   }
-  
+
   const oppositeColor = color === 'white' ? 'black' : 'white';
   const allMoves = generateAllLegalMoves(board, color);
-  
-  // Filter to tactical moves
+
+  // ── Filter to tactical moves (in-check searches everything) ──
+  // Score each tactical move as we filter — avoids the old comparator
+  // calling getMoveValue O(n log n) times during sort.
   let tacticalMoves;
   if (inCheck) {
-    // In check - search all evasions
-    tacticalMoves = allMoves;
-    logger.search('trace', { 
-      depth, 
-      inCheck: true, 
-      evasions: tacticalMoves.length 
-    }, 'Q-search: in check, searching all evasions');
+    tacticalMoves = allMoves;   // every evasion is mandatory
+    for (let i = 0; i < tacticalMoves.length; i++) {
+      tacticalMoves[i]._qScore = scoreTacticalMove(tacticalMoves[i]);
+    }
   } else {
-    // Not in check - only captures and promotions
-    tacticalMoves = allMoves.filter(m => 
-      m.capturedPiece !== null || m.isPromotion
-    );
+    tacticalMoves = [];
+    for (let i = 0; i < allMoves.length; i++) {
+      const m = allMoves[i];
+      if (m.capturedPiece !== null || m.isPromotion) {
+        m._qScore = scoreTacticalMove(m);
+        tacticalMoves.push(m);
+      }
+    }
   }
-  
+
+  // No tactical moves left
   if (tacticalMoves.length === 0) {
     if (inCheck) {
-      // Checkmate
-      return -50000 + depth; // Prefer shorter mates
+      // Checkmate inside q-search. Negamax: always bad for side-to-move.
+      // qDepth offset is imprecise (doesn't include main-search ply) —
+      // mates found here may sort slightly wrong vs. mates found in the
+      // main tree. Acceptable; q-search mates are rare. TODO: thread ply through.
+      return -(SCORE.MATE - qDepth);
     }
     return standPat;
   }
-  
-  // Sort by MVV-LVA with SEE estimation
-  tacticalMoves.sort((a, b) => {
-    const aValue = getMoveValue(a);
-    const bValue = getMoveValue(b);
-    return bValue - aValue;
-  });
-  
-  logger.search('trace', {
-    depth,
-    tacticalMoves: tacticalMoves.length,
-    topMoves: tacticalMoves.slice(0, 3).map(m => ({
-      move: m.algebraic,
-      value: getMoveValue(m)
-    }))
-  }, `Q-search at depth ${depth}: ${tacticalMoves.length} tactical moves`);
-  
-  for (const move of tacticalMoves) {
-    // Per-move delta pruning (skip losing captures)
+
+  // Sort by precomputed score — comparator does a subtraction, nothing more.
+  tacticalMoves.sort((a, b) => b._qScore - a._qScore);
+
+  if (__LOG__ && LOG.search) {
+    // Kept minimal — q-search fires far more often than main-search nodes.
+    // Building topMoves arrays per call (as before) was a per-q-node alloc.
+    console.log(`[Q${qDepth}] ${tacticalMoves.length} tactical, top=${tacticalMoves[0]?.algebraic}`);
+  }
+
+  for (let i = 0; i < tacticalMoves.length; i++) {
+    const move = tacticalMoves[i];
+
+    // ── Per-move pruning (captures only, not when in check) ──
     if (!inCheck && move.capturedPiece !== null) {
-      const DELTA_PER_MOVE = 100;
+      // Delta: even the best-case gain from this capture can't reach alpha.
       const maxGain = PIECE_VALUES[move.capturedPiece] +
-                      (move.isPromotion ? PIECE_VALUES[PIECES.QUEEN] - PIECE_VALUES[PIECES.PAWN] : 0);
-      
+        (move.isPromotion ? PIECE_VALUES[PIECES.QUEEN] - PIECE_VALUES[PIECES.PAWN] : 0);
       if (standPat + maxGain + DELTA_PER_MOVE < alpha) {
-        logger.search('trace', { 
-          move: move.algebraic, 
-          maxGain, 
-          standPat, 
-          alpha 
-        }, 'Q-search per-move delta pruned');
         continue;
       }
-      
-      // SEE pruning - skip clearly losing captures
-      const seeValue = PIECE_VALUES[move.capturedPiece] - PIECE_VALUES[move.piece];
-      if (seeValue < -200) {
-        logger.search('trace', { 
-          move: move.algebraic, 
-          seeValue 
-        }, 'Q-search SEE pruned');
+
+      // SEE estimate: capturing with a more valuable piece than the victim,
+      // by a wide margin, is probably a losing trade. Skip it.
+      // (This is a crude SEE — it doesn't look at recaptures. Good enough
+      // for pruning obviously-bad QxP in q-search.)
+      const seeEstimate = PIECE_VALUES[move.capturedPiece] - PIECE_VALUES[move.piece];
+      if (seeEstimate < SEE_PRUNE_MARGIN) {
         continue;
       }
     }
-    
+
     board.makeMove(move.fromSquare, move.toSquare, move.promotionPiece);
-    const score = -quiescenceSearch(board, -beta, -alpha, oppositeColor, evaluator, searchColor, depth + 1, maxDepth);
+    const score = -quiescenceSearch(board, -beta, -alpha, oppositeColor, evaluator, qDepth + 1, maxQDepth);
     board.undoMove();
-    
+
     if (score >= beta) {
-      logger.search('trace', { 
-        depth, 
-        move: move.algebraic, 
-        score, 
-        beta, 
-        cutoff: 'beta' 
-      }, 'Q-search beta cutoff');
       return beta;
     }
-    
     if (score > alpha) {
       alpha = score;
     }
   }
-  
+
   return alpha;
 }
 
 /**
- * Get move value for sorting (MVV-LVA with promotion bonus)
+ * MVV-LVA + promotion bonus. Computed once per move, stored on the move,
+ * then used by sort comparator.
  */
-function getMoveValue(move) {
-  let value = 0;
-  
-  // Capture value
+function scoreTacticalMove(move) {
+  let v = 0;
   if (move.capturedPiece !== null) {
-    value += PIECE_VALUES[move.capturedPiece] * 10 - PIECE_VALUES[move.piece];
+    // Most-valuable-victim × 10 dominates; least-valuable-attacker breaks ties.
+    v += PIECE_VALUES[move.capturedPiece] * 10 - PIECE_VALUES[move.piece];
   }
-  
-  // Promotion value
   if (move.isPromotion) {
-    value += PIECE_VALUES[move.promotionPiece || PIECES.QUEEN];
+    v += PIECE_VALUES[move.promotionPiece || PIECES.QUEEN];
   }
-  
-  return value;
+  return v;
 }
 
 export default quiescenceSearch;

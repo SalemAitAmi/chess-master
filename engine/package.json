@@ -5,10 +5,17 @@
   "type": "module",
   "main": "src/server.js",
   "scripts": {
-    "start": "node src/server.js",
-    "dev": "node --watch src/server.js"
+    "build:dev": "node build.mjs",
+    "build:prod": "node build.mjs --prod",
+    "start": "node dist/dev/server.js",
+    "start:prod": "node dist/prod/server.js",
+    "bench": "node dist/prod/engine.js",
+    "dev": "node --watch src/server.js",
+    "test:search": "node --expose-gc --test test/search.test.js",
+    "test:fork": "node --expose-gc --test test/forkKnight.test.js"
   },
   "dependencies": {
+    "esbuild": "^0.27.3",
     "pino": "^8.17.2",
     "pino-pretty": "^10.3.1",
     "ws": "^8.16.0"

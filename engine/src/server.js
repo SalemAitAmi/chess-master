@@ -9,8 +9,8 @@ import { loadOpeningBook, isBookLoaded, getBookStats } from './book/openingBook.
 
 const PORT = process.env.PORT || 8080;
 
-// Enable all logging for development
-logger.setEnabledCategories(LOG_CATEGORY.ALL);
+const logMask = parseInt(process.env.LOG_MASK || '0', 10);
+logger.setEnabledCategories(logMask);
 
 async function startServer() {
   console.log('Chess Engine Server starting...');

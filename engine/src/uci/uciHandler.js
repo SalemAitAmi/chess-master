@@ -5,7 +5,7 @@
 import { Board } from '../core/board.js';
 import { SearchEngine } from '../search/search.js';
 import { generateAllLegalMoves } from '../core/moveGeneration.js';
-import { loadOpeningBook, lookupBookMove, isBookLoaded, getBookStats } from '../book/openingBook.js';
+import { loadOpeningBook, lookupAllBookMoves, isBookLoaded, getBookStats } from '../book/openingBook.js';
 import { squareToIndex } from '../core/bitboard.js';
 import { PIECES, DEFAULT_CONFIG } from '../core/constants.js';
 import logger, { LOG_CATEGORY } from '../logging/logger.js';
@@ -219,71 +219,49 @@ export class UCIHandler {
   }
 
   async go(options) {
-    logger.uci('info', { options }, 'Go command received');
-
-    if (this.searching) {
-      logger.uci('warn', {}, 'Already searching, ignoring go command');
-      return null;
-    }
-
+    if (this.searching) return null;
     this.searching = true;
     const responses = [];
 
     try {
-      // Get legal moves first (needed for both book lookup and search)
       const legalMoves = generateAllLegalMoves(this.board, this.board.gameState.activeColor);
+      if (legalMoves.length === 0) return 'bestmove (none)';
 
-      if (legalMoves.length === 0) {
-        this.searching = false;
-        return 'bestmove (none)';
-      }
-
-      // Check opening book first — await the book being fully ready
+      // ── Gather book hints — passed to search, NOT returned directly ──
+      let bookHints = null;
       if (this.options.useOpeningBook) {
-        try {
-          // Ensure the book loading has fully completed (including async init)
-          if (this.bookReadyPromise) {
-            await this.bookReadyPromise;
+        if (this.bookReadyPromise) await this.bookReadyPromise;
+        if (isBookLoaded()) {
+          bookHints = lookupAllBookMoves(this.board, legalMoves);
+          if (bookHints) {
+            responses.push(`info string Book: ${bookHints.size} hint(s)`);
           }
-
-          // Only attempt lookup if the book is confirmed loaded
-          if (isBookLoaded()) {
-            const bookMove = await lookupBookMove(this.board, legalMoves);
-
-            if (bookMove) {
-              const moveStr = bookMove.algebraic;
-              responses.push(`info string Book move: ${moveStr}`);
-              responses.push(`bestmove ${moveStr}`);
-              this.searching = false;
-              return responses.join('\n');
-            }
-          }
-        } catch (err) {
-          logger.uci('warn', { error: err.message }, 'Book lookup failed');
         }
       }
 
-      // Determine search depth
-      let depth = options.depth || this.options.maxDepth;
+      const depth = options.depth || this.options.maxDepth;
 
-      // Run search
-      const result = this.engine.search(this.board, depth);
+      // ── Search runs unconditionally. Book hints bias ordering only. ──
+      const result = this.engine.search(this.board, depth, { bookHints });
 
-      // Send info
-      const pvString = result.pv?.map(m => m.algebraic).join(' ') || '';
+      // Report book agreement — this is the diagnostic you wanted:
+      // did search confirm or override the book's suggestion?
+      if (bookHints && result.bestMove) {
+        const agreed = bookHints.has(result.bestMove.algebraic);
+        responses.push(`info string Book ${agreed ? 'confirmed' : 'OVERRIDDEN'} ` +
+                      `(${result.bestMove.algebraic} cp=${result.score})`);
+      }
+
+      const pvStr = result.pv?.map(m => m.algebraic).join(' ') || '';
       responses.push(
         `info depth ${result.depth} nodes ${result.nodes} time ${result.time} ` +
-        `score cp ${result.score} pv ${pvString}`
+        `score cp ${result.score} pv ${pvStr}`
       );
-
-      const moveStr = result.bestMove ? result.bestMove.algebraic : '(none)';
-      responses.push(`bestmove ${moveStr}`);
-
-      logger.uci('info', { bestMove: moveStr, score: result.score }, 'Search complete');
+      responses.push(`bestmove ${result.bestMove?.algebraic ?? '(none)'}`);
 
     } catch (err) {
       logger.uci('error', { error: err.message, stack: err.stack }, 'Search error');
-      responses.push('info string Search error: ' + err.message);
+      responses.push(`info string Error: ${err.message}`);
       responses.push('bestmove (none)');
     } finally {
       this.searching = false;

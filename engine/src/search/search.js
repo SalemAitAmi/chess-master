@@ -1,83 +1,104 @@
 /**
- * Main search implementation - iterative deepening with alpha-beta and PVS
- * Includes comprehensive turn-based decision logging
+ * Iterative-deepening alpha-beta with PVS, NMP, LMR, futility.
+ *
+ * Allocation budget for alphaBeta():
+ *   - Returns a number (no result object per call)
+ *   - No `{...move}` spreads
+ *   - No moveCausesCheck pre-flight (check detected post-makeMove)
+ *   - Manual gc() and memory-abort removed — symptoms, not causes
+ *
+ * Collector hooks (all null-guarded, free when absent):
+ *   onNode() onRootMove() onMoveOrdering() onCutoff()
  */
 
 import { SCORE, PIECES } from '../core/constants.js';
-import { generateAllLegalMoves, isInCheck, hasLegalMoves } from '../core/moveGeneration.js';
+import { generateAllLegalMoves, isInCheck } from '../core/moveGeneration.js';
 import { Evaluator } from '../evaluation/evaluate.js';
 import { MoveOrderer } from './moveOrdering.js';
 import { quiescenceSearch } from './quiescence.js';
-import { TranspositionTable, TT_FLAG } from '../tables/transposition.js';
-import { detectGameStage, getStageWeights, checkOpeningPrinciples } from '../utils/gameStage.js';
+import { TranspositionTable, TT_FLAG, decodeFrom, decodeTo, decodePromo } from '../tables/transposition.js';
+import { detectGameStage, checkOpeningPrinciples } from '../utils/gameStage.js';
 import { GAME_STAGE } from '../logging/categories.js';
-import logger, { LOG_CATEGORY } from '../logging/logger.js';
+import { indexToSquare } from '../core/bitboard.js';
+import logger, { LOG } from '../logging/logger.js';
 
-/**
- * Check if side has non-pawn material (for null move pruning)
- */
+// Build-time guard. esbuild replaces `globalThis.__LOG__` with `false` in
+// prod builds, making this const `false`, which lets DCE strip every
+// `if (__LOG__ && ...)` block. Running from source: defaults to true.
+const __LOG__ = globalThis.__LOG__ ?? true;
+
+const FUTILITY_MARGIN = [0, 150, 300, 450];
+const ASPIRATION_WINDOW = 50;
+const ASPIRATION_MIN_DEPTH = 5;
+
 function hasNonPawnMaterial(board, color) {
-  const colorIdx = color === 'white' ? 0 : 1;
-  return board.bbPieces[colorIdx][PIECES.QUEEN].popCount() > 0 ||
-         board.bbPieces[colorIdx][PIECES.ROOK].popCount() > 0 ||
-         board.bbPieces[colorIdx][PIECES.BISHOP].popCount() > 0 ||
-         board.bbPieces[colorIdx][PIECES.KNIGHT].popCount() > 0;
+  const idx = color === 'white' ? 0 : 1;
+  return board.bbPieces[idx][PIECES.QUEEN].popCount()  > 0 ||
+         board.bbPieces[idx][PIECES.ROOK].popCount()   > 0 ||
+         board.bbPieces[idx][PIECES.BISHOP].popCount() > 0 ||
+         board.bbPieces[idx][PIECES.KNIGHT].popCount() > 0;
 }
 
-/** Maximum number of candidate moves to log (avoid huge JSON) */
-const MAX_LOGGED_CANDIDATES = 10;
+/** Build algebraic notation from an encoded TT move — for PV display only. */
+function encodedToAlgebraic(enc) {
+  if (enc === 0) return null;
+  const from = indexToSquare(decodeFrom(enc));
+  const to = indexToSquare(decodeTo(enc));
+  const promo = decodePromo(enc);
+  const promoChar = promo ? ' qrbnp'[promo] : '';  // index by PIECES enum
+  return from + to + promoChar.trim();
+}
 
 export class SearchEngine {
   constructor(config = {}) {
     this.config = {
       maxDepth: config.maxDepth || 64,
-      useQuiescence: config.useQuiescence !== false,
-      quiescenceDepth: config.quiescenceDepth || 8,
-      useTranspositionTable: config.useTranspositionTable !== false,
-      useNullMovePruning: config.useNullMovePruning !== false,
-      useLateMovereduction: config.useLateMovereduction !== false,
-      useFutilityPruning: config.useFutilityPruning !== false,
-      useAspirationWindows: config.useAspirationWindows !== false,
-      usePVS: config.usePVS !== false,
-      useIID: config.useIID !== false,
-      useOpeningPrinciples: config.useOpeningPrinciples !== false,
-      ...config
+      useQuiescence:          config.useQuiescence          !== false,
+      quiescenceDepth:        config.quiescenceDepth        || 8,
+      useTranspositionTable:  config.useTranspositionTable  !== false,
+      useNullMovePruning:     config.useNullMovePruning     !== false,
+      useLateMovereduction:   config.useLateMovereduction   !== false,
+      useFutilityPruning:     config.useFutilityPruning     !== false,
+      useAspirationWindows:   config.useAspirationWindows   !== false,
+      usePVS:                 config.usePVS                 !== false,
+      useIID:                 config.useIID                 !== false,
+      useOpeningPrinciples:   config.useOpeningPrinciples   !== false,
+      ...config,
     };
-    
+
     this.evaluator = new Evaluator(config);
     this.moveOrderer = new MoveOrderer(config);
     this.tt = this.config.useTranspositionTable ? new TranspositionTable(64) : null;
-    
-    // Search state
+
+    // Per-search state (reset each search)
     this.nodes = 0;
     this.qNodes = 0;
     this.maxDepthReached = 0;
     this.searchStartTime = 0;
     this.stopSearch = false;
     this.searchColor = 'white';
-    
-    // Principal variation
     this.pv = [];
-    
-    // Current game stage
     this.currentStage = null;
     this.previousStage = null;
-    
-    // Statistics for logging
-    this.stats = {
-      ttHits: 0,
-      ttCutoffs: 0,
-      nullMoveCutoffs: 0,
-      futilityCutoffs: 0,
-      lmrSearches: 0,
-      lmrResearches: 0,
-      pvsCutoffs: 0
+
+    // Root-move bookkeeping — written at ply 0 instead of returned from alphaBeta
+    this._rootBestMove = null;
+    this._rootMoveScores = [];   // [{ move, score, orderScore, nodes }] for the final iteration
+
+    // Injected per search() call
+    this._collector = null;
+    this._bookHints = null;
+    this._stageInfo = null;
+
+    this.stats = this._emptyStats();
+  }
+
+  _emptyStats() {
+    return {
+      ttHits: 0, ttCutoffs: 0,
+      nullMoveCutoffs: 0, futilityCutoffs: 0,
+      lmrSearches: 0, lmrResearches: 0, pvsResearches: 0,
     };
-    
-    // Root move scores for decision logging
-    this.rootMoveResults = [];
-    
-    logger.search('info', { config: this.config }, 'SearchEngine initialized');
   }
 
   resetSearchState() {
@@ -86,606 +107,446 @@ export class SearchEngine {
     this.maxDepthReached = 0;
     this.stopSearch = false;
     this.pv = [];
-    this.rootMoveResults = [];
-    this.stats = {
-      ttHits: 0,
-      ttCutoffs: 0,
-      nullMoveCutoffs: 0,
-      futilityCutoffs: 0,
-      lmrSearches: 0,
-      lmrResearches: 0,
-      pvsCutoffs: 0
-    };
-    
-    if (this.tt) this.tt.newSearch();
+    this._rootBestMove = null;
+    this._rootMoveScores = [];
+    this.stats = this._emptyStats();
+    this.tt?.newSearch();
     this.moveOrderer.prepareNewSearch();
   }
 
-  search(board, maxDepth = null) {
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Public entry point
+  // ═══════════════════════════════════════════════════════════════════════════
+  search(board, maxDepth = null, options = {}) {
     this.resetSearchState();
     this.searchStartTime = Date.now();
     this.searchColor = board.gameState.activeColor;
     board.searchColor = this.searchColor;
-    
-    // Detect game stage
+
+    // ── Injected dependencies — null in production, live in tests ──
+    this._collector = options.collector || null;
+    this._bookHints = options.bookHints || null;
+
     const stageInfo = detectGameStage(board);
+    this._stageInfo = stageInfo;
     this.previousStage = this.currentStage;
     this.currentStage = stageInfo.stage;
-    
-    // Log stage transition if changed
-    if (this.previousStage && this.previousStage !== this.currentStage) {
-      logger.logStageTransition(this.previousStage, this.currentStage, stageInfo);
-    }
-    
-    // Get stage-specific weights
-    const stageWeights = getStageWeights(stageInfo.stage);
-    
+
     const depth = maxDepth || this.config.maxDepth;
     const fen = board.toFen();
-    
-    // Start turn in logger
-    const turnId = logger.startTurn(fen, this.searchColor, stageInfo);
-    
-    logger.search('info', { 
-      turnId,
-      color: this.searchColor, 
-      maxDepth: depth,
-      fen,
-      stage: stageInfo.stage,
-      stageWeights
-    }, 'Starting search');
-    
-    // Log stage-specific info
-    logger.stage('info', {
-      stage: stageInfo.stage,
-      fullMoveNumber: stageInfo.fullMoveNumber,
-      materialPhase: stageInfo.materialPhase,
-      phasePercent: stageInfo.phasePercent,
-      priorities: stageInfo.priorities,
-      stageReasons: stageInfo.stageReasons
-    }, `Stage: ${stageInfo.stage} (move ${stageInfo.fullMoveNumber})`);
-    
+
+    const c = this._collector;
+
+    // Turn logging — gated on the aggregate flag, cheap when off.
+    if (__LOG__ && (LOG.search || LOG.stage)) {
+      logger.startTurn(fen, this.searchColor, stageInfo);
+      if (this.previousStage && this.previousStage !== this.currentStage) {
+        console.log(`[STAGE] ${this.previousStage} → ${this.currentStage}`);
+      }
+    }
+
     let bestMove = null;
     let bestScore = 0;
-    
-    // Aspiration window settings
-    const ASPIRATION_WINDOW = 50;
-    const ASPIRATION_MIN_DEPTH = 5;
-    
-    // Iterative deepening
+
+    // ── Iterative deepening ──
     for (let d = 1; d <= depth; d++) {
       if (this.stopSearch) break;
-      
-      const iterationStartTime = Date.now();
-      const iterationStartNodes = this.nodes;
-      
+      if (c) c.onIterationStart?.(d);
+
       let alpha = -SCORE.INFINITY;
-      let beta = SCORE.INFINITY;
+      let beta  =  SCORE.INFINITY;
       let delta = ASPIRATION_WINDOW;
-      
-      // Use aspiration windows after sufficient depth
-      if (this.config.useAspirationWindows && 
-          d >= ASPIRATION_MIN_DEPTH && 
+
+      if (this.config.useAspirationWindows &&
+          d >= ASPIRATION_MIN_DEPTH &&
           Math.abs(bestScore) < SCORE.MATE_THRESHOLD) {
         alpha = bestScore - delta;
-        beta = bestScore + delta;
+        beta  = bestScore + delta;
       }
-      
-      let result;
-      let searchAttempts = 0;
-      const maxAttempts = 5;
-      
-      // Aspiration window loop
-      while (searchAttempts < maxAttempts) {
-        searchAttempts++;
-        
-        result = this.alphaBeta(board, d, alpha, beta, this.searchColor, 0, null, stageInfo);
-        
-        if (this.stopSearch) break;
-        
-        if (result.score <= alpha) {
-          alpha = Math.max(-SCORE.INFINITY, alpha - delta);
-          delta *= 2;
-          continue;
-        }
-        
-        if (result.score >= beta) {
-          beta = Math.min(SCORE.INFINITY, beta + delta);
-          delta *= 2;
-          continue;
-        }
-        
-        break;
-      }
-      
-      if (this.stopSearch) break;
-      
-      if (result && result.move) {
-        bestMove = result.move;
-        bestScore = result.score;
-        
-        // Store root move results from final iteration
-        if (result.rootMoves) {
-          this.rootMoveResults = result.rootMoves;
-        }
-        
-        // Extract PV
-        this.extractPV(board, d);
-        
-        const iterationTime = Date.now() - iterationStartTime;
-        const iterationNodes = this.nodes - iterationStartNodes;
-        const nps = iterationTime > 0 ? Math.round(iterationNodes / (iterationTime / 1000)) : 0;
 
-        if (d % 3 === 0) {
-        logger.flush().catch(err => {
-          console.error('[LOGGER] Flush error:', err);
-        });
+      // Aspiration re-search loop
+      let score;
+      for (let attempt = 0; attempt < 5; attempt++) {
+        score = this.alphaBeta(board, d, alpha, beta, this.searchColor, 0, null);
+        if (this.stopSearch) break;
+        if (score <= alpha)      { alpha = Math.max(-SCORE.INFINITY, alpha - delta); delta *= 2; }
+        else if (score >= beta)  { beta  = Math.min( SCORE.INFINITY, beta  + delta); delta *= 2; }
+        else break;
       }
-      
-      // **ADD THIS: Memory usage check**
-      if (d >= 4) {
-        const memUsage = process.memoryUsage();
-        const heapUsedMB = Math.round(memUsage.heapUsed / 1024 / 1024);
-        
-        if (heapUsedMB > 3500) { // Warn at 3.5GB
-          console.warn(`[MEMORY WARNING] High memory usage: ${heapUsedMB}MB at depth ${d}`);
-          logger.search('warn', { heapUsedMB, depth: d }, 'High memory usage detected');
+
+      if (this.stopSearch) break;
+
+      if (this._rootBestMove) {
+        bestMove = this._rootBestMove;
+        bestScore = score;
+        this.extractPV(board, d);
+
+        if (__LOG__ && LOG.search) {
+          const pvStr = this.pv.map(m => m.algebraic).join(' ');
+          console.log(`[D${d}] ${bestMove.algebraic} cp=${bestScore} nodes=${this.nodes} pv=${pvStr}`);
         }
-        
-        if (heapUsedMB > 3800) { // Stop before crash at 3.8GB
-          console.error(`[MEMORY ERROR] Critical memory usage: ${heapUsedMB}MB - stopping search`);
-          this.stopSearch = true;
-          break;
-        }
-      }
-        
-        logger.search('info', {
-          depth: d,
-          score: bestScore,
-          nodes: this.nodes,
-          qNodes: this.qNodes,
-          nps,
-          time: iterationTime,
-          pv: this.pv.map(m => m.algebraic).join(' '),
-          bestMove: bestMove.algebraic,
-          stage: stageInfo.stage
-        }, `Depth ${d} complete: ${bestMove.algebraic} (${bestScore})`);
-        
-        logger.pv('info', {
-          depth: d,
-          score: bestScore,
-          pv: this.pv.map(m => m.algebraic),
-          pvLength: this.pv.length,
-          stage: stageInfo.stage
-        }, `PV: ${this.pv.map(m => m.algebraic).join(' ')}`);
-        
-        if (Math.abs(bestScore) > SCORE.MATE_THRESHOLD) {
-          const mateIn = Math.ceil((SCORE.MATE - Math.abs(bestScore)) / 2);
-          logger.search('info', { mateIn, score: bestScore }, `Mate found in ${mateIn}`);
-          break;
-        }
+
+        if (Math.abs(bestScore) > SCORE.MATE_THRESHOLD) break;  // mate found
       }
     }
-    
+
     const totalTime = Date.now() - this.searchStartTime;
-    
-    // Get evaluation for decision log (single eval, not per-move)
-    const evalResult = this.evaluator.evaluate(board, this.searchColor);
-    
-    // Check opening principles if applicable
-    let openingAnalysis = null;
-    if (stageInfo.stage === GAME_STAGE.OPENING && bestMove && this.config.useOpeningPrinciples) {
-      openingAnalysis = checkOpeningPrinciples(board, bestMove, this.searchColor);
-      if (openingAnalysis.violations.length > 0) {
-        logger.logOpeningViolation(bestMove, openingAnalysis.violations, openingAnalysis.bonuses);
+
+    // ── Turn finalization — only runs when logging ──
+    if (__LOG__ && (LOG.search || LOG.stage)) {
+      // Opening-principle check on the selected move (root only, cheap)
+      if (stageInfo.stage === GAME_STAGE.OPENING && bestMove && this.config.useOpeningPrinciples) {
+        const oa = checkOpeningPrinciples(board, bestMove, this.searchColor);
+        if (oa.violations.length > 0) {
+          logger.addTurnWarning('opening_violation',
+            `${bestMove.algebraic}: ${oa.violations.map(v => v.principle).join(', ')}`);
+        }
       }
+
+      for (const rm of this._rootMoveScores) {
+        logger.recordCandidateMove(rm.move, rm.score, rm.orderScore, null);
+      }
+
+      logger.finalizeTurn(bestMove, {
+        score: bestScore, depth: this.maxDepthReached,
+        nodes: this.nodes, qNodes: this.qNodes, time: totalTime,
+        pv: this.pv, stats: this.stats,
+      });
     }
-    
-    // Record candidate moves from search results (no re-evaluation needed)
-    const candidatesToLog = this.rootMoveResults.slice(0, MAX_LOGGED_CANDIDATES);
-    for (let i = 0; i < candidatesToLog.length; i++) {
-      const moveResult = candidatesToLog[i];
-      logger.recordCandidateMove(
-        moveResult,
-        moveResult.score,
-        moveResult.orderScore || 0,
-        null, // Skip per-move eval breakdown to save memory
-        i + 1
-      );
-    }
-    
-    // Finalize turn with all collected data
-    logger.finalizeTurn(
-      bestMove,
-      {
-        score: bestScore,
-        depth: this.maxDepthReached,
-        nodes: this.nodes,
-        qNodes: this.qNodes,
-        time: totalTime,
-        pv: this.pv,
-        source: 'search',
-        stats: { ...this.stats }
-      },
-      evalResult,
-      openingAnalysis
-    );
-    
-    logger.search('info', {
-      totalNodes: this.nodes,
-      quiescenceNodes: this.qNodes,
-      totalTime,
-      nps: totalTime > 0 ? Math.round(this.nodes / (totalTime / 1000)) : 0,
-      maxDepthReached: this.maxDepthReached,
-      bestMove: bestMove?.algebraic,
-      bestScore,
-      stage: stageInfo.stage,
-      ttStats: this.tt?.getStats()
-    }, 'Search complete');
-    
+
+    // Detach injected refs so they can be GC'd between searches
+    this._collector = null;
+    this._bookHints = null;
+    this._stageInfo = null;
+
     return {
-      bestMove,
-      score: bestScore,
-      nodes: this.nodes,
-      depth: this.maxDepthReached,
-      time: totalTime,
-      pv: this.pv,
-      stageInfo
+      bestMove, score: bestScore,
+      nodes: this.nodes, qNodes: this.qNodes,
+      depth: this.maxDepthReached, time: totalTime,
+      pv: this.pv, stats: this.stats, stageInfo,
     };
   }
 
-  alphaBeta(board, depth, alpha, beta, color, ply, lastMove, stageInfo) {
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Alpha-beta — returns a NUMBER. Root move written to this._rootBestMove.
+  // ═══════════════════════════════════════════════════════════════════════════
+  alphaBeta(board, depth, alpha, beta, color, ply, lastMove) {
     this.nodes++;
-    this.maxDepthReached = Math.max(this.maxDepthReached, ply);
-    
-    if (this.stopSearch) {
-      return { score: 0, move: null };
-    }
-    
-    if (this.nodes % 50000 === 0 && global.gc) {
-      global.gc();
-    }
+    if (ply > this.maxDepthReached) this.maxDepthReached = ply;
+    if (this.stopSearch) return 0;
+
+    const c = this._collector;
+    if (c) c.onNode();
 
     const isRoot = ply === 0;
     const isPvNode = beta - alpha > 1;
     const oppositeColor = color === 'white' ? 'black' : 'white';
     const inCheck = isInCheck(board, color);
-    
-    // Check extension
-    const extension = inCheck ? 1 : 0;
-    
-    // Get legal moves
+
     const moves = generateAllLegalMoves(board, color);
-    
-    // Terminal node detection
+
+    // Terminal: mate or stalemate
     if (moves.length === 0) {
       if (inCheck) {
-        const mateScore = SCORE.MATE - ply;
-        return { score: color === this.searchColor ? -mateScore : mateScore, move: null };
+        // Negamax: being mated is always −MATE from the mated side's own
+        // perspective. The parent negates this to +MATE. Ply offset prefers
+        // faster mates (+49999 beats +49998).
+        // The old `color === searchColor` check was a leftover from a
+        // fixed-perspective search that got half-converted to negamax.
+        return -(SCORE.MATE - ply);
       }
-      return { score: SCORE.DRAW, move: null };
+      // Stalemate: 0 from either perspective, negation is a no-op.
+      return SCORE.DRAW;
     }
-    
-    // Transposition table probe
-    let ttMove = null;
+
+    // ── TT probe ──
+    // ttMove is an encoded int (from|to<<6|promo<<12), 0 = none.
+    let ttMove = 0;
+    const key = board.gameState.zobristKey;
     if (this.tt) {
-      const ttResult = this.tt.probe(board.gameState.zobristKey, depth, alpha, beta);
-      if (ttResult) {
+      const tt = this.tt.probe(key, depth, alpha, beta);
+      if (tt.hit) {
         this.stats.ttHits++;
-        ttMove = ttResult.bestMove;
-        
-        if (!isRoot && ttResult.usable) {
+        ttMove = tt.move;
+        if (!isRoot && tt.usable) {
           this.stats.ttCutoffs++;
-          return { score: ttResult.score, move: ttResult.bestMove };
+          return tt.score;   // ← number, no object
         }
       }
     }
-    
-    // Leaf node
+
+    // ── Leaf / quiescence ──
     if (depth <= 0) {
-      let score;
       if (this.config.useQuiescence) {
-        score = quiescenceSearch(
-          board, alpha, beta, color, 
-          this.evaluator, this.searchColor,
+        this.qNodes++;
+        // searchColor dropped — quiescence now evals from `color` internally.
+        return quiescenceSearch(
+          board, alpha, beta, color, this.evaluator,
           0, this.config.quiescenceDepth
         );
-        this.qNodes++;
-      } else {
-        const evalResult = this.evaluator.evaluate(board, this.searchColor);
-        score = evalResult.score;
       }
-      return { score, move: null };
+      return this.evaluator.evaluate(board, color).score;
     }
-    
-    // IID
-    if (this.config.useIID && !ttMove && depth >= 4 && isPvNode) {
-      const iidDepth = Math.max(1, depth - 3);
-      const iidResult = this.alphaBeta(board, iidDepth, alpha, beta, color, ply, lastMove, stageInfo);
-      if (iidResult.move) {
-        ttMove = iidResult.move;
-      }
+
+    // ── IID: get a TT move by doing a shallow search first ──
+    // The shallow search populates TT; we then read the move hint back out.
+    // No need to capture a return object — TT is the communication channel.
+    if (this.config.useIID && ttMove === 0 && depth >= 4 && isPvNode && this.tt) {
+      this.alphaBeta(board, Math.max(1, depth - 3), alpha, beta, color, ply, lastMove);
+      ttMove = this.tt.getBestMove(key);
     }
-    
-    // Null Move Pruning
+
+    // ── Null-move pruning ──
     if (this.config.useNullMovePruning &&
-        depth >= 3 &&
-        !isRoot &&
-        !inCheck &&
-        !isPvNode &&
+        depth >= 3 && !isRoot && !inCheck && !isPvNode &&
         hasNonPawnMaterial(board, color)) {
-      
+
       const R = depth > 6 ? 3 : 2;
-      
-      // Null move: just flip the side to move without actually making a move
-      // Save and restore the minimal state needed
-      const savedEp = board.gameState.enPassantSquare;
-      const savedActiveColor = board.gameState.activeColor;
-      const savedZobrist = board.gameState.zobristKey;
-      board.gameState.enPassantSquare = -1;
-      board.gameState.activeColor = oppositeColor;
-      // Update zobrist for side change (not perfect but sufficient for null move)
-      board.gameState.zobristKey ^= 0xFFFFFFFFFFFFFFFFn;
-      
-      const nullResult = this.alphaBeta(
-        board, depth - R - 1, -beta, -beta + 1, 
-        oppositeColor, ply + 1, null, stageInfo
-      );
-      const nullScore = -nullResult.score;
-      
-      board.gameState.enPassantSquare = savedEp;
-      board.gameState.activeColor = savedActiveColor;
-      board.gameState.zobristKey = savedZobrist;
-      
+
+      // Null move: flip side without moving. Restore by hand — cheaper than
+      // going through the undo stack for this non-move.
+      const gs = board.gameState;
+      const savedEp = gs.enPassantSquare;
+      const savedColor = gs.activeColor;
+      const savedKey = gs.zobristKey;
+      gs.enPassantSquare = -1;
+      gs.activeColor = oppositeColor;
+      gs.zobristKey ^= 0xABCDEF0123456789n;   // arbitrary side-to-move flip constant
+
+      const nullScore = -this.alphaBeta(board, depth - R - 1, -beta, -beta + 1, oppositeColor, ply + 1, null);
+
+      gs.enPassantSquare = savedEp;
+      gs.activeColor = savedColor;
+      gs.zobristKey = savedKey;
+
       if (nullScore >= beta) {
         this.stats.nullMoveCutoffs++;
-        return { score: beta, move: null };
+        if (c) c.onCutoff(ply, null, 'null');
+        return beta;
       }
     }
-    
-    // Static evaluation for futility pruning
-    let staticEval = null;
-    const FUTILITY_MARGIN = [0, 150, 300, 450];
-    const canFutilityPrune = this.config.useFutilityPruning &&
-                             depth <= 3 &&
-                             !inCheck &&
-                             !isPvNode &&
-                             Math.abs(alpha) < SCORE.MATE_THRESHOLD;
-    
-    if (canFutilityPrune) {
-      const evalResult = this.evaluator.evaluate(board, this.searchColor);
-      staticEval = evalResult.score;
+
+    // ── Static eval for futility ──
+    let staticEval = 0;
+    const canFutility = this.config.useFutilityPruning &&
+                        depth <= 3 && !inCheck && !isPvNode &&
+                        Math.abs(alpha) < SCORE.MATE_THRESHOLD;
+    if (canFutility) {
+      staticEval = this.evaluator.evaluate(board, color).score;
     }
-    
-    // Move ordering with opening principle adjustments
-    let orderedMoves = this.moveOrderer.orderMoves(moves, ply, board, color, ttMove, lastMove);
-    
-    // Apply opening principle adjustments at root
-    if (isRoot && stageInfo?.stage === GAME_STAGE.OPENING && this.config.useOpeningPrinciples) {
-      orderedMoves = this.applyOpeningPrincipleScores(orderedMoves, board, color);
+
+    // ── Move ordering ──
+    // Book hints are root-only; at ply > 0 they'd distort deep-line ordering.
+    const bookHints = isRoot ? this._bookHints : null;
+    this.moveOrderer.orderMoves(moves, ply, board, color, ttMove, lastMove, bookHints);
+
+    // Apply opening-principle adjustments at root (mutates orderScore in place)
+    if (isRoot && this._stageInfo?.stage === GAME_STAGE.OPENING && this.config.useOpeningPrinciples) {
+      this._adjustForOpeningPrinciples(moves, board, color);
     }
-    
-    let bestMove = orderedMoves[0];
+
+    // Collector hook — root only to bound memory
+    if (c && isRoot) c.onMoveOrdering(ply, moves);
+
+    if (__LOG__ && LOG.moveOrder && isRoot) {
+      logger.moveOrderPoint(ply, moves[0]?.algebraic, moves[0]?.orderScore, moves.length);
+    }
+
+    // ── Main move loop ──
+    const extension = inCheck ? 1 : 0;
+    let bestMove = moves[0];
     let bestScore = -SCORE.INFINITY;
     let nodeType = TT_FLAG.UPPER_BOUND;
-    let movesSearched = 0;
-    const rootMoves = isRoot ? [] : null;
-    
-    for (let i = 0; i < orderedMoves.length; i++) {
-      const move = orderedMoves[i];
+    let searched = 0;
+
+    // Root-move score tracking — reuse the same array across iterations
+    if (isRoot) this._rootMoveScores.length = 0;
+
+    for (let i = 0; i < moves.length; i++) {
+      const move = moves[i];
       const isCapture = move.capturedPiece !== null;
       const isPromotion = move.isPromotion;
-      const givesCheck = this.moveCausesCheck(board, move, oppositeColor);
-      
-      // Futility pruning
-      if (canFutilityPrune && 
-          movesSearched > 0 && 
-          !isCapture && 
-          !isPromotion &&
-          !givesCheck &&
+
+      // ── Futility pruning — BEFORE makeMove ──
+      // Dropped the givesCheck guard here. Checking moves that reach this
+      // branch are quiet late moves that happen to give check — rare, and
+      // the worst case is we prune a marginal check. The old implementation
+      // doubled every makeMove to compute this up front; not worth it.
+      if (canFutility && searched > 0 && !isCapture && !isPromotion &&
           staticEval + FUTILITY_MARGIN[depth] <= alpha) {
         this.stats.futilityCutoffs++;
         continue;
       }
-      
-      // LMR
+
+      const nodesBefore = this.nodes;
+
+      board.makeMove(move.fromSquare, move.toSquare, move.promotionPiece);
+
+      // ── givesCheck computed ONCE, after the makeMove we were doing anyway ──
+      // This replaces the old moveCausesCheck(), which did an extra
+      // makeMove/undoMove per move — literally doubling board mutations.
+      const givesCheck = isInCheck(board, oppositeColor);
+
+      // ── LMR — decided post-makeMove using the real givesCheck ──
       let reduction = 0;
-      if (this.config.useLateMovereduction && 
-          movesSearched >= 4 && 
-          depth >= 3 && 
-          !isCapture && 
-          !isPromotion && 
-          !inCheck &&
-          !givesCheck &&
-          !move.isKiller) {
-        reduction = Math.floor(Math.log2(depth) * Math.log2(movesSearched + 1) * 0.5);
-        reduction = Math.min(reduction, depth - 2);
-        reduction = Math.max(reduction, 1);
+      if (this.config.useLateMovereduction &&
+          searched >= 4 && depth >= 3 &&
+          !isCapture && !isPromotion && !inCheck && !givesCheck && !move.isKiller) {
+        reduction = Math.floor(Math.log2(depth) * Math.log2(searched + 1) * 0.5);
+        reduction = Math.max(1, Math.min(reduction, depth - 2));
         this.stats.lmrSearches++;
       }
-      
-      board.makeMove(move.fromSquare, move.toSquare, move.promotionPiece);
-      
+
+      // ── Search the move ──
       let score;
-      
-      // PVS
-      if (this.config.usePVS && movesSearched > 0) {
-        const searchDepth = depth - 1 + extension - reduction;
-        score = -this.alphaBeta(
-          board, searchDepth, -alpha - 1, -alpha, 
-          oppositeColor, ply + 1, move, stageInfo
-        ).score;
-        
+      if (this.config.usePVS && searched > 0) {
+        // Null-window scout
+        score = -this.alphaBeta(board, depth - 1 + extension - reduction,
+                                -alpha - 1, -alpha, oppositeColor, ply + 1, move);
+
+        // Failed high inside window → re-search. If we reduced, undo the
+        // reduction first, then open the window if still necessary.
         if (score > alpha && score < beta) {
-          this.stats.pvsCutoffs++;
-          
+          this.stats.pvsResearches++;
           if (reduction > 0) {
             this.stats.lmrResearches++;
-            score = -this.alphaBeta(
-              board, depth - 1 + extension, -alpha - 1, -alpha, 
-              oppositeColor, ply + 1, move, stageInfo
-            ).score;
+            score = -this.alphaBeta(board, depth - 1 + extension,
+                                    -alpha - 1, -alpha, oppositeColor, ply + 1, move);
           }
-          
           if (score > alpha && score < beta) {
-            score = -this.alphaBeta(
-              board, depth - 1 + extension, -beta, -alpha, 
-              oppositeColor, ply + 1, move, stageInfo
-            ).score;
+            score = -this.alphaBeta(board, depth - 1 + extension,
+                                    -beta, -alpha, oppositeColor, ply + 1, move);
           }
         }
       } else {
-        score = -this.alphaBeta(
-          board, depth - 1 + extension - reduction, -beta, -alpha, 
-          oppositeColor, ply + 1, move, stageInfo
-        ).score;
-        
+        score = -this.alphaBeta(board, depth - 1 + extension - reduction,
+                                -beta, -alpha, oppositeColor, ply + 1, move);
         if (reduction > 0 && score > alpha) {
           this.stats.lmrResearches++;
-          score = -this.alphaBeta(
-            board, depth - 1 + extension, -beta, -alpha, 
-            oppositeColor, ply + 1, move, stageInfo
-          ).score;
+          score = -this.alphaBeta(board, depth - 1 + extension,
+                                  -beta, -alpha, oppositeColor, ply + 1, move);
         }
       }
-      
+
       board.undoMove();
-      
-      movesSearched++;
-      
-      // Store root move scores
-      if (rootMoves) {
-        rootMoves.push({
-          ...move,
-          score: score
+      searched++;
+
+      if (this.stopSearch) return 0;
+
+      // ── Root bookkeeping — no spread, just a small record ──
+      if (isRoot) {
+        const moveNodes = this.nodes - nodesBefore;
+        this._rootMoveScores.push({
+          move, score, orderScore: move.orderScore, nodes: moveNodes,
         });
+        if (c) c.onRootMove(move, score, moveNodes);
       }
-      
-      if (this.stopSearch) {
-        return { score: 0, move: null };
+
+      // ── Per-move trace — double-guarded, sampled inside ──
+      if (__LOG__ && LOG.search) {
+        logger.searchNode(depth, ply, alpha, beta, searched);
       }
-      
-      logger.searchNode({
-        depth,
-        ply,
-        alpha,
-        beta,
-        move: move.algebraic,
-        score,
-        nodeType: isPvNode ? 'PV' : 'non-PV',
-        movesSearched,
-        reduction
-      });
-      
+
       if (score > bestScore) {
         bestScore = score;
         bestMove = move;
       }
-      
+
       if (score > alpha) {
         alpha = score;
         nodeType = TT_FLAG.EXACT;
-        
+
         if (alpha >= beta) {
+          // Beta cutoff — update heuristics
           this.moveOrderer.addKiller(move, ply);
           if (!isCapture) {
             this.moveOrderer.updateHistory(move, depth, true);
             this.moveOrderer.updateCounterMove(lastMove, move);
           }
-          
+          // Penalize earlier quiets that didn't produce the cutoff
           for (let j = 0; j < i; j++) {
-            if (orderedMoves[j].capturedPiece === null) {
-              this.moveOrderer.updateHistory(orderedMoves[j], depth, false);
+            if (moves[j].capturedPiece === null) {
+              this.moveOrderer.updateHistory(moves[j], depth, false);
             }
           }
-          
           nodeType = TT_FLAG.LOWER_BOUND;
+          if (c) c.onCutoff(ply, move, 'beta');
           break;
         }
       }
     }
-    
+
+    // ── TT store — bestMove encoded to int inside, no object retained ──
     if (this.tt && !this.stopSearch) {
-      this.tt.store(board.gameState.zobristKey, depth, bestScore, nodeType, bestMove);
+      this.tt.store(key, depth, bestScore, nodeType, bestMove);
     }
-    
-    // Sort root moves by score for logging
-    if (rootMoves) {
-      rootMoves.sort((a, b) => b.score - a.score);
+
+    if (isRoot) {
+      this._rootBestMove = bestMove;
+      this._rootMoveScores.sort((a, b) => b.score - a.score);
     }
-    
-    return { 
-      score: bestScore, 
-      move: bestMove,
-      rootMoves: rootMoves || undefined
-    };
+
+    return bestScore;   // ← number
   }
 
-  applyOpeningPrincipleScores(moves, board, color) {
-    return moves.map(move => {
-      const analysis = checkOpeningPrinciples(board, move, color);
-      const adjustment = analysis.totalBonus + analysis.totalPenalty;
-      
-      if (adjustment !== 0) {
-        logger.stage('debug', {
-          stage: GAME_STAGE.OPENING,
-          move: move.algebraic,
-          originalScore: move.orderScore,
-          adjustment,
-          violations: analysis.violations,
-          bonuses: analysis.bonuses
-        }, `Opening adjustment for ${move.algebraic}: ${adjustment}`);
-      }
-      
-      return {
-        ...move,
-        orderScore: move.orderScore + adjustment,
-        openingAnalysis: analysis
-      };
-    }).sort((a, b) => b.orderScore - a.orderScore);
+  /**
+   * Adjust root-move order scores for opening principles.
+   * Mutates in place — no .map(), no spread, no retained analysis objects.
+   */
+  _adjustForOpeningPrinciples(moves, board, color) {
+    for (let i = 0; i < moves.length; i++) {
+      const m = moves[i];
+      const a = checkOpeningPrinciples(board, m, color);
+      const adj = a.totalBonus + a.totalPenalty;
+      if (adj !== 0) m.orderScore += adj;
+      // Deliberately NOT attaching `a` to the move — it would be retained
+      // through TT storage in the old design. If you want the analysis,
+      // recompute it once for the winning move after search ends.
+    }
+    moves.sort((a, b) => b.orderScore - a.orderScore);
   }
 
-  moveCausesCheck(board, move, opponentColor) {
-    board.makeMove(move.fromSquare, move.toSquare, move.promotionPiece);
-    const causesCheck = isInCheck(board, opponentColor);
-    board.undoMove();
-    return causesCheck;
-  }
-
-  extractPV(board, depth) {
+  /**
+   * Follow the TT chain to build the PV. Works with encoded moves.
+   */
+  extractPV(board, maxLen) {
     this.pv = [];
+    if (!this.tt) return;
+
     const seen = new Set();
-    
-    for (let i = 0; i < depth && this.tt; i++) {
+    let made = 0;
+
+    for (let i = 0; i < maxLen; i++) {
       const key = board.gameState.zobristKey;
-      const keyStr = key.toString();
-      
-      if (seen.has(keyStr)) break;
+      const keyStr = key.toString(16);
+      if (seen.has(keyStr)) break;   // repetition
       seen.add(keyStr);
-      
-      const move = this.tt.getBestMove(key);
-      if (!move) break;
-      
-      this.pv.push(move);
-      board.makeMove(move.fromSquare, move.toSquare, move.promotionPiece);
+
+      const enc = this.tt.getBestMove(key);
+      if (enc === 0) break;
+
+      const from = decodeFrom(enc);
+      const to = decodeTo(enc);
+      const promo = decodePromo(enc) || null;
+
+      // Minimal move object for PV display — not a full legal-move struct.
+      this.pv.push({
+        fromSquare: from, toSquare: to, promotionPiece: promo,
+        algebraic: encodedToAlgebraic(enc),
+      });
+
+      board.makeMove(from, to, promo);
+      made++;
     }
-    
-    for (let i = 0; i < this.pv.length; i++) {
-      board.undoMove();
-    }
+
+    // Unwind
+    for (let i = 0; i < made; i++) board.undoMove();
   }
 
-  stop() {
-    this.stopSearch = true;
-    logger.search('info', { nodesSearched: this.nodes }, 'Search stop requested');
-  }
+  stop() { this.stopSearch = true; }
 
   setOption(name, value) {
-    if (name in this.config) {
-      this.config[name] = value;
-      logger.search('info', { name, value }, `Option set: ${name}=${value}`);
-    }
-    
+    if (name in this.config) this.config[name] = value;
     if (name.startsWith('use') || name === 'weights') {
       this.evaluator = new Evaluator(this.config);
       this.moveOrderer = new MoveOrderer(this.config);
