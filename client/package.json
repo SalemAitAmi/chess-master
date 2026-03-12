@@ -19,7 +19,8 @@
     "deploy": "gh-pages -d build",
     "build": "react-scripts build",
     "test": "react-scripts test",
-    "eject": "react-scripts eject"
+    "eject": "react-scripts eject",
+    "clean": "node -e \"const fs=require('fs'); const path=require('path'); const {rimrafSync}=require('rimraf'); const ig=require('ignore')(); const root=require('child_process').execSync('git rev-parse --show-toplevel',{encoding:'utf8'}).trim(); ig.add(fs.readFileSync(path.join(root,'.gitignore'),'utf8')); const walk=d=>{for(const e of fs.readdirSync(d,{withFileTypes:true})){const p=path.join(d,e.name); const rel=path.relative(root,p); if(ig.ignores(rel)) rimrafSync(p); else if(e.isDirectory()) walk(p);} }; walk(process.cwd());\""
   },
   "eslintConfig": {
     "extends": [

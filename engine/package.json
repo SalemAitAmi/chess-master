@@ -15,14 +15,13 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "test:ui": "vitest --ui",
-    
     "test:search": "vitest run test/search.test.js",
     "test:zobrist": "vitest run test/zobrist.test.js",
     "test:repetition": "vitest run test/repetition.test.js",
     "test:endgame": "vitest run test/endgame.test.js",
     "test:eval": "vitest run test/evaluation/",
-    
-    "test:legacy": "node --expose-gc --test"
+    "test:legacy": "node --expose-gc --test",
+    "clean": "node -e \"const fs=require('fs'); const path=require('path'); const {rimrafSync}=require('rimraf'); const ig=require('ignore')(); const root=require('child_process').execSync('git rev-parse --show-toplevel',{encoding:'utf8'}).trim(); ig.add(fs.readFileSync(path.join(root,'.gitignore'),'utf8')); const walk=d=>{for(const e of fs.readdirSync(d,{withFileTypes:true})){const p=path.join(d,e.name); const rel=path.relative(root,p); if(ig.ignores(rel)) rimrafSync(p); else if(e.isDirectory()) walk(p);} }; walk(process.cwd());\""
   },
   "dependencies": {
     "esbuild": "^0.27.3",
@@ -33,6 +32,8 @@
   "devDependencies": {
     "@vitest/coverage-v8": "^4.0.18",
     "@vitest/ui": "^4.0.18",
+    "ignore": "^7.0.5",
+    "rimraf": "^6.1.3",
     "vitest": "^4.0.18"
   },
   "engines": {
