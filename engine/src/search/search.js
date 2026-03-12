@@ -243,6 +243,40 @@ export class SearchEngine {
     const oppositeColor = color === 'white' ? 'black' : 'white';
     const inCheck = isInCheck(board, color);
 
+    // ── Draw detection — MUST come before TT probe ──
+    // A repeated position during search is scored as a draw. We use
+    // twofold (not threefold) inside the search tree: if the engine can
+    // reach this position again, the opponent can force the third
+    // occurrence on the next cycle. Scoring at count=2 is standard and
+    // prevents the oscillation seen in Colosseum endgames.
+    //
+    // Skipped at root because the root position is the one we were ASKED
+    // to search — we need to return a move from it, not "draw". The draw
+    // scoring of root's children is what makes the engine steer away from
+    // (or toward, if losing) repetition.
+    //
+    // Placed BEFORE the TT probe because a TT entry stores a score that
+    // assumed no repetition — using it here would let the engine think a
+    // repeating line still wins material.
+    if (!isRoot) {
+      // 50-move rule: halfMoveClock counts plies since last capture/pawn move.
+      // 100 plies = 50 full moves. Maintained by board.makeMove but was never
+      // consulted here. Without this, K+R vs K shuffles forever.
+      if (board.gameState.halfMoveClock >= 100) {
+        return SCORE.DRAW;
+      }
+      // Repetition. countRepetitions walks the undo stack — cheap, bounded
+      // by halfMoveClock (typically < 20 in normal play). Now that the
+      // Zobrist EP bug is fixed, hashes actually match on repeated positions.
+      if (board.isRepetition(2)) {
+        // Tiny contempt: when ahead, a draw is slightly bad; when behind,
+        // slightly good. Prevents a dead-even 0 from making the engine
+        // indifferent between a draw and a marginal win attempt. Sign flips
+        // with ply parity so it's symmetric across the negamax negation.
+        return (ply & 1) ? 1 : -1;
+      }
+    }
+
     const moves = generateAllLegalMoves(board, color);
 
     // Terminal: mate or stalemate
@@ -398,8 +432,23 @@ export class SearchEngine {
       }
 
       // ── Search the move ──
+      // When a collector is attached at root, search every move with a full
+      // window so the collector gets TRUE scores, not alpha-beta bounds.
+      // Without this, once move #1 scores +600, every subsequent move's
+      // null-window search fails low and reports ≈alpha — gap appears as 0cp.
+      // Cost: root-only, collector-only, so zero impact on production play.
+      const wantTrueRootScores = isRoot && c !== null;
+
       let score;
-      if (this.config.usePVS && searched > 0) {
+      if (wantTrueRootScores) {
+        // Full window, no reduction. We still computed `reduction` above for
+        // stats parity, but we don't apply it — a reduced search would give
+        // a misleadingly low score for a move that's actually fine.
+        score = -this.alphaBeta(board, depth - 1 + extension,
+                                -SCORE.INFINITY, SCORE.INFINITY,
+                                oppositeColor, ply + 1, move);
+
+      } else if (this.config.usePVS && searched > 0) {
         // Null-window scout
         score = -this.alphaBeta(board, depth - 1 + extension - reduction,
                                 -alpha - 1, -alpha, oppositeColor, ply + 1, move);
@@ -463,7 +512,6 @@ export class SearchEngine {
             this.moveOrderer.updateHistory(move, depth, true);
             this.moveOrderer.updateCounterMove(lastMove, move);
           }
-          // Penalize earlier quiets that didn't produce the cutoff
           for (let j = 0; j < i; j++) {
             if (moves[j].capturedPiece === null) {
               this.moveOrderer.updateHistory(moves[j], depth, false);
@@ -471,7 +519,11 @@ export class SearchEngine {
           }
           nodeType = TT_FLAG.LOWER_BOUND;
           if (c) c.onCutoff(ply, move, 'beta');
-          break;
+
+          // When collecting true root scores, DON'T break — we need every
+          // root move evaluated so scoreGap / moveRank assertions work.
+          // In production (no collector), cutoff as normal.
+          if (!wantTrueRootScores) break;
         }
       }
     }

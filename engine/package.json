@@ -11,13 +11,31 @@
     "start:prod": "node dist/prod/server.js",
     "bench": "node dist/prod/engine.js",
     "dev": "node --watch src/server.js",
-    "test:search": "node --expose-gc --test test/search.test.js",
-    "test:fork": "node --expose-gc --test test/forkKnight.test.js"
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:ui": "vitest --ui",
+    
+    "test:search": "vitest run test/search.test.js",
+    "test:zobrist": "vitest run test/zobrist.test.js",
+    "test:repetition": "vitest run test/repetition.test.js",
+    "test:endgame": "vitest run test/endgame.test.js",
+    "test:eval": "vitest run test/evaluation/",
+    
+    "test:legacy": "node --expose-gc --test"
   },
   "dependencies": {
     "esbuild": "^0.27.3",
     "pino": "^8.17.2",
     "pino-pretty": "^10.3.1",
     "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "@vitest/coverage-v8": "^4.0.18",
+    "@vitest/ui": "^4.0.18",
+    "vitest": "^4.0.18"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }

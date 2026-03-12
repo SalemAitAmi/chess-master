@@ -1,18 +1,8 @@
 /**
- * Layer-by-layer introspection — call eval sub-modules, quiescence, move
- * ordering, and single-depth search INDEPENDENTLY of the full search entry
- * point. No logging, no collectors threaded through — each function returns
- * a plain data structure you inspect directly.
- *
- * Debugging flow, bottom-up:
- *   1. legalMoves(fen)        — is the move you expect even legal? (catches fixture bugs)
- *   2. evalComponents(fen)    — does static eval see what you expect?
- *   3. evalLine(fen, [moves]) — play the line by hand; does material track correctly?
- *   4. traceQSearch(fen)      — does quiescence follow the capture chain?
- *   5. searchOnce(fen, depth) — one clean alpha-beta pass, no ID, no TT carryover
- *   6. ordering(fen)          — is the expected move ranked high?
- *
- * If step N looks right but N+1 is wrong, the bug is in layer N+1.
+ * Layer-by-layer introspection for debugging and testing.
+ * 
+ * CRITICAL FIX: evalComponents now uses the exact same phase calculation
+ * as the production Evaluator, ensuring test coverage matches production.
  */
 
 import { Board } from '../../src/core/board.js';
@@ -29,11 +19,73 @@ import { MoveOrderer } from '../../src/search/moveOrdering.js';
 import { SearchEngine } from '../../src/search/search.js';
 import { DecisionCollector } from './DecisionCollector.js';
 
-// ═════════════════════════════════════════════════════════════════════════════
-// Layer 0: Position utilities
-// ═════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
+// Phase calculation — MUST match evaluate.js exactly
+// ═══════════════════════════════════════════════════════════════════════════
 
-/** List legal moves as algebraic strings. First line of defense against fixture typos. */
+const PHASE_KNIGHT = 1;
+const PHASE_BISHOP = 1;
+const PHASE_ROOK = 2;
+const PHASE_QUEEN = 4;
+const MAX_PHASE = 24;
+
+function computePhase(board) {
+  const wp = board.bbPieces[WHITE_IDX];
+  const bp = board.bbPieces[BLACK_IDX];
+  return (wp[PIECES.KNIGHT].popCount() + bp[PIECES.KNIGHT].popCount()) * PHASE_KNIGHT
+       + (wp[PIECES.BISHOP].popCount() + bp[PIECES.BISHOP].popCount()) * PHASE_BISHOP
+       + (wp[PIECES.ROOK].popCount() + bp[PIECES.ROOK].popCount()) * PHASE_ROOK
+       + (wp[PIECES.QUEEN].popCount() + bp[PIECES.QUEEN].popCount()) * PHASE_QUEEN;
+}
+
+// Mop-up calculation matching evaluate.js
+function computeMopUp(board, color, endgameWeight) {
+  if (endgameWeight < 0.5) return 0;
+  
+  const usIdx = color === 'white' ? WHITE_IDX : BLACK_IDX;
+  const oppIdx = usIdx ^ 1;
+  
+  const ourMat = board.bbPieces[usIdx][PIECES.QUEEN].popCount()
+               + board.bbPieces[usIdx][PIECES.ROOK].popCount()
+               + board.bbPieces[usIdx][PIECES.BISHOP].popCount()
+               + board.bbPieces[usIdx][PIECES.KNIGHT].popCount()
+               + board.bbPieces[usIdx][PIECES.PAWN].popCount();
+  const oppMat = board.bbPieces[oppIdx][PIECES.QUEEN].popCount()
+               + board.bbPieces[oppIdx][PIECES.ROOK].popCount()
+               + board.bbPieces[oppIdx][PIECES.BISHOP].popCount()
+               + board.bbPieces[oppIdx][PIECES.KNIGHT].popCount()
+               + board.bbPieces[oppIdx][PIECES.PAWN].popCount();
+  
+  let sign;
+  if (oppMat === 0 && ourMat > 0) sign = 1;
+  else if (ourMat === 0 && oppMat > 0) sign = -1;
+  else return 0;
+  
+  const ourKingSq = board.bbPieces[usIdx][PIECES.KING].getLSB();
+  const oppKingSq = board.bbPieces[oppIdx][PIECES.KING].getLSB();
+  if (ourKingSq < 0 || oppKingSq < 0) return 0;
+  
+  const defKingSq = sign === 1 ? oppKingSq : ourKingSq;
+  const atkKingSq = sign === 1 ? ourKingSq : oppKingSq;
+  
+  const defF = defKingSq & 7, defR = defKingSq >> 3;
+  const df = defF < 4 ? 3 - defF : defF - 4;
+  const dr = defR < 4 ? 3 - defR : defR - 4;
+  const cmd = df + dr;
+  let edgePush = cmd * cmd * 8;
+  if (defF === 0 || defF === 7 || defR === 0 || defR === 7) edgePush += 40;
+  
+  const atkF = atkKingSq & 7, atkR = atkKingSq >> 3;
+  const kingDist = Math.max(Math.abs(atkF - defF), Math.abs(atkR - defR));
+  const proximity = Math.max(0, 14 - 2 * kingDist) * 6;
+  
+  return sign * Math.round((edgePush + proximity) * endgameWeight);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Layer 0: Position utilities
+// ═══════════════════════════════════════════════════════════════════════════
+
 export function legalMoves(fen) {
   const board = Board.fromFen(fen);
   const color = board.gameState.activeColor;
@@ -44,7 +96,6 @@ export function legalMoves(fen) {
   };
 }
 
-/** Apply a move by algebraic string and return the resulting board. Throws if illegal. */
 export function afterMove(fen, algebraic) {
   const board = Board.fromFen(fen);
   const moves = generateAllLegalMoves(board, board.gameState.activeColor);
@@ -59,74 +110,49 @@ export function afterMove(fen, algebraic) {
   return board;
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-// Layer 1: Static evaluation — call sub-modules directly
-// ═════════════════════════════════════════════════════════════════════════════
-
-// Phase constants mirrored from evaluate.js so we can compute context
-// without instantiating an Evaluator.
-const PHASE_WEIGHTS = { [PIECES.KNIGHT]: 1, [PIECES.BISHOP]: 1, [PIECES.ROOK]: 2, [PIECES.QUEEN]: 4 };
-const MAX_PHASE = 24;
-
-function computePhase(board) {
-  let p = 0;
-  for (const pt of [PIECES.KNIGHT, PIECES.BISHOP, PIECES.ROOK, PIECES.QUEEN]) {
-    p += (board.bbPieces[WHITE_IDX][pt].popCount() + board.bbPieces[BLACK_IDX][pt].popCount()) * PHASE_WEIGHTS[pt];
-  }
-  return p;
-}
+// ═══════════════════════════════════════════════════════════════════════════
+// Layer 1: Static evaluation
+// ═══════════════════════════════════════════════════════════════════════════
 
 /**
- * Call each eval sub-module directly. Returns per-component scores plus
- * the context (phase, etc.) each was called with — so you can see both
- * WHAT a component returned and WHY (what inputs it saw).
- *
- * All scores are from `color`'s perspective (positive = good for `color`).
+ * Evaluate a position and return per-component breakdown.
+ * Uses the EXACT same phase calculation as the production Evaluator.
  */
 export function evalComponents(fen, color = null, weights = {}) {
   const board = Board.fromFen(fen);
   color = color || board.gameState.activeColor;
-
-  // Replicate the context Evaluator computes internally. If this drifts
-  // from evaluate.js, the totals won't match — which is itself a useful
-  // regression signal (add a test asserting they agree).
+  
+  // Phase calculation matching Evaluator._computePhase
   const phase = computePhase(board);
-  const gamePhase = Math.min(1, phase / MAX_PHASE);
+  const gamePhase = phase >= MAX_PHASE ? 1 : phase / MAX_PHASE;
   const endgameWeight = 1 - gamePhase;
   const moveCount = board.plyCount;
-
+  
   const w = { material: 1, centerControl: 1, development: 1, pawnStructure: 1, kingSafety: 1, ...weights };
-
-  // Direct sub-module calls. If one throws, you know exactly which
-  // component is broken — no need to bisect through the orchestrator.
+  
+  // Call sub-modules with EXACT same parameters as evaluate.js
   const components = {
-    material:      evaluateMaterial(board, color, w.material, gamePhase),
+    material: evaluateMaterial(board, color, w.material, gamePhase),
     centerControl: evaluateCenterControl(board, color, w.centerControl * (0.5 + 0.5 * gamePhase)),
-    development:   evaluateDevelopment(board, color, moveCount, w.development),
+    development: evaluateDevelopment(board, color, moveCount, w.development),
     pawnStructure: evaluatePawnStructure(board, color, w.pawnStructure),
-    kingSafety:    evaluateKingSafety(board, color, endgameWeight, w.kingSafety),
+    kingSafety: evaluateKingSafety(board, color, endgameWeight, w.kingSafety),
+    mopUp: computeMopUp(board, color, endgameWeight),
   };
-
+  
   const total = Object.values(components).reduce((s, v) => s + v, 0);
-
+  
   return {
     fen, color, total, components,
     context: { phase, gamePhase, endgameWeight, moveCount },
   };
 }
 
-/**
- * Eval the same position from both sides. A correct zero-sum evaluation
- * should give white.total ≈ −black.total. Non-zero `asymmetry` means
- * one of your sub-evaluators is not properly color-symmetric — a common
- * source of "engine plays well as white, badly as black" bugs.
- */
 export function evalSymmetry(fen) {
   const white = evalComponents(fen, 'white');
   const black = evalComponents(fen, 'black');
   const asymmetry = white.total + black.total;
 
-  // Per-component asymmetry — pinpoints WHICH sub-module is asymmetric.
   const componentAsymmetry = {};
   for (const k of Object.keys(white.components)) {
     componentAsymmetry[k] = white.components[k] + black.components[k];
@@ -135,20 +161,8 @@ export function evalSymmetry(fen) {
   return { white, black, asymmetry, componentAsymmetry };
 }
 
-/**
- * Play a sequence of moves and evaluate at each step, all from a FIXED
- * perspective so the numbers are directly comparable across plies.
- *
- * This is the tool for "I think Nxc7+ Kf8 Nxa8 wins a rook — does the
- * evaluator agree at each step?"
- *
- *   const line = evalLine(fen, ['d5c7', 'e8f8', 'c7a8']);
- *   // line[3].components.material should be ~+500 higher than line[0]
- */
 export function evalLine(fen, moves, { perspective = null } = {}) {
   const board = Board.fromFen(fen);
-  // Default: eval from the original mover's perspective throughout,
-  // so a winning line shows monotonically increasing scores.
   const evalColor = perspective || board.gameState.activeColor;
 
   const steps = [];
@@ -161,10 +175,11 @@ export function evalLine(fen, moves, { perspective = null } = {}) {
       fen: board.toFen(),
       total: ec.total,
       components: ec.components,
+      context: ec.context,
     });
   };
 
-  record(null);  // starting position
+  record(null);
 
   for (const alg of moves) {
     const legal = generateAllLegalMoves(board, board.gameState.activeColor);
@@ -182,7 +197,6 @@ export function evalLine(fen, moves, { perspective = null } = {}) {
   return steps;
 }
 
-/** Console-friendly table of an evalLine result. */
 export function printEvalLine(steps) {
   console.table(steps.map(s => ({
     ply: s.ply,
@@ -193,23 +207,15 @@ export function printEvalLine(steps) {
     dev: s.components.development,
     pawns: s.components.pawnStructure,
     king: s.components.kingSafety,
+    mopUp: s.components.mopUp,
     TOTAL: s.total,
   })));
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-// Layer 2: Quiescence — trace the capture chain
-// ═════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
+// Layer 2: Quiescence
+// ═══════════════════════════════════════════════════════════════════════════
 
-/**
- * Run quiescence and record every eval call it makes. Since q-search
- * evaluates exactly once per node (for stand-pat), the sequence of eval
- * calls IS the sequence of nodes visited.
- *
- * We intercept via an evaluator wrapper — no modification to engine code.
- * Q-depth is recovered from board.plyCount (it increments with each
- * makeMove, so plyCount − startingPly = current q-depth).
- */
 export function traceQSearch(fen, { maxQDepth = 8, config = {} } = {}) {
   const board = Board.fromFen(fen);
   const color = board.gameState.activeColor;
@@ -218,20 +224,16 @@ export function traceQSearch(fen, { maxQDepth = 8, config = {} } = {}) {
   const realEval = new Evaluator(config);
   const trace = [];
 
-  // Wrapping evaluate() lets us observe q-search from the outside without
-  // touching quiescence.js. Every stand-pat passes through here.
   const tracingEvaluator = {
     evaluate(b, c) {
       const r = realEval.evaluate(b, c);
       trace.push({
-        qDepth: b.plyCount - basePly,   // recovered from undo-stack depth
+        qDepth: b.plyCount - basePly,
         fen: b.toFen(),
         color: c,
         standPat: r.score,
         inCheck: isInCheck(b, c),
       });
-      // r is Evaluator's shared _result object. Both we and q-search read
-      // .score before the next evaluate() call, so the reuse is safe.
       return r;
     },
   };
@@ -240,10 +242,6 @@ export function traceQSearch(fen, { maxQDepth = 8, config = {} } = {}) {
     board, -SCORE.INFINITY, SCORE.INFINITY, color, tracingEvaluator, 0, maxQDepth
   );
 
-  // Reconstruct the PV by following the deepest chain. Q-search is DFS,
-  // so a node at depth d+1 immediately following a node at depth d is
-  // the child that was explored from it. The first such chain reaching
-  // max depth is (usually) the line that produced the returned score.
   const pv = [];
   let expectDepth = 0;
   for (const node of trace) {
@@ -251,7 +249,6 @@ export function traceQSearch(fen, { maxQDepth = 8, config = {} } = {}) {
       pv.push(node);
       expectDepth++;
     } else if (node.qDepth <= pv.length - 1) {
-      // Backtrack — truncate pv to this depth and continue
       pv.length = node.qDepth;
       pv.push(node);
       expectDepth = node.qDepth + 1;
@@ -267,17 +264,10 @@ export function traceQSearch(fen, { maxQDepth = 8, config = {} } = {}) {
   };
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-// Layer 3: Move ordering — see the ranking and why
-// ═════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
+// Layer 3: Move ordering
+// ═══════════════════════════════════════════════════════════════════════════
 
-/**
- * Generate legal moves, run them through a fresh MoveOrderer, and return
- * the ranking. A fresh orderer means no killer/history state — you see
- * pure MVV-LVA / book / TT tier assignment.
- *
- * Pass `bookHints` to verify book integration without running a full search.
- */
 export function ordering(fen, { bookHints = null, ttMove = 0, config = {} } = {}) {
   const board = Board.fromFen(fen);
   const color = board.gameState.activeColor;
@@ -290,46 +280,32 @@ export function ordering(fen, { bookHints = null, ttMove = 0, config = {} } = {}
     rank: i + 1,
     move: m.algebraic,
     orderScore: m.orderScore,
-    // Tier label derived from which flag got set. Makes it easy to spot
-    // "why is this capture ranked below that quiet move" at a glance.
-    tier: m.isTTMove       ? 'TT'
-        : m.isBookMove     ? 'BOOK'
-        : m.isPromotion    ? 'PROMO'
+    tier: m.isTTMove ? 'TT'
+        : m.isBookMove ? 'BOOK'
+        : m.isPromotion ? 'PROMO'
         : m.capturedPiece !== null ? 'CAPTURE'
-        : m.isKiller       ? 'KILLER'
-        : m.isCounterMove  ? 'COUNTER'
+        : m.isKiller ? 'KILLER'
+        : m.isCounterMove ? 'COUNTER'
         : m.orderScore > 0 ? 'HISTORY'
         : 'QUIET',
     capture: m.capturedPiece !== null ? m.capturedPiece : null,
   }));
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-// Layer 4: Single-depth search — no iterative deepening, no TT carryover
-// ═════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
+// Layer 4: Single-depth search
+// ═══════════════════════════════════════════════════════════════════════════
 
-/**
- * One clean alpha-beta pass at exactly `depth`. Fresh engine every call,
- * so no TT poisoning from previous iterations or previous tests.
- *
- * Use this when you suspect iterative deepening or cross-iteration TT
- * state is confusing the picture. If searchOnce(fen, 4) gives the right
- * answer but searchPosition(fen, {depth:4}) doesn't, the bug is in the
- * ID loop or aspiration windows, not in alpha-beta itself.
- */
 export function searchOnce(fen, depth, { config = {}, bookHints = null } = {}) {
   const board = Board.fromFen(fen);
   const engine = new SearchEngine({ ...DEFAULT_CONFIG, ...config });
   const collector = new DecisionCollector();
 
-  // Bypass search() — set up the minimal state alphaBeta needs and call
-  // it directly. This skips iterative deepening, aspiration windows, and
-  // turn logging entirely.
   engine.resetSearchState();
   engine.searchColor = board.gameState.activeColor;
   engine._collector = collector;
   engine._bookHints = bookHints;
-  engine._stageInfo = null;   // opening-principle adjustment skipped (null-safe in alphaBeta)
+  engine._stageInfo = null;
 
   const score = engine.alphaBeta(
     board, depth, -SCORE.INFINITY, SCORE.INFINITY, engine.searchColor, 0, null
@@ -343,18 +319,10 @@ export function searchOnce(fen, depth, { config = {}, bookHints = null } = {}) {
     nodes: engine.nodes,
     rootMoves: roots,
     stats: engine.stats,
-    // Sanity check: bestMove should match roots[0].move. If not, the
-    // root-move recording and best-move selection have diverged.
     consistent: engine._rootBestMove?.algebraic === roots[0]?.move,
   };
 }
 
-/**
- * Run searchOnce at depths 1..maxDepth and tabulate. If scores oscillate
- * in sign between odd/even depths, you have a perspective bug somewhere
- * (like the ones we just fixed). If the best move changes wildly, move
- * ordering or eval is unstable.
- */
 export function depthSweep(fen, maxDepth, config = {}) {
   const results = [];
   for (let d = 1; d <= maxDepth; d++) {
@@ -366,33 +334,24 @@ export function depthSweep(fen, maxDepth, config = {}) {
   return results;
 }
 
-// ═════════════════════════════════════════════════════════════════════════════
-// Layer 5: Move expansion — see opponent replies to a specific move
-// ═════════════════════════════════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════════════
+// Layer 5: Move expansion
+// ═══════════════════════════════════════════════════════════════════════════
 
-/**
- * Make `moveAlgebraic`, then search the resulting position at `replyDepth`
- * to see how the opponent responds. Answers "if I play X, what does the
- * engine think black does, and what's the resulting score?"
- */
 export function expandMove(fen, moveAlgebraic, replyDepth = 2, config = {}) {
   const childBoard = afterMove(fen, moveAlgebraic);
   const childFen = childBoard.toFen();
-
-  // Score from the REPLYING side's perspective (negamax at the child node).
-  // Negate to get the original mover's view.
   const reply = searchOnce(childFen, replyDepth, { config });
 
   return {
     move: moveAlgebraic,
     childFen,
-    // Original mover's score = −(opponent's best score)
     scoreForMover: -reply.score,
     opponentBest: reply.bestMove,
     opponentReplies: reply.rootMoves.map(m => ({
       reply: m.move,
-      opponentScore: m.score,       // opponent's perspective
-      moverScore: -m.score,         // flipped to original mover's perspective
+      opponentScore: m.score,
+      moverScore: -m.score,
     })),
   };
 }

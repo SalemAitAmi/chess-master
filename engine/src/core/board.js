@@ -14,7 +14,7 @@ import {
   squareToIndex, indexToSquare, colorToIndex, getPieceColor
 } from './bitboard.js';
 import {
-  computeZobristKey, PIECE_SQUARE_KEYS, CASTLING_KEYS, SIDE_KEYS, EN_PASSANT_KEYS
+  computeZobristKey, getEnPassantZobristIndex, PIECE_SQUARE_KEYS, CASTLING_KEYS, SIDE_KEYS, EN_PASSANT_KEYS
 } from '../tables/zobrist.js';
 
 // Undo stack depth: game moves (~300 max) + search depth (~128) + safety
@@ -115,6 +115,42 @@ export class Board {
     b._undoPly = 0;
 
     return b;
+  }
+
+  /**
+   * Count how many times the current Zobrist key appears in the undo history.
+   * Walks backwards through the frames until the half-move clock resets,
+   * because an irreversible move (capture / pawn push) makes any earlier
+   * position unreachable by repetition.
+   *
+   * Returns the count INCLUDING the current position, so:
+   *   1 = first occurrence, 2 = first repetition, 3 = threefold.
+   *
+   * Same-side positions are two plies apart, so we step by 2.
+   */
+  countRepetitions() {
+    const key = this.gameState.zobristKey;
+    const limit = this.gameState.halfMoveClock;   // reversible moves available to scan
+    let count = 1;
+
+    // u.prevZobrist at frame i is the key BEFORE move i was made.
+    // The key N plies ago lives at _undo[_undoPly - N].prevZobrist.
+    // Same side to move ⇒ N must be even. Start at N=2.
+    for (let back = 2; back <= limit && back <= this._undoPly; back += 2) {
+      if (this._undo[this._undoPly - back].prevZobrist === key) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * True if the current position has occurred at least `threshold` times.
+   * Threshold 2 = "this is a repeat" (search-time draw scoring).
+   * Threshold 3 = "threefold" (game-termination rule).
+   */
+  isRepetition(threshold = 2) {
+    return this.countRepetitions() >= threshold;
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -271,13 +307,14 @@ export class Board {
     if (movingColor === 'black') gs.fullMoveCount++;
 
     // ── Zobrist: EP file ──
+    // CRITICAL: computeZobristKey() uses a 17-entry scheme (0–7 white rank,
+    // 8–15 black rank, 16 = no EP). The old code here used only indices 0–8,
+    // causing permanent hash drift after any double pawn push. That drift
+    // poisoned the TT and made repetition detection by hash impossible.
     if (previousEnPassant !== gs.enPassantSquare) {
-      const prevFile = previousEnPassant !== -1 ? previousEnPassant & 7 : 8;
-      const newFile  = gs.enPassantSquare !== -1 ? gs.enPassantSquare & 7 : 8;
-      gs.zobristKey ^= EN_PASSANT_KEYS[prevFile];
-      gs.zobristKey ^= EN_PASSANT_KEYS[newFile];
+      gs.zobristKey ^= EN_PASSANT_KEYS[getEnPassantZobristIndex(previousEnPassant)];
+      gs.zobristKey ^= EN_PASSANT_KEYS[getEnPassantZobristIndex(gs.enPassantSquare)];
     }
-
     // ── Zobrist: castling ──
     if (previousCastling !== gs.castling) {
       gs.zobristKey ^= CASTLING_KEYS[previousCastling];
