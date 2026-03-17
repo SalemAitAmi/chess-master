@@ -318,48 +318,111 @@ export const getValidMoves = (row, col, board, checkCastling = true) => {
   return moves;
 };
 
-export const simulateMove = (fromRow, fromCol, toRow, toCol, board) => {
+/**
+ * Simulate a move on a deep-copied board.
+ *
+ * @param {boolean} autoPromote  If true and the move is a promotion,
+ *   promote to a queen on the copy before returning. Without this,
+ *   the board returned for a promotion is UNMOVED, which makes
+ *   `hasValidMoves` wrong when the only legal move is a promotion
+ *   under check — it tests isInCheck on the pre-move board and
+ *   concludes the move doesn't help → false checkmate.
+ *
+ *   UI callers leave this false so the promotion modal can ask the user
+ *   what to promote to; hasValidMoves passes true.
+ */
+export const simulateMove = (fromRow, fromCol, toRow, toCol, board, autoPromote = false) => {
   const newBoard = deepCopyBoard(board);
   const fromIndex = rowColToIndex(fromRow, fromCol);
   const toIndex = rowColToIndex(toRow, toCol);
   const piece = newBoard.pieceList[fromIndex];
   const color = getPieceColor(newBoard.bbSide, fromIndex);
-  
-  // Check for pawn promotion
-  if (piece === PIECES.PAWN && 
+
+  if (piece === PIECES.PAWN &&
       ((color === "white" && toRow === 0) || (color === "black" && toRow === 7))) {
+    if (autoPromote) {
+      // Queen is always legal if any promotion is legal. Good enough
+      // for the "does this side have ANY legal move" question.
+      newBoard.makeMove(fromIndex, toIndex, PIECES.QUEEN);
+    }
     return { board: newBoard, needsPromotion: true };
   }
-  
-  // Make the move
+
   newBoard.makeMove(fromIndex, toIndex);
-  
   return { board: newBoard, needsPromotion: false };
 };
 
 export const hasValidMoves = (color, board) => {
   const colorIdx = colorToIndex(color);
-  
-  // Check all pieces of the given color
+
   for (let pieceType = PIECES.KING; pieceType <= PIECES.PAWN; pieceType++) {
     const pieceBB = board.bbPieces[colorIdx][pieceType].clone();
-    
+
     while (!pieceBB.isEmpty()) {
       const square = pieceBB.popLSB();
       const [row, col] = indexToRowCol(square);
-      
       const moves = getValidMoves(row, col, board, true);
-      
-      // Check if any move is legal
+
       for (const [toRow, toCol] of moves) {
-        const { board: simulatedBoard } = simulateMove(row, col, toRow, toCol, board);
-        
-        if (!isInCheck(simulatedBoard, color)) {
+        // autoPromote=true so promotion moves are actually tested.
+        const { board: sim } = simulateMove(row, col, toRow, toCol, board, true);
+        if (!isInCheck(sim, color)) {
           return true;
         }
       }
     }
   }
-  
   return false;
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Centralized draw detection — use from ALL game modes.
+//
+// Takes an externally-maintained position-count Map and half-move clock
+// because board.clone() doesn't reliably preserve history (and even if it
+// did, different modes manage board state differently). The caller owns
+// the Map lifecycle; this function just reads it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const isInsufficientMaterial = (board) => {
+  const w = colorToIndex('white');
+  const b = colorToIndex('black');
+
+  // Any pawn/rook/queen → mate is constructible.
+  for (const idx of [w, b]) {
+    if (board.bbPieces[idx][PIECES.PAWN].popCount()  > 0) return false;
+    if (board.bbPieces[idx][PIECES.ROOK].popCount()  > 0) return false;
+    if (board.bbPieces[idx][PIECES.QUEEN].popCount() > 0) return false;
+  }
+
+  // K vs K, K+minor vs K, K+minor vs K+minor — all draws.
+  // (K+B+B on same color is also a draw, K+N+N is a draw vs lone king —
+  // not checking those edge cases here. FIDE rules say "cannot checkmate
+  // by any sequence of legal moves", which is nontrivial to compute.
+  // The common cases cover 99% of real games.)
+  const wMinor = board.bbPieces[w][PIECES.BISHOP].popCount() + board.bbPieces[w][PIECES.KNIGHT].popCount();
+  const bMinor = board.bbPieces[b][PIECES.BISHOP].popCount() + board.bbPieces[b][PIECES.KNIGHT].popCount();
+  return wMinor <= 1 && bMinor <= 1;
+};
+
+/**
+ * @param {Board} board             Current board (post-move)
+ * @param {Map<string,number>} positionCounts  zobristKeyStr → occurrence count, caller-maintained
+ * @param {number} halfMoveClock    Plies since last capture/pawn move, caller-maintained
+ */
+export const checkDrawConditions = (board, positionCounts, halfMoveClock) => {
+  if (halfMoveClock >= 100) {
+    return { isDraw: true, reason: '50-move rule' };
+  }
+
+  const key = String(board.gameState.zobrist_key);
+  if ((positionCounts.get(key) || 0) >= 3) {
+    return { isDraw: true, reason: 'threefold repetition' };
+  }
+
+  if (isInsufficientMaterial(board)) {
+    return { isDraw: true, reason: 'insufficient material' };
+  }
+
+  return { isDraw: false, reason: null };
 };

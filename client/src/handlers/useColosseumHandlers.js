@@ -1,8 +1,39 @@
+/**
+ * Colosseum game loop — engine vs engine.
+ *
+ * v3 — fixes the triple-win regression from v2.
+ *
+ * v2's failure mode: `roundActiveRef.current = true` ran in the effect
+ * body. When `config` came through as a fresh object reference per
+ * parent render (inline prop, unstable), the effect refired on every
+ * `setBoard` → parent re-render → new `config`. Each refire reset
+ * roundActiveRef, so after loop₁ called endRound and set it false,
+ * the very next refire flipped it back to true — and loop₂'s
+ * null-move handler walked right through the "idempotence" guard.
+ * Same refire also cleared positionCountsRef on every move, so draws
+ * never accumulated.
+ *
+ * Fix:
+ *   - `roundTerminatedRef` is reset ONLY by currentRound changing —
+ *     never by the game-loop effect. Spurious refires can't un-terminate.
+ *   - `config` removed from game-loop deps entirely. Read via ref.
+ *   - Generation counter kills stale loops deterministically, regardless
+ *     of where they are in their await chain.
+ *   - 1s minimum per-move cadence (per user request) so endgame TT hits
+ *     don't machine-gun through the last ten moves.
+ */
+
 import { useEffect, useRef, useCallback } from "react";
 import { isInCheck, hasValidMoves } from "../utils/chessLogic";
 import { PIECES } from "../constants/gameConstants";
 import { rowColToIndex, colorToIndex } from "../utils/bitboard";
 import { BotPlayer, abortSearch } from '../players/BotPlayer';
+
+// Hard floor on move cadence. Engine often replies in <10ms near the
+// endgame (TT hits, narrow trees) — without this the last dozen moves
+// blur past faster than React can keep up, and any per-render race
+// gets a dozen chances to fire.
+const MIN_MOVE_INTERVAL_MS = 1000;
 
 export const useColosseumHandlers = (
   gameState,
@@ -23,241 +54,292 @@ export const useColosseumHandlers = (
     setWinner,
   } = gameState;
 
-  const colosseumBotsRef = useRef({ white: null, black: null });
-  const moveTimeoutRef = useRef(null);
-  const isProcessingMoveRef = useRef(false);
-  const stopRequestedRef = useRef(false);
+  // ── Live mirrors ──
+  // Read these inside the async loop instead of closing over React state.
+  const boardRef   = useRef(boardObj);
+  const configRef  = useRef(config);
+  useEffect(() => { boardRef.current  = boardObj; }, [boardObj]);
+  useEffect(() => { configRef.current = config;   }, [config]);
+
+  // ── Termination flag — reset ONLY on round change ──
+  // This is the critical difference from v2. The game-loop effect never
+  // touches this. It can refire a thousand times and a terminated round
+  // stays terminated.
+  const roundTerminatedRef = useRef(false);
+  useEffect(() => {
+    roundTerminatedRef.current = false;
+  }, [currentRound]);
+
+  // ── Generation counter — stale-loop kill switch ──
+  // Each game-loop effect fire bumps this. A loop captures its generation
+  // at birth; the moment a newer generation exists, the old loop exits on
+  // its next check. Works regardless of which await the old loop is stuck
+  // in, and doesn't depend on cleanup timing.
+  const generationRef = useRef(0);
+
+  // ── Draw tracking — survives effect refires ──
+  // Cleared on round change, NOT on effect refire. (v2 cleared these in
+  // the effect body → wiped on every spurious refire → never reached 3.)
+  const positionCountsRef = useRef(new Map());
+  const halfMoveClockRef  = useRef(0);
+  useEffect(() => {
+    positionCountsRef.current = new Map();
+    halfMoveClockRef.current = 0;
+  }, [currentRound]);
+
+  // ── External control ──
+  const botsRef           = useRef({ white: null, black: null });
+  const stopRequestedRef  = useRef(false);
   const onStopCallbackRef = useRef(null);
-  const isInitializedRef = useRef(false);
 
-  const initializeBots = useCallback(() => {
-    const swapped = currentRound % 2 === 1;
-    const whiteDifficulty = swapped ? config.blackBot : config.whiteBot;
-    const blackDifficulty = swapped ? config.whiteBot : config.blackBot;
-    
-    console.log('[Colosseum] Initializing bots for round', currentRound + 1);
-    
-    colosseumBotsRef.current.white = new BotPlayer('white', boardObj, whiteDifficulty);
-    colosseumBotsRef.current.black = new BotPlayer('black', boardObj, blackDifficulty);
-    isInitializedRef.current = true;
-  }, [boardObj, config, currentRound]);
+  // ───────────────────────────────────────────────────────────────────────
 
-  // Check for draw conditions
-  const checkForDraw = useCallback((board) => {
-    // 50-move rule
-    if (board.gameState.half_move_clock >= 100) {
+  const endRound = (winnerValue, reason) => {
+    // Truly idempotent now — roundTerminatedRef survives effect refires.
+    if (roundTerminatedRef.current) return;
+    roundTerminatedRef.current = true;
+    console.log(`[Colosseum] Round ${currentRound + 1} over: ${winnerValue} (${reason})`);
+    setGameOver(true);
+    setWinner(winnerValue);
+  };
+
+  const recordPosition = (board, wasCapture, wasPawnMove) => {
+    if (wasCapture || wasPawnMove) {
+      // Irreversible → prior positions unreachable → counts irrelevant.
+      // Clearing keeps the Map bounded (≤100 entries between clears).
+      positionCountsRef.current.clear();
+      halfMoveClockRef.current = 0;
+    } else {
+      halfMoveClockRef.current++;
+    }
+    const key = String(board.gameState.zobrist_key);
+    positionCountsRef.current.set(key, (positionCountsRef.current.get(key) || 0) + 1);
+  };
+
+  const checkForDraw = (board) => {
+    const hmc = halfMoveClockRef.current;
+
+    // Diagnostic — fires every 20 reversible plies so we can confirm
+    // tracking is actually accumulating. If you never see this log in
+    // a 198-move game, something upstream is resetting the refs.
+    if (hmc > 0 && hmc % 20 === 0) {
+      const key = String(board.gameState.zobrist_key);
+      console.log(
+        `[Colosseum] Draw tracking — hmc=${hmc} ` +
+        `positions=${positionCountsRef.current.size} ` +
+        `currentKeyCount=${positionCountsRef.current.get(key) || 0} ` +
+        `keyPrefix=${key.slice(0, 12)}`
+      );
+    }
+
+    if (hmc >= 100) {
       return { isDraw: true, reason: '50-move rule' };
     }
-    
-    // Threefold repetition
-    const currentZobrist = board.gameState.zobrist_key;
-    let count = 1;
-    for (let i = 0; i < board.history.states.length; i++) {
-      if (board.history.states[i].zobrist_key === currentZobrist) {
-        count++;
-        if (count >= 3) {
-          return { isDraw: true, reason: 'Threefold repetition' };
-        }
+
+    const key = String(board.gameState.zobrist_key);
+    if ((positionCountsRef.current.get(key) || 0) >= 3) {
+      return { isDraw: true, reason: 'threefold repetition' };
+    }
+
+    // Insufficient material — pure popcount, no history needed.
+    const w = colorToIndex('white'), b = colorToIndex('black');
+    const heavy = (i) =>
+      board.bbPieces[i][PIECES.PAWN].popCount() +
+      board.bbPieces[i][PIECES.ROOK].popCount() +
+      board.bbPieces[i][PIECES.QUEEN].popCount();
+    if (heavy(w) === 0 && heavy(b) === 0) {
+      const minors = (i) =>
+        board.bbPieces[i][PIECES.BISHOP].popCount() +
+        board.bbPieces[i][PIECES.KNIGHT].popCount();
+      if (minors(w) <= 1 && minors(b) <= 1) {
+        return { isDraw: true, reason: 'insufficient material' };
       }
     }
-    
-    // Insufficient material
-    const whiteIdx = colorToIndex('white');
-    const blackIdx = colorToIndex('black');
-    
-    const hasPawns = board.bbPieces[whiteIdx][PIECES.PAWN].popCount() > 0 ||
-                    board.bbPieces[blackIdx][PIECES.PAWN].popCount() > 0;
-    const hasQueens = board.bbPieces[whiteIdx][PIECES.QUEEN].popCount() > 0 ||
-                     board.bbPieces[blackIdx][PIECES.QUEEN].popCount() > 0;
-    const hasRooks = board.bbPieces[whiteIdx][PIECES.ROOK].popCount() > 0 ||
-                    board.bbPieces[blackIdx][PIECES.ROOK].popCount() > 0;
-    
-    if (!hasPawns && !hasQueens && !hasRooks) {
-      const whiteMinors = board.bbPieces[whiteIdx][PIECES.BISHOP].popCount() + 
-                         board.bbPieces[whiteIdx][PIECES.KNIGHT].popCount();
-      const blackMinors = board.bbPieces[blackIdx][PIECES.BISHOP].popCount() + 
-                         board.bbPieces[blackIdx][PIECES.KNIGHT].popCount();
-      
-      if (whiteMinors <= 1 && blackMinors <= 1) {
-        return { isDraw: true, reason: 'Insufficient material' };
-      }
-    }
-    
+
     return { isDraw: false, reason: null };
-  }, []);
+  };
 
-  const executeMove = useCallback(async () => {
-    if (gameOver || stopRequestedRef.current || isProcessingMoveRef.current) {
+  // ───────────────────────────────────────────────────────────────────────
+  // Game loop — deps are [currentRound, isRunning] ONLY.
+  //
+  // config is gone from deps. If it's an inline object in the parent,
+  // that no longer refires us. We read configRef.current once at the
+  // top of each effect fire. If config genuinely changes mid-tournament
+  // (user tweaks difficulty?), the next round picks it up; the current
+  // round finishes with the old settings. That's the sane behavior anyway.
+  // ───────────────────────────────────────────────────────────────────────
+  useEffect(() => {
+    const cfg = configRef.current;
+    if (!cfg || !isRunning) return;
+
+    // If this round already ended (e.g. StrictMode double-fire, or some
+    // other refire after termination), don't spin up another loop.
+    if (roundTerminatedRef.current) {
+      console.log('[Colosseum] Skipping loop start — round already terminated');
       return;
     }
 
-    if (!colosseumBotsRef.current.white || !colosseumBotsRef.current.black) {
-      return;
+    // Claim a generation. Any older loop sees the mismatch and exits.
+    const myGen = ++generationRef.current;
+    console.log(`[Colosseum] Round ${currentRound + 1} loop gen=${myGen}`);
+
+    // Seed position tracking with the starting position — only if the
+    // map is empty (i.e., this is a fresh round, not a spurious refire).
+    // On a refire mid-round, the map already has data we want to keep.
+    if (positionCountsRef.current.size === 0) {
+      const startKey = String(boardRef.current.gameState.zobrist_key);
+      positionCountsRef.current.set(startKey, 1);
     }
 
-    // Check for draw before making a move
-    const drawCheck = checkForDraw(boardObj);
-    if (drawCheck.isDraw) {
-      console.log('[Colosseum] Draw detected:', drawCheck.reason);
-      setGameOver(true);
-      setWinner('draw');
-      return;
-    }
+    // Bot init — inline, one-shot, no stale boardObj closure.
+    const swapped = currentRound % 2 === 1;
+    botsRef.current.white = new BotPlayer('white', boardRef.current,
+      swapped ? cfg.blackBot : cfg.whiteBot);
+    botsRef.current.black = new BotPlayer('black', boardRef.current,
+      swapped ? cfg.whiteBot : cfg.blackBot);
 
-    const currentColor = boardObj.gameState.active_color;
-    const currentBot = currentColor === 'white' 
-      ? colosseumBotsRef.current.white 
-      : colosseumBotsRef.current.black;
-    
-    if (!currentBot) return;
+    // Closure-local cancellation for cleanup. Generation check handles
+    // the stale-loop case; this handles the unmount case.
+    let cancelled = false;
+    const shouldExit = () =>
+      cancelled ||
+      generationRef.current !== myGen ||
+      roundTerminatedRef.current ||
+      stopRequestedRef.current;
 
-    isProcessingMoveRef.current = true;
+    const loop = async () => {
+      // Move cadence: track when each iteration STARTS, not when the
+      // engine replies. If the engine takes 3s, no extra wait. If it
+      // takes 10ms, we wait the remaining 990ms.
+      let iterStart = Date.now() - MIN_MOVE_INTERVAL_MS;  // first iter: no wait
 
-    try {
-      currentBot.updateBoard(boardObj);
-      
-      const move = await currentBot.makeMove();
-      
-      if (move && !stopRequestedRef.current) {
-        const fromIndex = rowColToIndex(move.from[0], move.from[1]);
-        const toIndex = rowColToIndex(move.to[0], move.to[1]);
-        
-        const newBoard = boardObj.clone();
-        const piece = newBoard.pieceList[fromIndex];
-        
-        const isPromotion = piece === PIECES.PAWN && 
-          ((currentColor === 'white' && move.to[0] === 0) || 
-           (currentColor === 'black' && move.to[0] === 7));
-        
-        if (isPromotion) {
-          newBoard.makeMove(fromIndex, toIndex, PIECES.QUEEN);
-        } else {
-          newBoard.makeMove(fromIndex, toIndex);
+      while (!shouldExit()) {
+        // ── Cadence throttle ──
+        const sinceLastIter = Date.now() - iterStart;
+        if (sinceLastIter < MIN_MOVE_INTERVAL_MS) {
+          await new Promise(r => setTimeout(r, MIN_MOVE_INTERVAL_MS - sinceLastIter));
+          if (shouldExit()) break;
         }
-        
+        iterStart = Date.now();
+
+        // ── Read CURRENT board via ref — never a stale closure ──
+        const board = boardRef.current;
+        const color = board.gameState.active_color;
+        const bot = color === 'white' ? botsRef.current.white : botsRef.current.black;
+        if (!bot) break;
+
+        // ── Engine move ──
+        let move;
+        try {
+          bot.updateBoard(board);
+          move = await bot.makeMove();
+        } catch (err) {
+          console.error('[Colosseum] Bot error:', err);
+          break;
+        }
+        if (shouldExit()) break;
+
+        if (!move) {
+          // Engine saw terminal before we did (its movegen returned empty).
+          // Confirm with our own check so the winner is correct.
+          const mated = isInCheck(board, color);
+          endRound(mated ? (color === 'white' ? 'black' : 'white') : 'draw',
+                   mated ? 'checkmate (engine-side)' : 'stalemate (engine-side)');
+          break;
+        }
+
+        // ── Apply ──
+        const fromIdx = rowColToIndex(move.from[0], move.from[1]);
+        const toIdx   = rowColToIndex(move.to[0], move.to[1]);
+        const newBoard = board.clone();
+
+        const movingPiece   = newBoard.pieceList[fromIdx];
+        const capturedPiece = newBoard.pieceList[toIdx];
+        const wasCapture  = capturedPiece !== PIECES.NONE;
+        const wasPawnMove = movingPiece === PIECES.PAWN;
+        const isPromo = wasPawnMove && (
+          (color === 'white' && move.to[0] === 0) ||
+          (color === 'black' && move.to[0] === 7)
+        );
+        newBoard.makeMove(fromIdx, toIdx, isPromo ? PIECES.QUEEN : undefined);
+
+        // Record BEFORE setBoard so draw state is consistent with the
+        // board we're about to publish, even if React batches weirdly.
+        recordPosition(newBoard, wasCapture, wasPawnMove);
+
+        // Publish + eager ref bump (don't wait for React's render to
+        // update boardRef — next iteration reads it immediately).
         setBoard(newBoard);
         setLastMove({ from: move.from, to: move.to });
-        
-        // Check for draw after move
-        const postMoveDrawCheck = checkForDraw(newBoard);
-        if (postMoveDrawCheck.isDraw) {
-          console.log('[Colosseum] Draw after move:', postMoveDrawCheck.reason);
-          setGameOver(true);
-          setWinner('draw');
-          return;
+        boardRef.current = newBoard;
+
+        // ── Terminal checks ──
+        const draw = checkForDraw(newBoard);
+        if (draw.isDraw) {
+          endRound('draw', draw.reason);
+          break;
         }
-        
-        const nextColor = newBoard.gameState.active_color;
-        const opponentInCheck = isInCheck(newBoard, nextColor);
-        const opponentHasMoves = hasValidMoves(nextColor, newBoard);
-        
-        if (!opponentHasMoves) {
-          setGameOver(true);
-          if (opponentInCheck) {
-            setWinner(currentColor);
-          } else {
-            setWinner('draw');
-          }
+
+        const next = newBoard.gameState.active_color;
+        if (!hasValidMoves(next, newBoard)) {
+          const mated = isInCheck(newBoard, next);
+          endRound(mated ? color : 'draw', mated ? 'checkmate' : 'stalemate');
+          break;
         }
       }
-    } catch (err) {
-      console.error('[Colosseum] Bot move error:', err);
-    } finally {
-      isProcessingMoveRef.current = false;
-      
+
+      // Stop-callback handshake
       if (stopRequestedRef.current && onStopCallbackRef.current) {
-        onStopCallbackRef.current();
+        const cb = onStopCallbackRef.current;
         onStopCallbackRef.current = null;
         stopRequestedRef.current = false;
-      }
-    }
-  }, [boardObj, gameOver, setBoard, setLastMove, setGameOver, setWinner, checkForDraw]);
-
-  useEffect(() => {
-    if (config && isRunning) {
-      initializeBots();
-    }
-    
-    return () => {
-      if (moveTimeoutRef.current) {
-        clearTimeout(moveTimeoutRef.current);
-        moveTimeoutRef.current = null;
-      }
-    };
-  }, [config, currentRound, isRunning, initializeBots]);
-
-  useEffect(() => {
-    if (!isRunning || gameOver || !isInitializedRef.current) {
-      return;
-    }
-
-    const scheduleMove = () => {
-      if (!isProcessingMoveRef.current && !gameOver && isRunning && !stopRequestedRef.current) {
-        moveTimeoutRef.current = setTimeout(async () => {
-          await executeMove();
-          if (isRunning && !gameOver && !stopRequestedRef.current) {
-            scheduleMove();
-          }
-        }, 100);
+        cb();
       }
     };
 
-    scheduleMove();
+    loop();
 
     return () => {
-      if (moveTimeoutRef.current) {
-        clearTimeout(moveTimeoutRef.current);
-        moveTimeoutRef.current = null;
-      }
+      cancelled = true;
+      // Do NOT touch roundTerminatedRef or positionCountsRef here.
+      // Cleanup fires on every refire — resetting round-scoped state
+      // here was exactly the v2 bug.
     };
-  }, [boardObj, isRunning, gameOver, executeMove]);
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentRound, isRunning]);
+
+  // ───────────────────────────────────────────────────────────────────────
 
   const stopMatch = useCallback((callback) => {
-    console.log('[Colosseum] stopMatch called');
+    console.log('[Colosseum] Stop requested');
     stopRequestedRef.current = true;
+    onStopCallbackRef.current = callback || null;
+    roundTerminatedRef.current = true;   // round is over, just not naturally
+    generationRef.current++;             // kill any loop in flight
     setIsRunning(false);
-    
-    // Abort any ongoing search
     abortSearch();
-    
-    if (moveTimeoutRef.current) {
-      clearTimeout(moveTimeoutRef.current);
-      moveTimeoutRef.current = null;
-    }
-    
-    if (isProcessingMoveRef.current) {
-      onStopCallbackRef.current = callback;
-      // Give the search a moment to abort
-      setTimeout(() => {
-        if (onStopCallbackRef.current) {
-          onStopCallbackRef.current();
-          onStopCallbackRef.current = null;
-        }
-        isProcessingMoveRef.current = false;
-      }, 500);
-    } else {
-      if (callback) callback();
-    }
+
+    setTimeout(() => {
+      if (onStopCallbackRef.current) {
+        const cb = onStopCallbackRef.current;
+        onStopCallbackRef.current = null;
+        cb();
+      }
+    }, 500);
   }, [setIsRunning]);
 
   const cleanup = useCallback(() => {
     console.log('[Colosseum] Final cleanup');
     stopRequestedRef.current = true;
+    roundTerminatedRef.current = true;
+    generationRef.current++;
     abortSearch();
-    
-    if (moveTimeoutRef.current) {
-      clearTimeout(moveTimeoutRef.current);
-      moveTimeoutRef.current = null;
-    }
-    colosseumBotsRef.current = { white: null, black: null };
-    isProcessingMoveRef.current = false;
-    stopRequestedRef.current = false;
+    botsRef.current = { white: null, black: null };
     onStopCallbackRef.current = null;
-    isInitializedRef.current = false;
+    positionCountsRef.current.clear();
+    halfMoveClockRef.current = 0;
   }, []);
 
-  return {
-    stopMatch,
-    cleanup,
-  };
+  return { stopMatch, cleanup };
 };

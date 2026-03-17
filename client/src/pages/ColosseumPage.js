@@ -58,41 +58,51 @@ const ColosseumPage = ({ gameState, config, onBackToMenu }) => {
     gameOverProcessedRef.current = false;
   }, [currentRound]);
 
-  // Handle game over and round progression
+  // Pull primitives out so the effect deps are stable. `config` as an
+  // object may be a fresh reference per parent render; `gameState` from
+  // useGameState() definitely is. Depending on either fires this effect
+  // on every single render. gameOverProcessedRef made it idempotent, but
+  // we were still running it ~200 times per round for no reason.
+  const maxRounds = config?.maxRounds ?? 0;
+  const whiteBot  = config?.whiteBot;
+  const blackBot  = config?.blackBot;
+
   useEffect(() => {
-    if (!gameOver || !config || gameOverProcessedRef.current) return;
-    
-    // Mark as processed to prevent duplicate handling
+    if (!gameOver || !maxRounds || gameOverProcessedRef.current) return;
     gameOverProcessedRef.current = true;
 
+    const swapped = currentRound % 2 === 1;
     const result = {
       round: currentRound + 1,
-      winner: winner,
-      whiteBotDifficulty: currentRound % 2 === 0 ? config.whiteBot : config.blackBot,
-      blackBotDifficulty: currentRound % 2 === 0 ? config.blackBot : config.whiteBot,
-      moves: boardObj.history.moves.length,
-      fen: boardToFen(boardObj)
+      winner,
+      whiteBotDifficulty: swapped ? blackBot : whiteBot,
+      blackBotDifficulty: swapped ? whiteBot : blackBot,
+      moves: boardObj.history?.moves?.length ?? 0,
+      fen: boardToFen(boardObj),
     };
-    
+
+    console.log(`[ColosseumPage] Recording result: round ${result.round}, ${result.winner}, ${result.moves} moves`);
+
     setColosseumResults(prev => {
-      // Check if this round was already added
       if (prev.some(r => r.round === result.round)) {
+        console.warn(`[ColosseumPage] Duplicate round ${result.round} blocked by dedup`);
         return prev;
       }
       return [...prev, result];
     });
-    
-    if (currentRound + 1 < config.maxRounds && isRunning) {
+
+    if (currentRound + 1 < maxRounds && isRunning) {
       setTimeout(() => {
         setCurrentRound(prev => prev + 1);
         gameState.resetGame();
-        gameState.setGameOver(false);
-        gameState.setWinner(null);
       }, 2000);
     } else {
       setIsRunning(false);
     }
-  }, [gameOver, config, currentRound, winner, boardObj, isRunning, gameState]);
+  // boardObj intentionally included — we want to capture the move count
+  // at the moment gameOver flips true. The ref guard keeps it idempotent.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [gameOver, currentRound, winner, boardObj, isRunning, maxRounds, whiteBot, blackBot]);
 
   const handleStopClick = useCallback(() => {
     setIsPendingAction(true);
@@ -108,6 +118,23 @@ const ColosseumPage = ({ gameState, config, onBackToMenu }) => {
       onBackToMenu();
     });
   }, [stopMatch, onBackToMenu]);
+
+  // ── "Start New Game" → back to round/difficulty selection ──
+  // Tear down the running match, clear results, reset game state, then
+  // navigate. If your difficulty picker lives on a dedicated Colosseum
+  // config screen (not MainMenu), swap onBackToMenu for an onBackToSetup
+  // prop from the parent.
+  const handleNewGame = useCallback(() => {
+    setIsPendingAction(true);
+    stopMatch(() => {
+      cleanup();
+      setColosseumResults([]);
+      setCurrentRound(0);
+      gameState.resetGame();
+      setIsPendingAction(false);
+      onBackToMenu();
+    });
+  }, [stopMatch, cleanup, gameState, onBackToMenu]);
 
   const ColosseumSummary = () => {
     if (colosseumResults.length === 0) return null;
@@ -220,7 +247,7 @@ const ColosseumPage = ({ gameState, config, onBackToMenu }) => {
       <GameOverModal
         gameOver={gameOver}
         winner={winner}
-        onRestart={null}
+        onRestart={handleNewGame}
       />
 
       <ColosseumSummary />

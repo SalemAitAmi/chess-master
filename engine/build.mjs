@@ -10,17 +10,22 @@ await esbuild.build({
   format: 'esm',
   outdir: isProduction ? 'dist/prod' : 'dist/dev',
 
-  // ── This is the "preprocessor" ──
-  // esbuild replaces __LOG__ with the literal `false` at parse time,
-  // then eliminates `if (false) { ... }` blocks entirely.
+  // ── CRITICAL FIX ──
+  // Source code reads `globalThis.__LOG__`, not bare `__LOG__`.
+  // esbuild's define matches exact expressions — the previous key
+  // `'__LOG__'` matched nothing, so DCE never fired and every
+  // `if (__LOG__ && ...)` block survived into the prod bundle.
+  //
+  // After substitution: `const __LOG__ = false ?? true` → `false`,
+  // then `if (false && LOG.search)` → dead code → stripped.
   define: {
-    '__LOG__': isProduction ? 'false' : 'true',
-    '__DEV__': isProduction ? 'false' : 'true',
+    'globalThis.__LOG__': isProduction ? 'false' : 'true',
+    'globalThis.__DEV__': isProduction ? 'false' : 'true',
   },
 
   minify: isProduction,        // Required for DCE to actually fire
   treeShaking: true,
-  external: ['ws'],            // Don't bundle native deps
+  external: ['ws'],
 });
 
 console.log(`Built ${isProduction ? 'production (logging stripped)' : 'dev'} bundle`);

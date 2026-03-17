@@ -1,5 +1,5 @@
 import { getPieceAt } from "../utils/chessUtils";
-import { getValidMoves, simulateMove, isInCheck, hasValidMoves } from "../utils/chessLogic";
+import { getValidMoves, simulateMove, isInCheck, hasValidMoves, isInsufficientMaterial } from "../utils/chessLogic";
 import { PIECES, SQUARE_NAMES } from "../constants/gameConstants";
 import { rowColToIndex, indexToRowCol, indexToSquare } from "../utils/bitboard";
 
@@ -47,17 +47,24 @@ export const createGameHandlers = (gameState, engineCallbacks = {}) => {
     const moveStr = indexToSquare(fromIndex) + indexToSquare(toIndex) + pieceType;
     addMove(moveStr);
 
+    // ── Game termination ──
     const nextTurnColor = newBoard.gameState.active_color;
+    // The promoter was whoever just moved — the OPPOSITE of next-to-move.
+    // (makeMove already flipped active_color.)
+    const currentColor = nextTurnColor === "white" ? "black" : "white";
+
     const opponentInCheck = isInCheck(newBoard, nextTurnColor);
     const opponentHasMoves = hasValidMoves(nextTurnColor, newBoard);
 
     if (!opponentHasMoves) {
       setGameOver(true);
-      if (opponentInCheck) {
-        setWinner(nextTurnColor === "white" ? "black" : "white");
-      } else {
-        setWinner("draw");
-      }
+      setWinner(opponentInCheck ? currentColor : "draw");
+    } else if (newBoard.gameState.half_move_clock >= 100) {
+      setGameOver(true);
+      setWinner("draw");
+    } else if (isInsufficientMaterial(newBoard)) {
+      setGameOver(true);
+      setWinner("draw");
     } else if (onMoveComplete) {
       onMoveComplete(newBoard, moveStr);
     }
@@ -103,19 +110,30 @@ export const createGameHandlers = (gameState, engineCallbacks = {}) => {
     if (promotionPiece) moveStr += promotionPiece;
     addMove(moveStr);
 
-    // Check for game end
+    // ── Game termination ──
     const nextTurnColor = newBoard.gameState.active_color;
     const opponentInCheck = isInCheck(newBoard, nextTurnColor);
     const opponentHasMoves = hasValidMoves(nextTurnColor, newBoard);
 
     if (!opponentHasMoves) {
       setGameOver(true);
-      if (opponentInCheck) {
-        setWinner(currentColor);
-      } else {
-        setWinner("draw");
-      }
-    } else if (onMoveComplete) {
+      setWinner(opponentInCheck ? currentColor : "draw");
+    }
+    // 50-move — the one draw condition that can be checked against the
+    // board alone (assuming the client's makeMove increments the clock
+    // correctly). Threefold needs caller-maintained history; see
+    // useColosseumHandlers for the pattern. For human-play modes, the
+    // 50-move + insufficient-material checks catch the vast majority
+    // of drawn endgames in practice.
+    else if (newBoard.gameState.half_move_clock >= 100) {
+      setGameOver(true);
+      setWinner("draw");
+    }
+    else if (isInsufficientMaterial(newBoard)) {
+      setGameOver(true);
+      setWinner("draw");
+    }
+    else if (onMoveComplete) {
       onMoveComplete(newBoard, moveStr);
     }
 

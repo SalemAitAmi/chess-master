@@ -72,18 +72,26 @@ export class Engine {
 
   isGameOver() {
     const color = this.board.gameState.activeColor;
-    
+
     if (!hasLegalMoves(this.board, color)) {
       if (isInCheck(this.board, color)) {
         return { over: true, result: 'checkmate', winner: color === 'white' ? 'black' : 'white' };
       }
       return { over: true, result: 'stalemate', winner: null };
     }
-    
+
     if (this.board.gameState.halfMoveClock >= 100) {
       return { over: true, result: 'fifty-move', winner: null };
     }
-    
+
+    // Threefold — was missing. The board tracks this correctly via the
+    // Zobrist undo stack (see board.countRepetitions), but nobody asked.
+    // The search uses isRepetition(2) internally to score repeating lines
+    // as draws, but game-termination needs the full threefold.
+    if (this.board.isRepetition(3)) {
+      return { over: true, result: 'threefold', winner: null };
+    }
+
     return { over: false };
   }
 
