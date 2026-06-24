@@ -1,5 +1,6 @@
 /**
  * UCI Engine Client for communicating with the backend engine server
+ * Extended with local play support commands
  */
 
 export const LOG_CATEGORY = {
@@ -24,15 +25,17 @@ export class EngineClient {
     this.connected = false;
     this.ready = false;
     
-    // Separate handling for different response types
-    this.pendingSimpleResponse = null;  // For uci, isready
-    this.pendingSearchResponse = null;  // For go command (no timeout)
+    // Response handling
+    this.pendingSimpleResponse = null;
+    this.pendingSearchResponse = null;
+    this.pendingMultiLineResponse = null;
     
     // Callbacks
     this.onInfo = null;
     this.onBestMove = null;
     this.onConnectionChange = null;
     this.onError = null;
+    this.onGameState = null;
   }
 
   async connect() {
@@ -67,22 +70,13 @@ export class EngineClient {
           this.ready = false;
           console.log('Disconnected from engine server', event.code, event.reason);
 
-          // Reject any pending responses
-          if (this.pendingSimpleResponse) {
-            this.pendingSimpleResponse.reject(new Error('Connection closed'));
-            this.pendingSimpleResponse = null;
-          }
-          if (this.pendingSearchResponse) {
-            this.pendingSearchResponse.reject(new Error('Connection closed'));
-            this.pendingSearchResponse = null;
-          }
+          this._rejectAllPending(new Error('Connection closed'));
 
           if (wasConnected) {
             this._notifyConnectionChange(false);
           }
         };
 
-        // Connection timeout
         setTimeout(() => {
           if (!this.connected) {
             this.ws?.close();
@@ -102,8 +96,31 @@ export class EngineClient {
     }
   }
 
+  _rejectAllPending(error) {
+    if (this.pendingSimpleResponse) {
+      this.pendingSimpleResponse.reject(error);
+      this.pendingSimpleResponse = null;
+    }
+    if (this.pendingSearchResponse) {
+      this.pendingSearchResponse.reject(error);
+      this.pendingSearchResponse = null;
+    }
+    if (this.pendingMultiLineResponse) {
+      this.pendingMultiLineResponse.reject(error);
+      this.pendingMultiLineResponse = null;
+    }
+  }
+
   handleMessage(data) {
     const lines = data.split('\n');
+    
+    // Check if this is a multi-line response (gamestate, etc.)
+    if (this.pendingMultiLineResponse) {
+      const parsed = this._parseMultiLineResponse(lines);
+      this.pendingMultiLineResponse.resolve(parsed);
+      this.pendingMultiLineResponse = null;
+      return;
+    }
 
     for (const line of lines) {
       if (!line.trim()) continue;
@@ -130,7 +147,6 @@ export class EngineClient {
         if (this.onBestMove) {
           this.onBestMove(move, ponder);
         }
-        // Resolve the search promise (no timeout for searches)
         if (this.pendingSearchResponse) {
           this.pendingSearchResponse.resolve({ move, ponder });
           this.pendingSearchResponse = null;
@@ -139,8 +155,71 @@ export class EngineClient {
         if (this.onInfo) {
           this.onInfo(this.parseInfo(line));
         }
+      } else if (line.startsWith('valid ')) {
+        // Response to validate command
+        if (this.pendingSimpleResponse) {
+          this.pendingSimpleResponse.resolve(this._parseValidateResponse(line));
+          this.pendingSimpleResponse = null;
+        }
+      } else if (line.startsWith('legalmoves ')) {
+        // Response to legalmoves command
+        if (this.pendingSimpleResponse) {
+          this.pendingSimpleResponse.resolve(this._parseLegalMovesResponse(line));
+          this.pendingSimpleResponse = null;
+        }
+      } else if (line.startsWith('eval ')) {
+        if (this.pendingSimpleResponse) {
+          this.pendingSimpleResponse.resolve({ eval: parseInt(line.split(' ')[1]) });
+          this.pendingSimpleResponse = null;
+        }
+      } else if (line.startsWith('error ')) {
+        if (this.pendingSimpleResponse) {
+          this.pendingSimpleResponse.reject(new Error(line.slice(6)));
+          this.pendingSimpleResponse = null;
+        }
       }
     }
+  }
+
+  _parseMultiLineResponse(lines) {
+    const result = {};
+    for (const line of lines) {
+      const spaceIdx = line.indexOf(' ');
+      if (spaceIdx === -1) continue;
+      const key = line.slice(0, spaceIdx);
+      const value = line.slice(spaceIdx + 1);
+      
+      // Parse specific types
+      if (['incheck', 'canundo', 'blunder'].includes(key)) {
+        result[key] = value === 'true';
+      } else if (['fullmove', 'halfmove', 'legalmovecount', 'eval', 
+                  'material_white', 'material_black', 'material_diff', 'movecount'].includes(key)) {
+        result[key] = parseInt(value) || 0;
+      } else if (key === 'captured_white' || key === 'captured_black') {
+        result[key] = value === 'none' ? [] : value.split('');
+      } else if (key === 'history') {
+        result[key] = value === 'none' ? [] : value.split(' ');
+      } else {
+        result[key] = value;
+      }
+    }
+    return result;
+  }
+
+  _parseValidateResponse(line) {
+    const parts = line.split(' ');
+    return {
+      valid: parts[1] === 'true',
+      reason: parts[2] || null
+    };
+  }
+
+  _parseLegalMovesResponse(line) {
+    const content = line.slice('legalmoves '.length);
+    if (content === 'none' || content.startsWith('none')) {
+      return { moves: [], error: content.includes(' ') ? content.split(' ')[1] : null };
+    }
+    return { moves: content.split(' '), error: null };
   }
 
   parseInfo(line) {
@@ -198,9 +277,6 @@ export class EngineClient {
     this.ws.send(command);
   }
 
-  /**
-   * Send command and wait for simple response (with timeout)
-   */
   async sendAndWait(command, timeout = 10000) {
     return new Promise((resolve, reject) => {
       const timeoutId = setTimeout(() => {
@@ -229,16 +305,37 @@ export class EngineClient {
     });
   }
 
-  /**
-   * Send search command and wait for bestmove (NO timeout - searches can take arbitrarily long)
-   */
+  async sendMultiLineAndWait(command, timeout = 10000) {
+    return new Promise((resolve, reject) => {
+      const timeoutId = setTimeout(() => {
+        this.pendingMultiLineResponse = null;
+        reject(new Error(`Command timeout: ${command}`));
+      }, timeout);
+
+      this.pendingMultiLineResponse = {
+        resolve: (result) => {
+          clearTimeout(timeoutId);
+          resolve(result);
+        },
+        reject: (err) => {
+          clearTimeout(timeoutId);
+          reject(err);
+        }
+      };
+
+      try {
+        this.send(command);
+      } catch (err) {
+        clearTimeout(timeoutId);
+        this.pendingMultiLineResponse = null;
+        reject(err);
+      }
+    });
+  }
+
   async sendSearchAndWait(command) {
     return new Promise((resolve, reject) => {
-      // No timeout for search commands
-      this.pendingSearchResponse = {
-        resolve,
-        reject
-      };
+      this.pendingSearchResponse = { resolve, reject };
 
       try {
         this.send(command);
@@ -248,6 +345,10 @@ export class EngineClient {
       }
     });
   }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // STANDARD UCI COMMANDS
+  // ═══════════════════════════════════════════════════════════════════════════
 
   async initialize() {
     await this.sendAndWait('uci');
@@ -267,10 +368,6 @@ export class EngineClient {
     this.send(cmd);
   }
 
-  /**
-   * Start search - returns promise that resolves when bestmove is received
-   * No timeout since searches can take arbitrarily long
-   */
   async go(options = {}) {
     let cmd = 'go';
 
@@ -284,7 +381,6 @@ export class EngineClient {
     if (options.binc) cmd += ` binc ${options.binc}`;
     if (options.movestogo) cmd += ` movestogo ${options.movestogo}`;
 
-    // Use search-specific method without timeout
     return this.sendSearchAndWait(cmd);
   }
 
@@ -306,9 +402,65 @@ export class EngineClient {
     this.send(`setlog ${mask}`);
   }
 
-  clearLogs() {
-    this.send('clearlogs');
+  // ═══════════════════════════════════════════════════════════════════════════
+  // EXTENDED UCI COMMANDS FOR LOCAL PLAY
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Validate a move without applying it
+   * @param {string} move - Move in UCI format (e.g., "e2e4", "e7e8q")
+   * @returns {Promise<{valid: boolean, reason: string|null}>}
+   */
+  async validateMove(move) {
+    return this.sendAndWait(`validate ${move}`);
   }
+
+  /**
+   * Get all legal moves, optionally for a specific square
+   * @param {string|null} square - Optional source square (e.g., "e2")
+   * @returns {Promise<{moves: string[], error: string|null}>}
+   */
+  async getLegalMoves(square = null) {
+    const cmd = square ? `legalmoves ${square}` : 'legalmoves';
+    return this.sendAndWait(cmd);
+  }
+
+  /**
+   * Apply a move and get updated game state
+   * @param {string} move - Move in UCI format
+   * @returns {Promise<GameState>} Full game state after move
+   */
+  async makeMove(move) {
+    return this.sendMultiLineAndWait(`makemove ${move}`);
+  }
+
+  /**
+   * Undo the last move
+   * @returns {Promise<GameState>} Full game state after undo
+   */
+  async undoMove() {
+    return this.sendMultiLineAndWait('undomove');
+  }
+
+  /**
+   * Get current game state
+   * @returns {Promise<GameState>}
+   */
+  async getGameState() {
+    return this.sendMultiLineAndWait('gamestate');
+  }
+
+  /**
+   * Get static evaluation of current position
+   * @returns {Promise<{eval: number}>}
+   */
+  async getEvaluation() {
+    return this.sendAndWait('eval');
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // UTILITY METHODS
+  // ═══════════════════════════════════════════════════════════════════════════
 
   disconnect() {
     if (this.ws) {
@@ -330,9 +482,6 @@ export class EngineClient {
     return this.connected && this.ready && this.ws?.readyState === WebSocket.OPEN;
   }
 
-  /**
-   * Check if a search is currently in progress
-   */
   isSearching() {
     return this.pendingSearchResponse !== null;
   }

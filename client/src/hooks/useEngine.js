@@ -1,213 +1,288 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
-import EngineClient, { LOG_CATEGORY } from '../engine/EngineClient';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import EngineClient from '../engine/EngineClient';
+
+export const LOG_CATEGORY = {
+  NONE: 0,
+  SEARCH: 1 << 0,
+  EVAL: 1 << 1,
+  MOVE_ORDER: 1 << 2,
+  TT: 1 << 3,
+  UCI: 1 << 4,
+  BOOK: 1 << 5,
+  ALL: 0x3FF
+};
+
+// Singleton engine client - shared across all components
+let sharedEngine = null;
+let connectionPromise = null;
+let listenerCount = 0;
+
+function getSharedEngine(serverUrl) {
+  if (!sharedEngine) {
+    sharedEngine = new EngineClient(serverUrl);
+  }
+  return sharedEngine;
+}
+
+async function connectSharedEngine(engine) {
+  if (engine.isConnected()) {
+    return true;
+  }
+  
+  if (connectionPromise) {
+    return connectionPromise;
+  }
+  
+  connectionPromise = (async () => {
+    try {
+      await engine.connect();
+      await engine.initialize();
+      return true;
+    } catch (err) {
+      console.error('Engine connection failed:', err);
+      return false;
+    } finally {
+      connectionPromise = null;
+    }
+  })();
+  
+  return connectionPromise;
+}
 
 export function useEngine(serverUrl = 'ws://localhost:8080') {
   const [connected, setConnected] = useState(false);
   const [thinking, setThinking] = useState(false);
   const [searchInfo, setSearchInfo] = useState(null);
   const [error, setError] = useState(null);
-  const engineRef = useRef(null);
+  
   const mountedRef = useRef(true);
+  const engineRef = useRef(null);
 
+  // Initialize and connect
   useEffect(() => {
     mountedRef.current = true;
-    const engine = new EngineClient(serverUrl);
+    listenerCount++;
+    
+    const engine = getSharedEngine(serverUrl);
     engineRef.current = engine;
 
+    // Set up callbacks
+    const prevOnInfo = engine.onInfo;
+    const prevOnConnectionChange = engine.onConnectionChange;
+    const prevOnError = engine.onError;
+
     engine.onInfo = (info) => {
-      if (mountedRef.current) {
-        setSearchInfo(info);
-      }
+      if (mountedRef.current) setSearchInfo(info);
+      if (prevOnInfo) prevOnInfo(info);
     };
 
     engine.onConnectionChange = (isConnected) => {
-      console.log('Connection state changed:', isConnected);
       if (mountedRef.current) {
         setConnected(isConnected);
         if (!isConnected) {
           setThinking(false);
           setError('Connection to engine lost');
+        } else {
+          setError(null);
         }
       }
+      if (prevOnConnectionChange) prevOnConnectionChange(isConnected);
     };
 
     engine.onError = (err) => {
-      console.error('Engine error:', err);
       if (mountedRef.current) {
         setError(err.message || 'Engine error');
       }
+      if (prevOnError) prevOnError(err);
     };
 
-    const connect = async () => {
-      try {
-        setError(null);
-        await engine.connect();
-        await engine.initialize();
-
-        if (mountedRef.current) {
-          try {
-            engine.setLogMask(LOG_CATEGORY.SEARCH | LOG_CATEGORY.EVAL | LOG_CATEGORY.BOOK);
-          } catch (e) {
-            console.warn('Failed to set log mask:', e);
-          }
-
-          setConnected(true);
-          setError(null);
-        }
-      } catch (err) {
-        console.error('Failed to connect to engine:', err);
-        if (mountedRef.current) {
-          setError('Failed to connect to engine server. Make sure the server is running on ' + serverUrl);
-          setConnected(false);
+    // Connect
+    connectSharedEngine(engine).then(success => {
+      if (mountedRef.current) {
+        setConnected(success);
+        if (!success) {
+          setError('Failed to connect to engine server');
         }
       }
-    };
+    });
 
-    connect();
+    // Update state if already connected
+    if (engine.isConnected()) {
+      setConnected(true);
+    }
 
     return () => {
       mountedRef.current = false;
-      if (engine.isConnected()) {
-        engine.disconnect();
+      listenerCount--;
+      
+      // Only disconnect if no more listeners AND we're actually connected
+      // Don't disconnect on page navigation - keep connection alive
+      if (listenerCount === 0 && sharedEngine?.isConnected()) {
+        // Keep connection alive for now - only close on app unmount
+        // This prevents reconnection delays when navigating between pages
       }
     };
   }, [serverUrl]);
 
+  // Stable method references
   const newGame = useCallback(async () => {
-    if (!engineRef.current?.isConnected()) {
-      console.warn('Cannot start new game: engine not connected');
-      return;
-    }
-
+    const engine = engineRef.current;
+    if (!engine?.isConnected()) return;
     try {
-      await engineRef.current.newGame();
+      await engine.newGame();
     } catch (err) {
       console.error('Failed to start new game:', err);
-      setError('Failed to start new game');
     }
   }, []);
 
   const setPosition = useCallback(async (fen, moves = []) => {
-    if (!engineRef.current?.isConnected()) {
-      console.warn('Cannot set position: engine not connected');
-      return;
-    }
-
+    const engine = engineRef.current;
+    if (!engine?.isConnected()) return;
     try {
-      await engineRef.current.setPosition(fen, moves);
+      await engine.setPosition(fen, moves);
     } catch (err) {
       console.error('Failed to set position:', err);
     }
   }, []);
 
-  const findBestMove = useCallback(async (fen, options = {}) => {
-    if (!engineRef.current?.isConnected()) {
+  const go = useCallback(async (options = {}) => {
+    const engine = engineRef.current;
+    if (!engine?.isConnected()) {
       throw new Error('Engine not connected');
     }
-
-    // Prevent multiple simultaneous searches
-    if (thinking) {
-      console.warn('Already searching, ignoring request');
-      return null;
-    }
-
+    
     setThinking(true);
     setSearchInfo(null);
 
     try {
-      await engineRef.current.setPosition(fen);
-      const result = await engineRef.current.go(options);
+      const result = await engine.go(options);
       return result;
-    } catch (err) {
-      console.error('Find best move error:', err);
-      throw err;
     } finally {
-      if (mountedRef.current) {
-        setThinking(false);
-      }
+      if (mountedRef.current) setThinking(false);
     }
-  }, [thinking]);
+  }, []);
 
   const stop = useCallback(() => {
-    if (engineRef.current?.isConnected()) {
+    const engine = engineRef.current;
+    if (engine?.isConnected()) {
       try {
-        engineRef.current.stop();
+        engine.stop();
       } catch (e) {
-        console.warn('Failed to stop engine:', e);
+        console.warn('Failed to stop:', e);
       }
     }
     setThinking(false);
   }, []);
 
-  const setOption = useCallback((name, value) => {
-    if (engineRef.current?.isConnected()) {
-      try {
-        engineRef.current.setOption(name, value);
-      } catch (e) {
-        console.warn('Failed to set option:', e);
-      }
+  const validateMove = useCallback(async (move) => {
+    const engine = engineRef.current;
+    if (!engine?.isConnected()) return { valid: false, reason: 'not_connected' };
+    try {
+      return await engine.validateMove(move);
+    } catch (err) {
+      return { valid: false, reason: err.message };
     }
   }, []);
 
-  const setLogCategories = useCallback((mask) => {
-    if (engineRef.current?.isConnected()) {
-      try {
-        engineRef.current.setLogMask(mask);
-      } catch (e) {
-        console.warn('Failed to set log categories:', e);
-      }
+  const getLegalMoves = useCallback(async (square = null) => {
+    const engine = engineRef.current;
+    if (!engine?.isConnected()) return { moves: [], error: 'not_connected' };
+    try {
+      return await engine.getLegalMoves(square);
+    } catch (err) {
+      return { moves: [], error: err.message };
+    }
+  }, []);
+
+  const makeMove = useCallback(async (move) => {
+    const engine = engineRef.current;
+    if (!engine?.isConnected()) return null;
+    try {
+      return await engine.makeMove(move);
+    } catch (err) {
+      console.error('makeMove failed:', err);
+      return null;
+    }
+  }, []);
+
+  const undoMove = useCallback(async () => {
+    const engine = engineRef.current;
+    if (!engine?.isConnected()) return null;
+    try {
+      return await engine.undoMove();
+    } catch (err) {
+      console.error('undoMove failed:', err);
+      return null;
+    }
+  }, []);
+
+  const getGameState = useCallback(async () => {
+    const engine = engineRef.current;
+    if (!engine?.isConnected()) return null;
+    try {
+      return await engine.getGameState();
+    } catch (err) {
+      console.error('getGameState failed:', err);
+      return null;
     }
   }, []);
 
   const reconnect = useCallback(async () => {
-    if (engineRef.current) {
-      engineRef.current.disconnect();
-    }
-
-    const engine = new EngineClient(serverUrl);
-    engineRef.current = engine;
-
-    engine.onInfo = (info) => {
-      if (mountedRef.current) {
-        setSearchInfo(info);
+    // Force new connection
+    if (sharedEngine) {
+      try {
+        sharedEngine.disconnect();
+      } catch (e) {
+        // ignore
       }
-    };
-
+      sharedEngine = null;
+    }
+    connectionPromise = null;
+    
+    const engine = getSharedEngine(serverUrl);
+    engineRef.current = engine;
+    
     engine.onConnectionChange = (isConnected) => {
       if (mountedRef.current) {
         setConnected(isConnected);
-        if (!isConnected) {
-          setThinking(false);
-        }
+        if (!isConnected) setThinking(false);
       }
     };
 
     try {
       setError(null);
-      await engine.connect();
-      await engine.initialize();
-      setConnected(true);
+      const success = await connectSharedEngine(engine);
+      setConnected(success);
+      if (!success) {
+        setError('Failed to reconnect');
+      }
     } catch (err) {
       setError('Failed to reconnect: ' + err.message);
       setConnected(false);
     }
   }, [serverUrl]);
 
-  return {
+  // Return a stable object using useMemo
+  return useMemo(() => ({
     connected,
     thinking,
     searchInfo,
     error,
     newGame,
     setPosition,
-    findBestMove,
+    go,
     stop,
-    setOption,
-    setLogCategories,
+    validateMove,
+    getLegalMoves,
+    makeMove,
+    undoMove,
+    getGameState,
     reconnect,
-    LOG_CATEGORY
-  };
+  }), [
+    connected, thinking, searchInfo, error,
+    newGame, setPosition, go, stop,
+    validateMove, getLegalMoves, makeMove, undoMove, getGameState, reconnect
+  ]);
 }
 
-export { LOG_CATEGORY };
 export default useEngine;

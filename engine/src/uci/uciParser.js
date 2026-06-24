@@ -1,5 +1,5 @@
 /**
- * UCI command parser
+ * UCI command parser - Extended for local play support
  */
 
 export function parseUCICommand(line) {
@@ -35,7 +35,38 @@ export function parseUCICommand(line) {
     case 'quit':
       return { type: 'quit' };
       
-    // Custom extensions
+    // ═══════════════════════════════════════════════════════════════════════
+    // EXTENDED COMMANDS FOR LOCAL PLAY (No search required)
+    // ═══════════════════════════════════════════════════════════════════════
+    
+    case 'validate':
+      // validate e2e4 - Check if move is legal
+      return { type: 'validate', move: args[0] || '' };
+      
+    case 'legalmoves':
+      // legalmoves [square] - Get legal moves, optionally for specific square
+      return { type: 'legalmoves', square: args[0] || null };
+      
+    case 'makemove':
+      // makemove e2e4 - Apply move and return new state
+      return { type: 'makemove', move: args[0] || '' };
+      
+    case 'undomove':
+      // undomove - Undo last move
+      return { type: 'undomove' };
+      
+    case 'gamestate':
+      // gamestate - Get full game state (for UI)
+      return { type: 'gamestate' };
+    
+    case 'eval':
+      // eval - Get static evaluation of current position
+      return { type: 'eval' };
+      
+    // ═══════════════════════════════════════════════════════════════════════
+    // EXISTING CUSTOM EXTENSIONS
+    // ═══════════════════════════════════════════════════════════════════════
+    
     case 'setlog':
       return { type: 'setlog', mask: parseInt(args[0]) || 0 };
       

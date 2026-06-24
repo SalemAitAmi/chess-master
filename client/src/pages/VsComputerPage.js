@@ -1,190 +1,420 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
+import { useEngine } from "../hooks/useEngine";
 import ChessBoard from "../components/ChessBoard";
 import PromotionModal from "../components/PromotionModal";
 import GameOverModal from "../components/GameOverModal";
-import { isInCheck } from "../utils/chessLogic";
-import { useVsComputerHandlers } from "../handlers/useVsComputerHandlers";
-import { DIFFICULTY, downloadReport, downloadAllReports, getLatestReport } from "../players/BotPlayer";
+import GameInfoPanel from "../components/GameInfoPanel";
+import MoveHistory from "../components/MoveHistory";
+import CapturedPieces from "../components/CapturedPieces";
+import { indexToSquare, rowColToIndex, squareToIndex, indexToRowCol } from "../utils/bitboard";
 
-const DIFFICULTY_NAMES = {
-  [DIFFICULTY.ROOKIE]: 'Rookie',
-  [DIFFICULTY.CASUAL]: 'Casual',
-  [DIFFICULTY.STRATEGIC]: 'Strategic',
-  [DIFFICULTY.MASTER]: 'Master'
+const STARTING_FEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+const DIFFICULTY_DEPTHS = { 1: 4, 2: 6, 3: 8, 4: 12 };
+const DIFFICULTY_NAMES = { 1: 'Rookie', 2: 'Casual', 3: 'Strategic', 4: 'Master' };
+
+const initialGameState = {
+  fen: STARTING_FEN,
+  turn: 'white',
+  fullmove: 1,
+  halfmove: 0,
+  status: 'ongoing',
+  winner: 'none',
+  incheck: false,
+  eval: 0,
+  material_white: 3900,
+  material_black: 3900,
+  captured_white: [],
+  captured_black: [],
+  canundo: false,
+  blunder: false,
+  lastmove: null
 };
 
-const VsComputerPage = ({ gameState, playerColor, difficulty, onBackToMenu }) => {
-  const {
-    boardObj,
-    selected,
-    turn,
-    gameOver,
-    winner,
-    lastMove,
-    promotion,
-  } = gameState;
-
-  const [selectedWithMoves, setSelectedWithMoves] = useState(null);
-  const [isThinking, setIsThinking] = useState(false);
-  const [gamesPlayed, setGamesPlayed] = useState(0);
-  const [currentPlayerColor, setCurrentPlayerColor] = useState(playerColor);
+const VsComputerPage = ({ playerColor, difficulty, onBackToMenu }) => {
+  const engine = useEngine();
   
-  const handlers = useVsComputerHandlers(
-    gameState, 
-    setSelectedWithMoves, 
-    isThinking, 
-    setIsThinking,
-    currentPlayerColor,
-    difficulty
-  );
-
-  const { 
-    handleSquareClick, 
-    handlePromotion, 
-    handleUndo, 
-    handleSurrender, 
-    handleRestart,
-    cleanup
-  } = handlers;
+  const [gameState, setGameState] = useState(initialGameState);
+  const [moveHistory, setMoveHistory] = useState([]); // Client-side history cache
+  const [selected, setSelected] = useState(null);
+  const [legalMoves, setLegalMoves] = useState([]);
+  const [promotion, setPromotion] = useState(null);
+  const [initialized, setInitialized] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const [engineThinking, setEngineThinking] = useState(false);
+  const [currentPlayerColor, setCurrentPlayerColor] = useState(playerColor);
+  const [gamesPlayed, setGamesPlayed] = useState(0);
+  
+  const mountedRef = useRef(true);
+  const initRef = useRef(false);
+  const engineMoveRef = useRef(false);
 
   useEffect(() => {
-    return () => {
-      cleanup();
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+
+  const isPlayerTurn = gameState.turn === currentPlayerColor;
+
+  // Update game state, optionally appending a move
+  const updateGameState = useCallback((engineState, appendMove = null) => {
+    if (!engineState) return;
+    
+    setGameState(prev => ({
+      ...prev,
+      ...engineState,
+    }));
+    
+    if (appendMove) {
+      setMoveHistory(prev => [...prev, appendMove]);
+    }
+  }, []);
+
+  // Initialize game
+  useEffect(() => {
+    if (!engine.connected || initRef.current) return;
+    
+    const init = async () => {
+      initRef.current = true;
+      try {
+        await engine.newGame();
+        const state = await engine.getGameState();
+        if (state && mountedRef.current) {
+          setGameState({ ...initialGameState, ...state });
+          setMoveHistory([]);
+          setInitialized(true);
+        }
+      } catch (err) {
+        console.error('Init failed:', err);
+        initRef.current = false;
+      }
     };
-  }, [cleanup]);
+    
+    init();
+  }, [engine.connected]);
 
-  const handleRestartWithColorSwap = useCallback(() => {
+  // Engine move function
+  const makeEngineMove = useCallback(async () => {
+    if (!engine.connected || engineMoveRef.current) return;
+    
+    engineMoveRef.current = true;
+    setEngineThinking(true);
+    
+    try {
+      const currentState = await engine.getGameState();
+      if (!currentState || !mountedRef.current || currentState.status !== 'ongoing') {
+        engineMoveRef.current = false;
+        setEngineThinking(false);
+        return;
+      }
+
+      await engine.setPosition(currentState.fen);
+      const result = await engine.go({ depth: DIFFICULTY_DEPTHS[difficulty] });
+      
+      if (!mountedRef.current) return;
+      
+      if (result?.move && result.move !== '(none)') {
+        const newState = await engine.makeMove(result.move);
+        if (newState && mountedRef.current) {
+          updateGameState(newState, result.move);
+        }
+      }
+    } catch (err) {
+      console.error('Engine move error:', err);
+    } finally {
+      if (mountedRef.current) {
+        setEngineThinking(false);
+      }
+      engineMoveRef.current = false;
+    }
+  }, [engine.connected, engine.getGameState, engine.setPosition, engine.go, engine.makeMove, difficulty, updateGameState]);
+
+  // Trigger engine move when it's computer's turn
+  useEffect(() => {
+    if (!initialized || !engine.connected) return;
+    if (gameState.status !== 'ongoing') return;
+    if (isPlayerTurn || engineThinking || loading) return;
+    if (engineMoveRef.current) return;
+
+    const timer = setTimeout(makeEngineMove, 500);
+    return () => clearTimeout(timer);
+  }, [initialized, engine.connected, gameState.status, gameState.turn, isPlayerTurn, engineThinking, loading, makeEngineMove]);
+
+  // Fetch legal moves
+  const fetchLegalMoves = useCallback(async (row, col) => {
+    if (!engine.connected) return [];
+    const square = indexToSquare(rowColToIndex(row, col));
+    try {
+      const result = await engine.getLegalMoves(square);
+      return result?.moves || [];
+    } catch {
+      return [];
+    }
+  }, [engine.connected, engine.getLegalMoves]);
+
+  const handleSquareClick = useCallback(async (row, col) => {
+    if (gameState.status !== 'ongoing' || promotion || loading) return;
+    if (!isPlayerTurn || engineThinking) return;
+    if (!engine.connected) return;
+
+    const clickedSquare = indexToSquare(rowColToIndex(row, col));
+
+    if (selected) {
+      const [selRow, selCol] = selected;
+      const fromSquare = indexToSquare(rowColToIndex(selRow, selCol));
+      const moveStr = fromSquare + clickedSquare;
+
+      const isValidMove = legalMoves.some(m => m === moveStr || m.startsWith(moveStr));
+
+      if (isValidMove) {
+        const promotionMoves = legalMoves.filter(m => m.startsWith(moveStr) && m.length > 4);
+        
+        if (promotionMoves.length > 0) {
+          setPromotion({
+            from: fromSquare,
+            to: clickedSquare,
+            color: gameState.turn === 'white' ? 'w' : 'b'
+          });
+          return;
+        }
+
+        setLoading(true);
+        try {
+          const newState = await engine.makeMove(moveStr);
+          if (newState && mountedRef.current) {
+            updateGameState(newState, moveStr);
+            setSelected(null);
+            setLegalMoves([]);
+          }
+        } catch (err) {
+          console.error('Move failed:', err);
+        }
+        setLoading(false);
+        return;
+      }
+
+      const moves = await fetchLegalMoves(row, col);
+      if (moves.length > 0) {
+        setSelected([row, col]);
+        setLegalMoves(moves);
+      } else {
+        setSelected(null);
+        setLegalMoves([]);
+      }
+    } else {
+      const moves = await fetchLegalMoves(row, col);
+      if (moves.length > 0) {
+        setSelected([row, col]);
+        setLegalMoves(moves);
+      }
+    }
+  }, [selected, legalMoves, gameState.status, gameState.turn, promotion, loading, 
+      isPlayerTurn, engineThinking, engine.connected, engine.makeMove, fetchLegalMoves, updateGameState]);
+
+  const handlePromotion = useCallback(async (pieceType) => {
+    if (!promotion || !engine.connected) return;
+
+    const moveStr = promotion.from + promotion.to + pieceType;
+    
+    setLoading(true);
+    try {
+      const newState = await engine.makeMove(moveStr);
+      if (newState && mountedRef.current) {
+        updateGameState(newState, moveStr);
+        setSelected(null);
+        setLegalMoves([]);
+        setPromotion(null);
+      }
+    } catch (err) {
+      console.error('Promotion failed:', err);
+    }
+    setLoading(false);
+  }, [promotion, engine.connected, engine.makeMove, updateGameState]);
+
+  const handleUndo = useCallback(async () => {
+    if (!gameState.canundo || !engine.connected || loading || engineThinking) return;
+
+    setLoading(true);
+    try {
+      // Undo twice (player move + engine response)
+      let newState = await engine.undoMove();
+      let undoCount = 1;
+      
+      if (newState?.canundo) {
+        newState = await engine.undoMove();
+        undoCount = 2;
+      }
+      
+      if (newState && mountedRef.current) {
+        // Pop moves from client history
+        setMoveHistory(prev => prev.slice(0, -undoCount));
+        updateGameState(newState);
+        setSelected(null);
+        setLegalMoves([]);
+      }
+    } catch (err) {
+      console.error('Undo failed:', err);
+    }
+    setLoading(false);
+  }, [gameState.canundo, loading, engineThinking, engine.connected, engine.undoMove, updateGameState]);
+
+  const handleSurrender = useCallback(() => {
+    setGameState(prev => ({
+      ...prev,
+      status: 'resignation',
+      winner: currentPlayerColor === 'white' ? 'black' : 'white'
+    }));
+  }, [currentPlayerColor]);
+
+  const handleRestart = useCallback(async () => {
+    if (!engine.connected) return;
+    
+    // Swap colors
+    const newColor = currentPlayerColor === 'white' ? 'black' : 'white';
+    setCurrentPlayerColor(newColor);
     setGamesPlayed(prev => prev + 1);
-    setCurrentPlayerColor(prev => prev === "white" ? "black" : "white");
-    handleRestart();
-  }, [handleRestart]);
+    
+    // Reset refs
+    initRef.current = false;
+    engineMoveRef.current = false;
+    
+    setLoading(true);
+    try {
+      await engine.newGame();
+      const newState = await engine.getGameState();
+      if (newState && mountedRef.current) {
+        setGameState({ ...initialGameState, ...newState });
+        setMoveHistory([]); // Clear history for new game
+        setSelected(null);
+        setLegalMoves([]);
+        setPromotion(null);
+        setInitialized(true);
+      }
+    } catch (err) {
+      console.error('Restart failed:', err);
+    }
+    setLoading(false);
+  }, [currentPlayerColor, engine.connected, engine.newGame, engine.getGameState]);
 
-  const handleBackClick = useCallback(() => {
-    setGamesPlayed(0);
-    setCurrentPlayerColor(playerColor);
-    onBackToMenu();
-  }, [onBackToMenu, playerColor]);
+  const lastMove = gameState.lastmove ? (() => {
+    const from = squareToIndex(gameState.lastmove.slice(0, 2));
+    const to = squareToIndex(gameState.lastmove.slice(2, 4));
+    if (from === -1 || to === -1) return null;
+    return { from: indexToRowCol(from), to: indexToRowCol(to) };
+  })() : null;
 
-  const shouldFlipBoard = currentPlayerColor === "black";
+  const selectedWithMoves = selected ? {
+    row: selected[0],
+    col: selected[1],
+    moves: legalMoves.map(m => {
+      const toIdx = squareToIndex(m.slice(2, 4));
+      return toIdx !== -1 ? indexToRowCol(toIdx) : null;
+    }).filter(Boolean)
+  } : null;
+
+  const gameOver = gameState.status !== 'ongoing';
+  const winner = gameState.winner === 'none' ? null : gameState.winner;
+
+  if (!engine.connected) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-gray-800 to-gray-900">
+        <div className="text-white text-xl mb-4">Connecting to engine...</div>
+        {engine.error && <div className="text-red-400 mb-4">{engine.error}</div>}
+        <button onClick={engine.reconnect} className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">
+          Retry
+        </button>
+        <button onClick={onBackToMenu} className="mt-4 px-4 py-2 bg-gray-600 text-white rounded hover:bg-gray-700">
+          Back to Menu
+        </button>
+      </div>
+    );
+  }
+
+  if (!initialized) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-gray-800 to-gray-900">
+        <div className="text-white text-xl">Initializing game...</div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-gray-800 to-gray-900 relative font-sans">
       <div className="absolute top-4 left-4">
         <button
-          onClick={handleBackClick}
-          className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 
-            transition-all duration-200 shadow-md hover:shadow-lg text-sm font-semibold"
+          onClick={onBackToMenu}
+          className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 text-sm font-semibold"
         >
-          <i className="fas fa-arrow-left mr-2"></i>
-          Main Menu
+          ← Main Menu
         </button>
       </div>
 
-      <div className="mb-8 text-center">
-        <h1 className="text-5xl font-bold text-white mb-4 drop-shadow-lg">
-          Chess Game
-        </h1>
-        <div className="text-xl text-gray-300">
-          Playing vs {DIFFICULTY_NAMES[difficulty]} Bot as {currentPlayerColor}
+      <div className="mb-6 text-center">
+        <h1 className="text-4xl font-bold text-white mb-2">VS Computer</h1>
+        <div className="text-gray-400">
+          {DIFFICULTY_NAMES[difficulty]} • Playing as {currentPlayerColor}
+          {gamesPlayed > 0 && ` • Game #${gamesPlayed + 1}`}
         </div>
-        {gamesPlayed > 0 && (
-          <div className="text-sm text-gray-400 mt-2">
-            Game #{gamesPlayed + 1} - Colors swapped
-          </div>
-        )}
       </div>
 
-      <div className="mb-6 px-6 py-3 bg-gray-700 rounded-lg shadow-lg">
-        <p className="text-xl font-semibold text-white">
-          Current Turn:{" "}
-          <span className={`${turn === "white" ? "text-yellow-300" : "text-gray-400"}`}>
-            {turn === "white" ? "White" : "Black"}
-          </span>
-          {isInCheck(boardObj, boardObj.gameState.active_color) && (
-            <span className="ml-2 text-red-500 font-bold animate-pulse">Check!</span>
+      <div className="flex gap-6 items-start">
+        <div className="space-y-4">
+          <GameInfoPanel gameState={gameState} />
+          <CapturedPieces
+            capturedWhite={gameState.captured_white}
+            capturedBlack={gameState.captured_black}
+          />
+        </div>
+
+        <div className="flex flex-col items-center">
+          {engineThinking && (
+            <div className="mb-4 px-4 py-2 bg-gray-700 rounded-lg text-gray-300 animate-pulse">
+              🤔 {DIFFICULTY_NAMES[difficulty]} is thinking...
+              {engine.searchInfo?.depth && ` (Depth: ${engine.searchInfo.depth})`}
+            </div>
           )}
-        </p>
-        {isThinking && (
-          <p className="mt-2 text-gray-300 text-sm animate-pulse">
-            {DIFFICULTY_NAMES[difficulty]} Bot is thinking...
-          </p>
-        )}
-      </div>
 
-      <ChessBoard
-        boardObj={boardObj}
-        selected={selectedWithMoves}
-        lastMove={lastMove}
-        onSquareClick={handleSquareClick}
-        flipped={shouldFlipBoard}
-      />
+          <ChessBoard
+            fen={gameState.fen}
+            selected={selectedWithMoves}
+            legalMoves={legalMoves}
+            lastMove={lastMove}
+            onSquareClick={handleSquareClick}
+            flipped={currentPlayerColor === 'black'}
+            disabled={loading || engineThinking || gameOver || !isPlayerTurn}
+          />
+
+          <div className="mt-6 flex gap-4">
+            {!gameOver && !promotion && (
+              <>
+                <button
+                  onClick={handleUndo}
+                  disabled={!gameState.canundo || loading || engineThinking}
+                  className={`px-6 py-3 rounded-lg text-lg font-semibold
+                    ${gameState.canundo && !loading && !engineThinking
+                      ? 'bg-blue-600 hover:bg-blue-700 text-white' 
+                      : 'bg-gray-600 cursor-not-allowed text-gray-400'}`}
+                >
+                  ↶ Undo
+                </button>
+                
+                <button
+                  onClick={handleSurrender}
+                  disabled={loading || engineThinking}
+                  className="px-6 py-3 bg-red-600 hover:bg-red-700 text-white rounded-lg text-lg font-semibold"
+                >
+                  ⚑ Surrender
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+
+        {/* Use client-cached history */}
+        <MoveHistory history={moveHistory} />
+      </div>
 
       <PromotionModal promotion={promotion} onPromotion={handlePromotion} />
-
-      <GameOverModal
-        gameOver={gameOver}
-        winner={winner}
-        onRestart={handleRestartWithColorSwap}
-      />
-
-      <div className="mt-6 flex gap-4">
-        {!gameOver && !promotion && (
-          <>
-            <button
-              onClick={handleUndo}
-              disabled={!boardObj.canUndo() || isThinking}
-              className={`px-6 py-3 ${boardObj.canUndo() && !isThinking ? 'bg-blue-600 hover:bg-blue-700' : 'bg-gray-600 cursor-not-allowed'} 
-                text-white rounded-lg transition-all duration-200 shadow-md hover:shadow-lg text-lg font-semibold`}
-            >
-              Undo Move
-            </button>
-            
-            <button
-              onClick={handleSurrender}
-              disabled={isThinking}
-              className={`px-6 py-3 ${isThinking ? 'bg-gray-600 cursor-not-allowed' : 'bg-red-600 hover:bg-red-700'} text-white rounded-lg 
-                transition-all duration-200 shadow-md hover:shadow-lg text-lg font-semibold`}
-            >
-              Surrender
-            </button>
-          </>
-        )}
-      </div>
-
-      <div className="mt-4 flex flex-wrap gap-2 justify-center">
-        <button
-          onClick={() => downloadReport('txt')}
-          disabled={!getLatestReport()}
-          className={`px-4 py-2 text-sm ${getLatestReport() ? 'bg-purple-600 hover:bg-purple-700' : 'bg-gray-600 cursor-not-allowed'} 
-            text-white rounded-lg transition-all duration-200 shadow-md`}
-        >
-          Download Last Decision (TXT)
-        </button>
-        <button
-          onClick={() => downloadReport('json')}
-          disabled={!getLatestReport()}
-          className={`px-4 py-2 text-sm ${getLatestReport() ? 'bg-purple-600 hover:bg-purple-700' : 'bg-gray-600 cursor-not-allowed'} 
-            text-white rounded-lg transition-all duration-200 shadow-md`}
-        >
-          Download Last Decision (JSON)
-        </button>
-        <button
-          onClick={() => downloadAllReports('json')}
-          disabled={!getLatestReport()}
-          className={`px-4 py-2 text-sm ${getLatestReport() ? 'bg-indigo-600 hover:bg-indigo-700' : 'bg-gray-600 cursor-not-allowed'} 
-            text-white rounded-lg transition-all duration-200 shadow-md`}
-        >
-          Download All Decisions (JSON)
-        </button>
-        <button
-          onClick={() => downloadAllReports('txt')}
-          disabled={!getLatestReport()}
-          className={`px-4 py-2 text-sm ${getLatestReport() ? 'bg-indigo-600 hover:bg-indigo-700' : 'bg-gray-600 cursor-not-allowed'} 
-            text-white rounded-lg transition-all duration-200 shadow-md`}
-        >
-          Download All Decisions (TXT)
-        </button>
-      </div>
+      <GameOverModal gameOver={gameOver} winner={winner} onRestart={handleRestart} />
     </div>
   );
 };
