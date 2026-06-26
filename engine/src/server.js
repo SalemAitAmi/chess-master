@@ -1,140 +1,113 @@
 /**
- * WebSocket server for UCI communication.
- *
- * Production logging contract:
- *   - NoopLogger installed → every logger.* call is a no-op
- *   - Per-message console I/O guarded by __DEV__
- *   - ONE unconditional log survives: the `bestmove` response.
- *     This is the single observable output we always want.
+ * WebSocket server with timestamped-file logging and crash-safe flush.
  */
-
 import { WebSocketServer } from 'ws';
 import { UCIHandler } from './uci/uciHandler.js';
 import logger, { LOG_CATEGORY, installNoopLogger } from './logging/logger.js';
 import { loadOpeningBook, isBookLoaded, getBookStats } from './book/openingBook.js';
 
-// ── Build-time / runtime environment detection ──
-// In a --prod bundle, esbuild replaces `globalThis.__DEV__` with `false`
-// and the whole expression folds to `false` at parse time.
-// Running from source: falls back to NODE_ENV so `NODE_ENV=production
-// node src/server.js` behaves like a prod build even without bundling.
 const __DEV__ = globalThis.__DEV__ ?? (process.env.NODE_ENV !== 'production');
 
-// ── Defense in depth ──
-// Even if someone sets LOG_MASK in prod, the NoopLogger makes every
-// logger method an empty function. Belt + suspenders with the DCE'd
-// `if (__LOG__)` guards in search.js/quiescence.js.
 if (!__DEV__) {
   installNoopLogger();
-  console.log('[server] Production mode — NoopLogger installed, per-message I/O suppressed');
+  console.log('[server] Production mode — NoopLogger installed');
 } else {
   const logMask = parseInt(process.env.LOG_MASK || '0', 10);
   logger.setEnabledCategories(logMask);
-  if (logMask !== 0) {
-    console.log(`[server] Dev mode — log mask 0x${logMask.toString(16)}`);
-  }
+  if (logMask !== 0) console.log(`[server] Dev mode — log mask 0x${logMask.toString(16)}`);
 }
+
+// ── Redirect engine console output to the log file ──
+const _stdout = console.log.bind(console);
+const _stderr = console.error.bind(console);
+console.log  = (...args) => { const m = args.map(a => typeof a==='object'?JSON.stringify(a):String(a)).join(' '); logger.write(m); };
+console.warn = (...args) => { const m = args.map(a => typeof a==='object'?JSON.stringify(a):String(a)).join(' '); logger.write(`[WARN] ${m}`); };
+console.error= (...args) => { const m = args.map(a => typeof a==='object'?JSON.stringify(a):String(a)).join(' '); logger.write(`[ERROR] ${m}`); _stderr(...args); };
 
 const PORT = process.env.PORT || 8080;
 
 async function startServer() {
-  console.log('Chess Engine Server starting...');
+  _stdout('Chess Engine Server starting...');
+  logger.write('Chess Engine Server starting');
 
   try {
     const bookInstance = await loadOpeningBook();
     if (bookInstance && isBookLoaded()) {
       const stats = getBookStats();
-      console.log(`[BOOK] Opening book ready (${stats.positions} positions)`);
+      _stdout(`[BOOK] Opening book ready (${stats.positions} positions)`);
+      logger.write(`[BOOK] Opening book ready (${stats.positions} positions)`);
     } else {
-      console.warn('[BOOK] Opening book not available');
+      _stdout('[BOOK] Opening book not available');
     }
   } catch (err) {
-    console.warn('Opening book not loaded:', err.message);
+    _stdout('Opening book not loaded:', err.message);
   }
 
   const wss = new WebSocketServer({ port: PORT });
-  console.log(`Chess Engine Server listening on port ${PORT}`);
+  _stdout(`Chess Engine Server listening on port ${PORT}`);
+  logger.write(`Server listening on port ${PORT}`);
 
   wss.on('connection', (ws, req) => {
     const clientAddr = req.socket.remoteAddress;
-    if (__DEV__) console.log(`Client connected from ${clientAddr}`);
+    logger.write(`Client connected from ${clientAddr}`);
+    if (__DEV__) _stdout(`Client connected from ${clientAddr}`);
 
     const handler = new UCIHandler();
 
     ws.on('message', async (message) => {
       const line = message.toString().trim();
       if (!line) return;
-
-      // Inbound command echo — dev only. At depth 12 a `go` command
-      // is followed by ~30s of silence, so this isn't hot, but it's
-      // still noise in prod logs.
-      if (__DEV__) console.log(`< ${line}`);
+      logger.write(`< ${line}`);
 
       try {
         const response = await handler.handleCommand(line);
-
         if (response) {
-          if (response === 'quit') {
-            ws.close();
-            return;
-          }
-
-          // ── The ONE log that survives production ──
-          // `bestmove` is the post-search, post-eval final answer.
-          // Everything else (info strings, readyok, etc.) is dev-only.
-          // UCI sends multi-line responses joined by \n, and bestmove
-          // is the last line, so check suffix too.
+          if (response === 'quit') { ws.close(); return; }
           if (response.startsWith('bestmove') || response.includes('\nbestmove')) {
-            // Pull just the bestmove line for a clean prod log
             const bmLine = response.split('\n').find(l => l.startsWith('bestmove')) || response;
-            console.log(`> ${bmLine}`);
-          } else if (__DEV__) {
-            console.log(`> ${response}`);
+            _stdout(`> ${bmLine}`);
           }
-
+          logger.write(`> ${response.split('\n')[0]}${response.includes('\n')?'...':''}`);
           ws.send(response);
         }
       } catch (err) {
-        // Errors always surface — NoopLogger.uci still console.errors
-        console.error('Error handling command:', err);
-        logger.uci('error', { error: err.message, command: line }, 'Command error');
-        try {
-          ws.send(`info string Error: ${err.message}`);
-        } catch (e) { /* ignore send errors on closed socket */ }
+        _stderr('Error handling command:', err);
+        logger.write(`[COMMAND ERROR] ${err.message}\n${err.stack}`);
+        try { ws.send(`info string Error: ${err.message}`); } catch {}
       }
     });
 
-    ws.on('close', (code, reason) => {
-      if (__DEV__) console.log(`Client disconnected: ${code} ${reason}`);
-    });
-
-    ws.on('error', (err) => {
-      console.error('WebSocket error:', err);
-    });
+    ws.on('close', (code, reason) => { logger.write(`Client disconnected: ${code} ${reason}`); });
+    ws.on('error', (err) => { _stderr('WebSocket error:', err); logger.write(`[WS ERROR] ${err.message}`); });
   });
 
-  wss.on('error', (err) => {
-    console.error('Server error:', err);
-  });
+  wss.on('error', (err) => { _stderr('Server error:', err); });
 
-  process.on('SIGINT', async () => {
-    console.log('\nShutting down...');
-    wss.clients.forEach(client => client.close());
-    wss.close(() => console.log('Server closed'));
+  // ── Crash / exit handlers — flush logs before dying ──
+  const shutdown = async (signal) => {
+    _stdout(`\n${signal} received, shutting down...`);
+    logger.write(`${signal} — shutting down`);
+    wss.clients.forEach(c => c.close());
+    wss.close(() => {});
     await logger.flush();
+    logger.close();
     process.exit(0);
-  });
+  };
+  process.on('SIGINT',  () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 
   process.on('uncaughtException', (err) => {
-    console.error('Uncaught exception:', err);
+    _stderr('Uncaught exception:', err);
+    logger.write(`[FATAL] uncaughtException: ${err.message}\n${err.stack}`);
+    logger.flushSync();
+    process.exit(1);
   });
-
   process.on('unhandledRejection', (reason) => {
-    console.error('Unhandled rejection:', reason);
+    _stderr('Unhandled rejection:', reason);
+    logger.write(`[FATAL] unhandledRejection: ${reason}`);
+    logger.flushSync();
+    process.exit(1);
   });
 }
 
-startServer().catch(err => {
-  console.error('Failed to start server:', err);
-  process.exit(1);
-});
+startServer().catch(err => { _stderr('Failed to start server:', err); process.exit(1); });

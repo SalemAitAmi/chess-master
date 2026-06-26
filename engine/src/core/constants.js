@@ -1,7 +1,6 @@
 /**
  * Core constants for the chess engine
  */
-
 export const PIECES = {
   KING: 0,
   QUEEN: 1,
@@ -35,7 +34,6 @@ export const CASTLING = {
   ALL: 15
 };
 
-// Square indices
 export const SQUARES = {};
 const FILES = 'abcdefgh';
 for (let rank = 1; rank <= 8; rank++) {
@@ -45,7 +43,6 @@ for (let rank = 1; rank <= 8; rank++) {
   }
 }
 
-// Score bounds for search
 export const SCORE = {
   INFINITY: 100000,
   MATE: 50000,
@@ -53,20 +50,16 @@ export const SCORE = {
   DRAW: 0
 };
 
-// Engine configuration defaults
 export const DEFAULT_CONFIG = {
-  // Search parameters
   maxDepth: 64,
-  
-  // Heuristic toggles (can be individually enabled/disabled)
+
   useMaterial: true,
   useCenterControl: true,
   useDevelopment: true,
   usePawnStructure: true,
   useKingSafety: true,
   usePawnPush: true,
-  
-  // Search features
+
   useQuiescence: true,
   quiescenceDepth: 8,
   useMoveOrdering: true,
@@ -75,9 +68,12 @@ export const DEFAULT_CONFIG = {
   useTranspositionTable: true,
   useNullMovePruning: true,
   useLateMovereduction: true,
+  useFutilityPruning: true,
+  useAspirationWindows: true,
+  usePVS: true,
+  useIID: true,
   useOpeningBook: true,
-  
-  // Heuristic weights (for fine-tuning)
+
   weights: {
     material: 1.0,
     centerControl: 1.0,
@@ -86,14 +82,18 @@ export const DEFAULT_CONFIG = {
     kingSafety: 1.0,
     pawnPush: 1.0
   },
-
   useOpeningPrinciples: true,
   openingPrincipleWeight: 1.0,
-  
-  // Stage-aware evaluation
   useStageWeights: true,
-  
-  // Logging
+
+  // Maximum draw-contempt magnitude (centipawns).
+  drawContemptMax: 50,
+
+  // Hard time ceiling per search (ms). Prevents the synchronous search from
+  // blocking the event-loop indefinitely. The iterative-deepening loop
+  // checks this before starting each new depth.
+  maxSearchTime: 30000,
+
   logDecisions: true,
   logStages: true
 };

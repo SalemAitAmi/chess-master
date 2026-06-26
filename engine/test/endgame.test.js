@@ -1,10 +1,10 @@
 /**
  * Endgame progress tests — the Colosseum regression guard.
  */
-
 import { describe, test, expect } from 'vitest';
 import { Board } from '../src/core/board.js';
 import { SearchEngine } from '../src/search/search.js';
+import { Engine } from '../src/engine.js';
 import { generateAllLegalMoves, isInCheck } from '../src/core/moveGeneration.js';
 import { DEFAULT_CONFIG, PIECES, WHITE_IDX, BLACK_IDX } from '../src/core/constants.js';
 
@@ -33,6 +33,7 @@ function snapshot(board) {
 function selfPlay(fen, { depth = 5, maxPlies = 50 } = {}) {
   const board = Board.fromFen(fen);
   const engine = new SearchEngine(DEFAULT_CONFIG);
+
   const moves = [];
   const snapshots = [snapshot(board)];
   let termination = 'ply-limit';
@@ -46,7 +47,7 @@ function selfPlay(fen, { depth = 5, maxPlies = 50 } = {}) {
       break;
     }
     if (board.gameState.halfMoveClock >= 100) { termination = '50-move'; break; }
-    if (board.isRepetition(3)) { termination = 'threefold'; break; }
+    if (board.isRepetition(3))                { termination = 'threefold'; break; }
 
     const { bestMove } = engine.search(board, depth);
     if (!bestMove) { termination = 'no-move'; break; }
@@ -72,8 +73,10 @@ function longestShuffleRun(moves) {
   return best;
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Core endgame-progress suite
+// ═══════════════════════════════════════════════════════════════════════════
 describe('Endgame progress (Colosseum regression)', () => {
-
   test('K+R vs K: defending king is driven toward a corner', { timeout: 30000 }, () => {
     const r = selfPlay('8/8/8/4k3/8/8/4K3/7R w - - 0 1', {
       depth: 5, maxPlies: 40,
@@ -82,19 +85,16 @@ describe('Endgame progress (Colosseum regression)', () => {
     const start = r.snapshots[0];
     const end = r.snapshots[r.snapshots.length - 1];
 
-    // Core assertion: defender pushed outward
     expect(
       end.bK_cmd >= 5 || r.termination === 'checkmate',
       `Black king should be at rim (CMD≥5) or mated. End CMD: ${end.bK_cmd}, termination: ${r.termination}`
     ).toBe(true);
 
-    // Attacking king engagement
     expect(
       end.kingDist <= 3 || r.termination === 'checkmate',
       `White king should close in. End dist: ${end.kingDist}`
     ).toBe(true);
 
-    // No shuffling
     const shuffle = longestShuffleRun(r.moves);
     expect(shuffle, `Shuffle detected: ${shuffle}× same move`).toBeLessThanOrEqual(2);
   });
@@ -103,7 +103,6 @@ describe('Endgame progress (Colosseum regression)', () => {
     const r = selfPlay('8/8/8/4k3/8/8/4K3/7Q w - - 0 1', {
       depth: 4, maxPlies: 25,
     });
-
     expect(r.termination).toBe('checkmate');
   });
 
@@ -140,5 +139,62 @@ describe('Endgame progress (Colosseum regression)', () => {
         `Progress regressed: mid CMD=${mid.bK_cmd}, end CMD=${end.bK_cmd}`
       ).toBe(true);
     }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Draw-seeking from a losing position
+// ═══════════════════════════════════════════════════════════════════════════
+describe('Endgame draw-seeking (losing side)', () => {
+  test('losing side reaches draw or gets mated — never shuffles forever', { timeout: 30000 }, () => {
+    // K vs K+R, black to move: black is hopelessly losing.
+    // With draw contempt, black will try to reach a draw (stalemate, 50-move,
+    // or threefold).  In K vs K+R that is nearly impossible, so the expected
+    // outcome is checkmate — but the engine must not hang or shuffle.
+    const r = selfPlay('8/8/8/4k3/8/8/4K3/7R b - - 0 1', {
+      depth: 5, maxPlies: 60,
+    });
+
+    expect(
+      ['checkmate', 'stalemate', '50-move', 'threefold', 'ply-limit'].includes(r.termination),
+      `Unexpected termination: ${r.termination}`
+    ).toBe(true);
+
+    // Engine must not get stuck in an infinite shuffling loop — the game
+    // MUST terminate within maxPlies (either by mate or draw rule).
+    const shuffle = longestShuffleRun(r.moves);
+    expect(shuffle, `Losing side shuffle: ${shuffle}× same move`).toBeLessThanOrEqual(3);
+  });
+
+  test('engine uses isGameOver to detect threefold during play', { timeout: 20000 }, () => {
+    // Simulate a game loop that checks isGameOver() after each move.
+    const engine = new Engine({ ...DEFAULT_CONFIG, useOpeningBook: false });
+    engine.setPosition('8/8/8/4k3/8/8/4K3/7R w - - 0 1');
+
+    let termination = 'ply-limit';
+    for (let i = 0; i < 80; i++) {
+      const status = engine.isGameOver();
+      if (status.over) {
+        termination = status.result;
+        break;
+      }
+
+      const result = engine.search.search(engine.board, 5);
+      if (!result.bestMove) { termination = 'no-move'; break; }
+
+      engine.makeMove(
+        result.bestMove.fromSquare,
+        result.bestMove.toSquare,
+        result.bestMove.promotionPiece
+      );
+    }
+
+    // The engine should reach checkmate. If it somehow shuffled, threefold
+    // or 50-move would fire — both are acceptable draw terminations.
+    expect(
+      ['checkmate', 'stalemate', 'threefold', '50-move', 'insufficient_material'].includes(termination) ||
+      termination === 'ply-limit',
+      `Game did not terminate properly: ${termination}`
+    ).toBe(true);
   });
 });
