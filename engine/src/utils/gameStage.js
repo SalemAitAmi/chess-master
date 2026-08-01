@@ -1,180 +1,161 @@
 /**
- * Game stage detection and management.
- *
- * FIX: replaced stale `board.moveHistory?.length` (always 0, Board has no
- * such property) with `halfMoveCount()` derived from the game-state counters
- * that makeMove/undoMove maintain correctly.
+ * Game-stage detection. Used for opening-principle move ordering and for
+ * stage logging; `halfMoveCount` is also the single source of truth for
+ * "how many plies into the game are we" (used by the development eval term).
  */
 import { PIECES } from '../core/constants.js';
 import { colorToIndex } from '../core/bitboard.js';
 import { GAME_STAGE } from '../logging/categories.js';
 
-const STAGE_CONFIG = {
-  openingEndMove: 20,
-  earlyMiddleEndMove: 40,
-  middleEndMove: 70,
-  lateMiddleEndMove: 100,
-  endgameMaterialThreshold: 13,
-  phaseWeights: {
-    [PIECES.QUEEN]: 4,
-    [PIECES.ROOK]: 2,
-    [PIECES.BISHOP]: 1,
-    [PIECES.KNIGHT]: 1
-  }
-};
+const OPENING_END_PLY = 20;
+const EARLY_MIDDLE_END_PLY = 40;
+const MIDDLE_END_PLY = 70;
+const LATE_MIDDLE_END_PLY = 100;
+const ENDGAME_MATERIAL_THRESHOLD = 13;
+const MAX_PHASE = 24;
 
-const PIECE_NAMES = {
-  [PIECES.KING]: 'king', [PIECES.QUEEN]: 'queen', [PIECES.ROOK]: 'rook',
-  [PIECES.BISHOP]: 'bishop', [PIECES.KNIGHT]: 'knight', [PIECES.PAWN]: 'pawn'
-};
-
-/** Derive game half-move (ply) count from fullMoveCount + activeColor. */
-function halfMoveCount(board) {
-  const fmc = board.gameState.fullMoveCount;
-  return (fmc - 1) * 2 + (board.gameState.activeColor === 'black' ? 1 : 0);
+/**
+ * Game half-move (ply) count derived from the FEN counters.
+ *
+ * Deliberately NOT board.plyCount: that is the undo-stack depth, which is 0
+ * for any position loaded from a FEN and inflated by search make/unmake.
+ */
+export function halfMoveCount(board) {
+  const gs = board.gameState;
+  return (gs.fullMoveCount - 1) * 2 + (gs.activeColor === 'black' ? 1 : 0);
 }
 
-export function calculateMaterialPhase(board) {
-  const whiteIdx = colorToIndex('white');
-  const blackIdx = colorToIndex('black');
-  let phase = 0;
-  const pieceCounts = {};
-  for (const [pieceType, weight] of Object.entries(STAGE_CONFIG.phaseWeights)) {
-    const piece = parseInt(pieceType);
-    const whiteCount = board.bbPieces[whiteIdx][piece].popCount();
-    const blackCount = board.bbPieces[blackIdx][piece].popCount();
-    const total = whiteCount + blackCount;
-    phase += total * weight;
-    pieceCounts[PIECE_NAMES[piece]] = { white: whiteCount, black: blackCount, total };
-  }
-  return { phase, maxPhase: 24, pieceCounts };
+function materialPhase(board) {
+  const w = board.bbPieces[colorToIndex('white')];
+  const b = board.bbPieces[colorToIndex('black')];
+  return (w[PIECES.KNIGHT].popCount() + b[PIECES.KNIGHT].popCount()) * 1
+       + (w[PIECES.BISHOP].popCount() + b[PIECES.BISHOP].popCount()) * 1
+       + (w[PIECES.ROOK  ].popCount() + b[PIECES.ROOK  ].popCount()) * 2
+       + (w[PIECES.QUEEN ].popCount() + b[PIECES.QUEEN ].popCount()) * 4;
 }
 
+const PRIORITIES = {
+  [GAME_STAGE.OPENING]: ['Control the centre', 'Develop knights before bishops',
+    'Castle early', 'Connect rooks', 'Avoid moving the same piece twice',
+    'Avoid early queen sorties'],
+  [GAME_STAGE.EARLY_MIDDLE]: ['Complete development', 'Improve piece placement',
+    'Fix the pawn structure', 'Identify targets'],
+  [GAME_STAGE.MIDDLE]: ['Execute plans', 'Attack weaknesses',
+    'Improve the worst-placed piece', 'Control open files'],
+  [GAME_STAGE.LATE_MIDDLE]: ['Simplify if ahead', 'Avoid simplification if behind',
+    'Steer toward a favourable endgame', 'Create passed pawns'],
+  [GAME_STAGE.ENDGAME]: ['Activate the king', 'Promote pawns',
+    'Coordinate pieces', 'Opposition and key squares'],
+};
+
+export function getStagePriorities(stage) { return PRIORITIES[stage] ?? PRIORITIES[GAME_STAGE.MIDDLE]; }
+
+/**
+ * Cheap stage classification. Returns scalars only — the caller asks for
+ * priorities separately, so the common path allocates one small object.
+ */
 export function detectGameStage(board) {
-  const moveCount = halfMoveCount(board);
-  const fullMoveNumber = board.gameState.fullMoveCount;
-  const { phase, maxPhase, pieceCounts } = calculateMaterialPhase(board);
-  const phasePercent = phase / maxPhase;
+  const ply = halfMoveCount(board);
+  const phase = materialPhase(board);
 
-  let stage, stageReasons = [], priorities = [];
+  let stage;
+  if (phase <= ENDGAME_MATERIAL_THRESHOLD)   stage = GAME_STAGE.ENDGAME;
+  else if (ply <= OPENING_END_PLY)           stage = GAME_STAGE.OPENING;
+  else if (ply <= EARLY_MIDDLE_END_PLY)      stage = GAME_STAGE.EARLY_MIDDLE;
+  else if (ply <= MIDDLE_END_PLY)            stage = GAME_STAGE.MIDDLE;
+  else if (ply <= LATE_MIDDLE_END_PLY)       stage = GAME_STAGE.LATE_MIDDLE;
+  else                                       stage = GAME_STAGE.ENDGAME;
 
-  if (phase <= STAGE_CONFIG.endgameMaterialThreshold) {
-    stage = GAME_STAGE.ENDGAME;
-    stageReasons.push(`Low material (phase ${phase}/${maxPhase})`);
-    priorities = ['King activation','Pawn promotion','Piece coordination','Opposition and key squares'];
-  } else if (moveCount <= STAGE_CONFIG.openingEndMove) {
-    stage = GAME_STAGE.OPENING;
-    stageReasons.push(`Move ${fullMoveNumber} (opening phase)`);
-    priorities = ['Control center with pawns','Develop knights before bishops','Castle early for king safety','Connect rooks','Avoid moving same piece twice','Avoid early queen development'];
-  } else if (moveCount <= STAGE_CONFIG.earlyMiddleEndMove) {
-    stage = GAME_STAGE.EARLY_MIDDLE;
-    stageReasons.push(`Move ${fullMoveNumber} (early middlegame)`);
-    priorities = ['Complete development','Improve piece placement','Create pawn structure','Identify targets','Coordinate pieces'];
-  } else if (moveCount <= STAGE_CONFIG.middleEndMove) {
-    stage = GAME_STAGE.MIDDLE;
-    stageReasons.push(`Move ${fullMoveNumber} (middlegame)`);
-    priorities = ['Execute plans','Attack weaknesses','Improve worst placed piece','Control open files','Create threats'];
-  } else if (moveCount <= STAGE_CONFIG.lateMiddleEndMove) {
-    stage = GAME_STAGE.LATE_MIDDLE;
-    stageReasons.push(`Move ${fullMoveNumber} (late middlegame)`);
-    priorities = ['Simplify if ahead','Avoid simplification if behind','Transition to favorable endgame','Activate king if safe','Create passed pawns'];
-  } else {
-    stage = GAME_STAGE.ENDGAME;
-    stageReasons.push(`Move ${fullMoveNumber} (endgame by move count)`);
-    priorities = ['King activation','Pawn promotion','Piece coordination'];
-  }
-
-  if (phasePercent < 0.5 && stage !== GAME_STAGE.ENDGAME) {
-    stageReasons.push(`Material suggests late stage (${(phasePercent * 100).toFixed(0)}%)`);
-  }
-
-  return { stage, fullMoveNumber, halfMoveCount: moveCount, materialPhase: phase,
-    maxMaterialPhase: maxPhase, phasePercent, pieceCounts, stageReasons, priorities, config: STAGE_CONFIG };
-}
-
-export function getStageWeights(stage) {
-  const weights = {
-    [GAME_STAGE.OPENING]:      { material:1.0, centerControl:1.3, development:1.5, pawnStructure:0.8, kingSafety:1.2, pst:1.0, mobility:0.7 },
-    [GAME_STAGE.EARLY_MIDDLE]: { material:1.0, centerControl:1.2, development:1.0, pawnStructure:1.0, kingSafety:1.1, pst:1.0, mobility:1.0 },
-    [GAME_STAGE.MIDDLE]:       { material:1.0, centerControl:1.0, development:0.5, pawnStructure:1.1, kingSafety:1.0, pst:1.0, mobility:1.2 },
-    [GAME_STAGE.LATE_MIDDLE]:  { material:1.1, centerControl:0.9, development:0.2, pawnStructure:1.2, kingSafety:0.9, pst:1.0, mobility:1.1 },
-    [GAME_STAGE.ENDGAME]:      { material:1.2, centerControl:0.6, development:0.0, pawnStructure:1.3, kingSafety:0.3, pst:1.0, mobility:1.0 },
+  return {
+    stage,
+    fullMoveNumber: board.gameState.fullMoveCount,
+    halfMoveCount: ply,
+    materialPhase: phase,
+    maxMaterialPhase: MAX_PHASE,
+    phasePercent: phase / MAX_PHASE,
   };
-  return weights[stage] || weights[GAME_STAGE.MIDDLE];
 }
 
+/**
+ * Opening-principle bonuses/penalties for move ordering. Root-only — this
+ * allocates two arrays per call and must never be used inside the tree.
+ */
 export function checkOpeningPrinciples(board, move, color) {
   const violations = [];
   const bonuses = [];
-  const moveCount = halfMoveCount(board);
+  const ply = halfMoveCount(board);
   const colorIdx = colorToIndex(color);
 
-  if (moveCount > 20) {
-    return { violations:[], bonuses:[], isOpening:false, totalPenalty:0, totalBonus:0 };
+  if (ply > OPENING_END_PLY) {
+    return { violations, bonuses, isOpening: false, totalPenalty: 0, totalBonus: 0 };
   }
 
-  if (moveCount >= 2 && move.capturedPiece === null) {
+  // Same piece twice: scan our own previous moves in the undo history.
+  if (move.capturedPiece === null) {
     const undoPly = board.plyCount;
     for (let back = 2; back <= Math.min(4, undoPly); back += 2) {
-      const prevFrame = board._undo[undoPly - back];
-      if (prevFrame && prevFrame.to === move.fromSquare) {
-        violations.push({ principle:'SAME_PIECE_TWICE', description:'Moving the same piece twice in the opening', severity:'medium', penalty:-15 });
+      const frame = board._undo[undoPly - back];
+      if (frame && frame.to === move.fromSquare) {
+        violations.push({ principle: 'SAME_PIECE_TWICE', severity: 'medium', penalty: -15 });
         break;
       }
     }
   }
 
-  if (move.piece === PIECES.QUEEN && moveCount < 12) {
-    let undevelopedMinors = 0;
-    const knightStarts = color === 'white' ? [1,6] : [57,62];
-    const bishopStarts = color === 'white' ? [2,5] : [58,61];
-    for (const sq of knightStarts) if (board.bbPieces[colorIdx][PIECES.KNIGHT].getBit(sq)) undevelopedMinors++;
-    for (const sq of bishopStarts) if (board.bbPieces[colorIdx][PIECES.BISHOP].getBit(sq)) undevelopedMinors++;
-    if (undevelopedMinors >= 2) {
-      violations.push({ principle:'EARLY_QUEEN', description:`Queen out with ${undevelopedMinors} undeveloped minor pieces`, severity:'high', penalty:-30 });
+  const knightStarts = color === 'white' ? [1, 6] : [57, 62];
+  const bishopStarts = color === 'white' ? [2, 5] : [58, 61];
+
+  if (move.piece === PIECES.QUEEN && ply < 12) {
+    let undeveloped = 0;
+    for (const sq of knightStarts) if (board.bbPieces[colorIdx][PIECES.KNIGHT].getBit(sq)) undeveloped++;
+    for (const sq of bishopStarts) if (board.bbPieces[colorIdx][PIECES.BISHOP].getBit(sq)) undeveloped++;
+    if (undeveloped >= 2) {
+      violations.push({ principle: 'EARLY_QUEEN', severity: 'high', penalty: -30 });
     }
   }
 
-  if (move.piece === PIECES.PAWN && moveCount < 8) {
-    const fromFile = move.from[1];
-    if (fromFile === 0 || fromFile === 7) {
-      const dPawn = color === 'white' ? 11 : 51;
-      const ePawn = color === 'white' ? 12 : 52;
-      if (board.bbPieces[colorIdx][PIECES.PAWN].getBit(dPawn) && board.bbPieces[colorIdx][PIECES.PAWN].getBit(ePawn)) {
-        violations.push({ principle:'EDGE_PAWN_EARLY', description:'Moving edge pawn before central pawns', severity:'low', penalty:-10 });
-      }
+  // Squares instead of move.from / move.to tuples.
+  const fromFile = move.fromSquare & 7;
+  const toFile = move.toSquare & 7;
+  const toRank = move.toSquare >> 3;
+
+  if (move.piece === PIECES.PAWN && ply < 8 && (fromFile === 0 || fromFile === 7)) {
+    const dPawn = color === 'white' ? 11 : 51;
+    const ePawn = color === 'white' ? 12 : 52;
+    if (board.bbPieces[colorIdx][PIECES.PAWN].getBit(dPawn) &&
+        board.bbPieces[colorIdx][PIECES.PAWN].getBit(ePawn)) {
+      violations.push({ principle: 'EDGE_PAWN_EARLY', severity: 'low', penalty: -10 });
     }
   }
-
-  if (move.piece === PIECES.PAWN) {
-    const toFile = move.to[1], toRank = move.to[0];
-    if ((toFile===3||toFile===4) && (toRank===3||toRank===4))
-      bonuses.push({ principle:'CENTRAL_PAWN', description:'Central pawn to good square', bonus:10 });
+  
+  if (move.piece === PIECES.PAWN && (toFile === 3 || toFile === 4) && (toRank === 3 || toRank === 4)) {
+    bonuses.push({ principle: 'CENTRAL_PAWN', bonus: 10 });
   }
   if (move.piece === PIECES.KNIGHT) {
-    const [toRow,toCol] = move.to;
-    if (toCol>=2&&toCol<=5&&toRow>=2&&toRow<=5)
-      bonuses.push({ principle:'KNIGHT_DEVELOPMENT', description:'Knight to central square', bonus:8 });
-    const classicSq = color==='white' ? [[5,2],[5,5]] : [[2,2],[2,5]];
-    if (classicSq.some(([r,c])=>r===toRow&&c===toCol))
-      bonuses.push({ principle:'CLASSIC_KNIGHT_SQUARE', description:'Knight to classic development square', bonus:5 });
+    if (toFile >= 2 && toFile <= 5 && toRank >= 2 && toRank <= 5) {
+      bonuses.push({ principle: 'KNIGHT_DEVELOPMENT', bonus: 8 });
+    }
+    const classicRank = color === 'white' ? 2 : 5;   // c3/f3 for white, c6/f6 for black
+    if (toRank === classicRank && (toFile === 2 || toFile === 5)) {
+      bonuses.push({ principle: 'CLASSIC_KNIGHT_SQUARE', bonus: 5 });
+    }
   }
   if (move.piece === PIECES.BISHOP) {
-    const [toRow,toCol] = move.to;
-    if ((toRow+toCol===7)||(toRow===toCol))
-      bonuses.push({ principle:'BISHOP_LONG_DIAGONAL', description:'Bishop on long diagonal', bonus:8 });
+    // Long diagonals in rank/file terms: a1-h8 (rank === file) and a8-h1.
+    if (toRank === toFile || toRank + toFile === 7) {
+      bonuses.push({ principle: 'BISHOP_LONG_DIAGONAL', bonus: 8 });
+    }
   }
-  if (move.piece === PIECES.KING) {
-    if (Math.abs(move.to[1]-move.from[1])===2)
-      bonuses.push({ principle:'CASTLING', description:'Castling for king safety', bonus:25 });
+  if (move.piece === PIECES.KING && Math.abs(toFile - fromFile) === 2) {
+    bonuses.push({ principle: 'CASTLING', bonus: 25 });
   }
 
-  return {
-    violations, bonuses, isOpening:true,
-    totalPenalty: violations.reduce((s,v)=>s+v.penalty, 0),
-    totalBonus: bonuses.reduce((s,b)=>s+b.bonus, 0)
-  };
+  let totalPenalty = 0;
+  for (const v of violations) totalPenalty += v.penalty;
+  let totalBonus = 0;
+  for (const b of bonuses) totalBonus += b.bonus;
+
+  return { violations, bonuses, isOpening: true, totalPenalty, totalBonus };
 }
 
 export { GAME_STAGE };
-export default { detectGameStage, getStageWeights, checkOpeningPrinciples, calculateMaterialPhase, GAME_STAGE };

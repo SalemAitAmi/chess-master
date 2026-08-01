@@ -1,13 +1,21 @@
+const DRAW_HEADLINES = {
+  stalemate: 'Stalemate — Draw!',
+  threefold: 'Threefold Repetition — Draw!',
+  fifty_move: '50-Move Rule — Draw!',
+  'fifty-move': '50-Move Rule — Draw!',
+  insufficient_material: 'Insufficient Material — Draw!',
+};
+
 const GameOverModal = ({ gameOver, winner, status, onRestart }) => {
   if (!gameOver) return null;
 
-  const headline = winner
-    ? `${winner.charAt(0).toUpperCase() + winner.slice(1)} wins!`
-    : status === 'stalemate' ? 'Stalemate — Draw!'
-    : status === 'threefold' ? 'Threefold Repetition — Draw!'
-    : status === 'fifty_move' || status === 'fifty-move' ? '50-Move Rule — Draw!'
-    : status === 'insufficient_material' ? 'Insufficient Material — Draw!'
-    : 'Game Over — Draw!';
+  // The engine reports winner='draw' for every drawn termination and
+  // winner='none' while undecided. Neither is a player.
+  const hasWinner = winner && winner !== 'none' && winner !== 'draw';
+
+  const headline = hasWinner
+    ? `${winner.charAt(0).toUpperCase() + winner.slice(1)} wins!${status === 'resignation' ? ' (resignation)' : ''}`
+    : DRAW_HEADLINES[status] ?? 'Game Over — Draw!';
 
   return (
     <div className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2

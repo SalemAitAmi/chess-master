@@ -14,9 +14,6 @@ export const PIECES = {
   NONE: 6
 };
 
-// Piece names for display
-export const PIECE_NAMES = ['King', 'Queen', 'Rook', 'Bishop', 'Knight', 'Pawn', 'None'];
-
 // Piece values for material display
 export const PIECE_VALUES = {
   [PIECES.PAWN]: 1,
@@ -35,34 +32,4 @@ export const pieceIcons = {
   [PIECES.BISHOP]: "fa-chess-bishop",
   [PIECES.KNIGHT]: "fa-chess-knight",
   [PIECES.PAWN]: "fa-chess-pawn",
-};
-
-// Piece characters for captured pieces display
-export const PIECE_CHARS = {
-  [PIECES.KING]: 'K',
-  [PIECES.QUEEN]: 'Q',
-  [PIECES.ROOK]: 'R',
-  [PIECES.BISHOP]: 'B',
-  [PIECES.KNIGHT]: 'N',
-  [PIECES.PAWN]: 'P',
-};
-
-// Unicode chess pieces for alternative display
-export const PIECE_UNICODE = {
-  white: {
-    [PIECES.KING]: '♔',
-    [PIECES.QUEEN]: '♕',
-    [PIECES.ROOK]: '♖',
-    [PIECES.BISHOP]: '♗',
-    [PIECES.KNIGHT]: '♘',
-    [PIECES.PAWN]: '♙',
-  },
-  black: {
-    [PIECES.KING]: '♚',
-    [PIECES.QUEEN]: '♛',
-    [PIECES.ROOK]: '♜',
-    [PIECES.BISHOP]: '♝',
-    [PIECES.KNIGHT]: '♞',
-    [PIECES.PAWN]: '♟',
-  }
 };

@@ -357,6 +357,11 @@ export class PolyglotBook {
     this.totalEntries = 0;
   }
 
+  /**
+   * NOTE: readFileSync wrapped in a Promise — this is synchronous work behind
+   * an async signature, kept because callers await it during startup. The book
+   * is ~1MB; if it grows, switch to fs.promises.readFile.
+   */
   async load() {
     return new Promise((resolve, reject) => {
       try {
@@ -411,72 +416,4 @@ export class PolyglotBook {
 
     return this.entries.get(keyHex) || [];
   }
-}
-
-export function findStartingPositionHash(filePath) {
-  const buffer = fs.readFileSync(filePath);
-  const candidates = new Map();
-  const openingMoves = ['e2e4', 'd2d4', 'g1f3', 'c2c4', 'e2e3'];
-
-  for (let i = 0; i < buffer.length / 16; i++) {
-    const offset = i * 16;
-
-    const keyHi = buffer.readUInt32BE(offset);
-    const keyLo = buffer.readUInt32BE(offset + 4);
-    const key = (BigInt(keyHi) << 32n) | BigInt(keyLo >>> 0);
-    const keyHex = key.toString(16).padStart(16, '0');
-
-    const moveInt = buffer.readUInt16BE(offset + 8);
-    const weight = buffer.readUInt16BE(offset + 10);
-    const move = decodeMove(moveInt);
-
-    if (openingMoves.includes(move)) {
-      if (!candidates.has(keyHex)) {
-        candidates.set(keyHex, []);
-      }
-      candidates.get(keyHex).push({ move, weight });
-    }
-  }
-
-  let maxMoves = 0;
-  let startingHash = null;
-
-  for (const [hash, moves] of candidates.entries()) {
-    if (moves.length > maxMoves) {
-      maxMoves = moves.length;
-      startingHash = hash;
-    }
-  }
-
-  return {
-    hash: startingHash,
-    moves: candidates.get(startingHash) || []
-  };
-}
-
-/**
- * Debug: Read first 5 entries from book to verify our hashing
- */
-export function debugBookEntries(filePath) {
-  const buffer = fs.readFileSync(filePath);
-  const entries = [];
-  
-  for (let i = 0; i < Math.min(5, buffer.length / 16); i++) {
-    const offset = i * 16;
-    
-    const keyHi = buffer.readUInt32BE(offset);
-    const keyLo = buffer.readUInt32BE(offset + 4);
-    const key = (BigInt(keyHi) << 32n) | BigInt(keyLo >>> 0);
-    
-    const moveInt = buffer.readUInt16BE(offset + 8);
-    const weight = buffer.readUInt16BE(offset + 10);
-    
-    entries.push({
-      keyHex: key.toString(16).padStart(16, '0'),
-      move: decodeMove(moveInt),
-      weight
-    });
-  }
-  
-  return entries;
 }

@@ -5,7 +5,7 @@ import { describe, test, expect } from 'vitest';
 import { Board } from '../src/core/board.js';
 import { SearchEngine } from '../src/search/search.js';
 import { DEFAULT_CONFIG, PIECES } from '../src/core/constants.js';
-import { Engine } from '../src/engine.js';
+import { UciSession } from './harness/uciSession.js';
 import { POSITIONS } from './harness/fixtures.js';
 import { searchOnce, evalComponents } from './harness/introspect.js';
 
@@ -69,39 +69,32 @@ describe('Repetition: board-level detection', () => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Engine.isGameOver — full threefold / 50-move / insufficient material
+// isGameOver — full threefold / 50-move / insufficient material
 // ═══════════════════════════════════════════════════════════════════════════
-describe('Engine.isGameOver detects terminal conditions', () => {
-  test('threefold repetition ends the game', () => {
-    const engine = new Engine({ useOpeningBook: false });
-    engine.setPosition('8/8/8/4k3/8/8/4K3/7R w - - 0 1');
-
-    // Two full cycles of Rh1-h2, Ke5-d5, Rh2-h1, Kd5-e5 = 8 plies.
-    // After the second cycle the starting position has occurred 3 times.
-    const moves = [
-      [7, 15], [36, 35], [15, 7], [35, 36],
-      [7, 15], [36, 35], [15, 7], [35, 36],
-    ];
-    for (const [from, to] of moves) engine.makeMove(from, to, null);
-
-    const result = engine.isGameOver();
-    expect(result.over).toBe(true);
-    expect(result.result).toBe('threefold');
+describe('UCI gamestate detects terminal conditions', () => {
+  test('threefold repetition ends the game', async () => {
+    const s = new UciSession();
+    await s.setPosition('8/8/8/4k3/8/8/4K3/7R w - - 0 1');
+    for (const uci of ['h1h2', 'e5d5', 'h2h1', 'd5e5',
+                       'h1h2', 'e5d5', 'h2h1', 'd5e5']) {
+      await s.play(uci);
+    }
+    const st = await s.state();
+    expect(st.repetitions).toBe(3);
+    expect(st.status).toBe('threefold');
+    expect(st.winner).toBe('draw');
   });
 
-  test('insufficient material K vs K', () => {
-    const engine = new Engine({ useOpeningBook: false });
-    engine.setPosition('8/8/8/4k3/8/8/4K3/8 w - - 0 1');
-    const result = engine.isGameOver();
-    expect(result.over).toBe(true);
-    expect(result.result).toBe('insufficient_material');
+  test('insufficient material K vs K', async () => {
+    const s = new UciSession();
+    await s.setPosition('8/8/8/4k3/8/8/4K3/8 w - - 0 1');
+    expect((await s.state()).status).toBe('insufficient_material');
   });
-
-  test('K+R vs K is NOT insufficient material', () => {
-    const engine = new Engine({ useOpeningBook: false });
-    engine.setPosition('8/8/8/4k3/8/8/4K3/7R w - - 0 1');
-    const result = engine.isGameOver();
-    expect(result.over).toBe(false);
+  
+  test('K+R vs K is NOT insufficient material', async () => {
+    const s = new UciSession();
+    await s.setPosition('8/8/8/4k3/8/8/4K3/7R w - - 0 1');
+    expect((await s.state()).status).toBe('ongoing');
   });
 });
 

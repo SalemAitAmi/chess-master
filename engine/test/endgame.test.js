@@ -4,7 +4,7 @@
 import { describe, test, expect } from 'vitest';
 import { Board } from '../src/core/board.js';
 import { SearchEngine } from '../src/search/search.js';
-import { Engine } from '../src/engine.js';
+import { UciSession } from './harness/uciSession.js';
 import { generateAllLegalMoves, isInCheck } from '../src/core/moveGeneration.js';
 import { DEFAULT_CONFIG, PIECES, WHITE_IDX, BLACK_IDX } from '../src/core/constants.js';
 
@@ -166,35 +166,25 @@ describe('Endgame draw-seeking (losing side)', () => {
     expect(shuffle, `Losing side shuffle: ${shuffle}× same move`).toBeLessThanOrEqual(3);
   });
 
-  test('engine uses isGameOver to detect threefold during play', { timeout: 20000 }, () => {
-    // Simulate a game loop that checks isGameOver() after each move.
-    const engine = new Engine({ ...DEFAULT_CONFIG, useOpeningBook: false });
-    engine.setPosition('8/8/8/4k3/8/8/4K3/7R w - - 0 1');
+    test('threefold/50-move is detected through the UCI interface during play', { timeout: 20000 }, async () => {
+    // Drives the real client path: go → makemove → gamestate, checking the
+    // reported status each turn. This is the seam the unit tests miss.
+    const s = new UciSession();
+    await s.setPosition('8/8/8/4k3/8/8/4K3/7R w - - 0 1');
 
-    let termination = 'ply-limit';
+    let status = 'ply-limit';
     for (let i = 0; i < 80; i++) {
-      const status = engine.isGameOver();
-      if (status.over) {
-        termination = status.result;
-        break;
-      }
-
-      const result = engine.search.search(engine.board, 5);
-      if (!result.bestMove) { termination = 'no-move'; break; }
-
-      engine.makeMove(
-        result.bestMove.fromSquare,
-        result.bestMove.toSquare,
-        result.bestMove.promotionPiece
-      );
+      const st = await s.state();
+      if (st.status !== 'ongoing') { status = st.status; break; }
+      const best = await s.bestMove(5);
+      if (best === '(none)') { status = 'no-move'; break; }
+      await s.play(best);
     }
 
-    // The engine should reach checkmate. If it somehow shuffled, threefold
-    // or 50-move would fire — both are acceptable draw terminations.
     expect(
-      ['checkmate', 'stalemate', 'threefold', '50-move', 'insufficient_material'].includes(termination) ||
-      termination === 'ply-limit',
-      `Game did not terminate properly: ${termination}`
+      ['checkmate', 'stalemate', 'threefold', 'fifty_move', 'insufficient_material', 'ply-limit']
+        .includes(status),
+      `Game did not terminate properly: ${status}`
     ).toBe(true);
   });
 });

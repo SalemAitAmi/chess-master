@@ -12,6 +12,7 @@ import { fileURLToPath } from 'url';
 import { PolyglotBook } from './polyglotReader.js';
 import logger, { LOG } from '../logging/logger.js';
 
+const __LOG__ = globalThis.__LOG__ ?? true;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BOOK_PATH = path.join(__dirname, '../../data/baron30.bin');
 
@@ -96,41 +97,16 @@ export function lookupAllBookMoves(board, legalMoves) {
 
   if (hints.size === 0) return null;
 
-  if (LOG.book) {
+  if (__LOG__ && LOG.book) {
     const top = [...hints.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3);
-    logger.book('debug', {
-      fen, count: hints.size,
-      top: top.map(([m, w]) => `${m}(${w})`).join(' '),
-    }, `Book: ${hints.size} hint(s)`);
+    logger.book('debug',
+      { count: hints.size, top: top.map(([m, w]) => `${m}(${w})`).join(' ') },
+      `Book: ${hints.size} hint(s)`);
   }
 
   return hints;
 }
 
-/**
- * LEGACY — single-move selection with weighted random.
- * @deprecated Use lookupAllBookMoves() + search. Kept for backward compat.
- */
-export async function lookupBookMove(board, legalMoves) {
-  const hints = lookupAllBookMoves(board, legalMoves);
-  if (!hints) return null;
-
-  const entries = [...hints.entries()];
-  const total = entries.reduce((s, [, w]) => s + w, 0);
-  let r = Math.random() * total;
-
-  for (const [alg, weight] of entries) {
-    r -= weight;
-    if (r <= 0) {
-      const match = legalMoves.find(m => m.algebraic === alg);
-      if (match) {
-        console.log(`[BOOK] Legacy select: ${alg} (weight ${weight})`);
-        return match;
-      }
-    }
-  }
-  return null;
-}
 
 export function isBookLoaded() { return book !== null && book.loaded === true; }
 export function getBookStats() {
@@ -141,8 +117,3 @@ export function getBookStats() {
   };
 }
 export function getBookError() { return loadError; }
-
-export default {
-  loadOpeningBook, lookupAllBookMoves, lookupBookMove,
-  isBookLoaded, getBookStats, getBookError,
-};

@@ -13,9 +13,11 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { LOG_CATEGORY, CATEGORY_NAMES, GAME_STAGE } from './categories.js';
 
+const __DEV__ = globalThis.__DEV__ ?? true;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const LOG_DIR = path.join(__dirname, '../../logs');
 const TURN_LOG_DIR = path.join(LOG_DIR, 'turns');
+
 
 // ── Hot-path guard flags ──
 export const LOG = {
@@ -206,25 +208,18 @@ class EngineLogger {
   time(l,d,m)       { this._legacyLog(LOG.time,       LOG_CATEGORY.TIME,       l,d,m); }
   stage(l,d,m)      { this._legacyLog(LOG.stage,      LOG_CATEGORY.STAGE,      l,d,m); }
 
-  evalBreakdown(fen,breakdown,total) { if(!LOG.eval)return;
-    this._getTraceWriter(LOG_CATEGORY.EVAL).write({t:this.turnNumber,fen,total,...breakdown}); }
-  heuristicCalc(name,color,score,details) { if(!LOG.heuristics)return;
-    this._getTraceWriter(LOG_CATEGORY.HEURISTICS).write({t:this.turnNumber,h:name,c:color,s:score,...details}); }
-  moveOrderingDecision(moves,ply) { if(!LOG.moveOrder)return;
-    this._getTraceWriter(LOG_CATEGORY.MOVE_ORDER).write({t:this.turnNumber,ply,n:moves.length,
-      top:moves[0]?.algebraic,topScore:moves[0]?.orderScore}); }
-  logStageTransition(prev,next,details) { this.write(`[STAGE] ${prev} → ${next}`);
-    if(!LOG.stage)return; this._getTraceWriter(LOG_CATEGORY.STAGE).writeAlways({t:this.turnNumber,prev,next,...details}); }
-  logOpeningViolation(move,violations,bonuses) {
-    this.write(`[OPENING] ${move.algebraic}: ${violations.length} violation(s)`);
-    this.addTurnWarning('opening_violation',`${move.algebraic}: ${violations.length} violation(s)`); }
-
   // ── Introspection ──
   getRecentTurns() { return this.recentTurns.toArray(); }
   getCurrentTurn() { return this.turnData; }
   getTraceStats()  { const o={}; for(const[c,w]of this._traceWriters)o[CATEGORY_NAMES[c]]=w.stats(); return o; }
 
   // ── Flush / close ──
+  // NOTE: stream.write('') is a no-op on a Writable and does NOT force a
+  // flush — Node flushes its internal buffer on its own schedule. This timer
+  // therefore only guarantees the event loop gets a chance to drain. The real
+  // durability guarantee is flushSync() in the crash handlers.
+  // TODO: if durability of the last few lines matters, switch the main log to
+  // fs.writeSync on a plain fd.
   _flushAll() {
     if (this._mainStream && !this._mainStream.destroyed)
       this._mainStream.write('');   // triggers internal flush
@@ -288,11 +283,13 @@ class NoopLogger {
   heuristics(l,d,m){this._errOnly('HEURISTICS',l,m);}  moves(l,d,m){this._errOnly('MOVES',l,m);}
   pv(l,d,m){this._errOnly('PV',l,m);}  time(l,d,m){this._errOnly('TIME',l,m);}
   stage(l,d,m){this._errOnly('STAGE',l,m);}
-  evalBreakdown(){}  heuristicCalc(){}  moveOrderingDecision(){}
-  logStageTransition(){}  logOpeningViolation(){}
 }
 
-let _instance = new EngineLogger();
+// In a production bundle this folds to `new NoopLogger()` and the EngineLogger
+// constructor — which creates logs/, opens a write stream and starts a 5s
+// interval — never runs at import time. server.js previously swapped in the
+// NoopLogger, but only AFTER the real one had already touched the filesystem.
+let _instance = __DEV__ ? new EngineLogger() : new NoopLogger();
 export function installNoopLogger() { _instance.close(); _instance=new NoopLogger(); for(const k of Object.keys(LOG))LOG[k]=false; }
 export function installRealLogger(opts) { if(_instance instanceof EngineLogger)_instance.close(); _instance=new EngineLogger(opts); }
 

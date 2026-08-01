@@ -1,5 +1,5 @@
 import React, { useMemo } from 'react';
-import { pieceIcons, PIECES } from "../constants/gameConstants";
+import { pieceIcons } from "../constants/gameConstants";
 import { parseFenToBoard } from "../utils/chessUtils";
 
 const ChessBoard = ({ 
@@ -24,9 +24,12 @@ const ChessBoard = ({
     
     for (let displayRow = 0; displayRow < 8; displayRow++) {
       for (let displayCol = 0; displayCol < 8; displayCol++) {
+        // A board flip mirrors BOTH axes. Previously only ranks were flipped,
+        // so playing as black showed a vertically-mirrored board with files
+        // still running a→h left to right.
         const actualRow = flipped ? 7 - displayRow : displayRow;
-        const actualCol = displayCol;
-        
+        const actualCol = flipped ? 7 - displayCol : displayCol;
+
         const piece = board[actualRow]?.[actualCol];
         
         const isSelected = selected && 
@@ -40,9 +43,9 @@ const ChessBoard = ({
           (lastMove.to[0] === actualRow && lastMove.to[1] === actualCol)
         );
 
-        let squareClass = (displayRow + displayCol) % 2 === 0 
-          ? "bg-amber-100" 
-          : "bg-amber-700";
+        // Square colour must follow the ACTUAL square, not the display slot,
+        // otherwise a1 changes colour when the board flips.
+        let squareClass = (actualRow + actualCol) % 2 === 0 ? "bg-amber-100" : "bg-amber-700";
         
         if (isSelected) {
           squareClass = "bg-blue-400 shadow-inner";
@@ -88,13 +91,12 @@ const ChessBoard = ({
 
   const renderFileLabels = () => {
     const files = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
+    const display = flipped ? [...files].reverse() : files;
     return (
       <div className="flex">
         <div className="w-8" />
-        {files.map((file) => (
-          <div key={file} className="w-[64px] text-center text-gray-400 text-sm font-semibold">
-            {file}
-          </div>
+        {display.map((file) => (
+          <div key={file} className="w-[64px] text-center text-gray-400 text-sm font-semibold">{file}</div>
         ))}
       </div>
     );

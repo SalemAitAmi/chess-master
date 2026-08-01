@@ -60,7 +60,7 @@ export class TranspositionTable {
     this.indexMask = BigInt(pow2 - 1);
 
     // Struct-of-arrays. Contiguous, cache-friendly, no per-entry objects.
-    this.keys   = new BigInt64Array(this.size);
+    this.keys   = new BigUint64Array(this.size);
     this.scores = new Int32Array(this.size);
     this.moves  = new Int32Array(this.size);     // encoded
     this.depths = new Int8Array(this.size);

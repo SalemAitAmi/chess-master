@@ -26,7 +26,7 @@ export function parseFenToBoard(fen) {
     board[row] = [];
     let col = 0;
     
-    for (const char of rows[row]) {
+    for (const char of rows[row] ?? '8') {
       if (char >= '1' && char <= '8') {
         const empty = parseInt(char);
         for (let i = 0; i < empty; i++) {
@@ -41,6 +41,7 @@ export function parseFenToBoard(fen) {
         };
       }
     }
+    while (col < 8) board[row][col++] = null;   // tolerate truncated ranks
   }
   
   return board;
@@ -51,32 +52,4 @@ export function parseFenToBoard(fen) {
  */
 export function createEmptyBoard() {
   return Array(8).fill(null).map(() => Array(8).fill(null));
-}
-
-/**
- * Get piece at position from parsed board
- */
-export function getPieceAt(board, row, col) {
-  if (!board || row < 0 || row >= 8 || col < 0 || col >= 8) {
-    return null;
-  }
-  return board[row][col];
-}
-
-/**
- * Parse active color from FEN
- */
-export function getActiveColor(fen) {
-  if (!fen) return 'white';
-  const parts = fen.split(' ');
-  return parts[1] === 'b' ? 'black' : 'white';
-}
-
-/**
- * Get full move number from FEN
- */
-export function getFullMoveNumber(fen) {
-  if (!fen) return 1;
-  const parts = fen.split(' ');
-  return parseInt(parts[5]) || 1;
 }

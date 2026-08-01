@@ -9,6 +9,7 @@
  */
 
 import { PIECES, WHITE_IDX, BLACK_IDX } from '../core/constants.js';
+import { halfMoveCount } from '../utils/gameStage.js';
 import { evaluateMaterial } from './material.js';
 import { evaluateCenterControl } from './centerControl.js';
 import { evaluateDevelopment } from './development.js';

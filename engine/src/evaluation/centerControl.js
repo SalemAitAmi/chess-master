@@ -4,7 +4,8 @@
 
 import { PIECES } from '../core/constants.js';
 import { colorToIndex, rowColToIndex } from '../core/bitboard.js';
-import logger from '../logging/logger.js';
+import logger, { LOG } from '../logging/logger.js';
+const __LOG__ = globalThis.__LOG__ ?? true;
 
 const CENTER_SQUARES = [
   rowColToIndex(3, 3), rowColToIndex(3, 4), // d5, e5
@@ -32,40 +33,19 @@ const PIECE_CENTER_BONUS = {
 
 export function evaluateCenterControl(board, color, weight = 1.0) {
   const colorIdx = colorToIndex(color);
-  const oppositeColorIdx = colorToIndex(color === 'white' ? 'black' : 'white');
-  
+  const oppIdx = colorIdx ^ 1;
   let score = 0;
-  const details = { centerSquares: [], extendedCenter: [] };
-  
-  // Center squares
   for (const sq of CENTER_SQUARES) {
-    if (board.bbSide[colorIdx].getBit(sq)) {
-      const piece = board.pieceList[sq];
-      const bonus = PIECE_CENTER_BONUS[piece] || 10;
-      score += bonus;
-      details.centerSquares.push({ square: sq, piece, bonus });
-    }
-    if (board.bbSide[oppositeColorIdx].getBit(sq)) {
-      const piece = board.pieceList[sq];
-      const penalty = PIECE_CENTER_BONUS[piece] || 10;
-      score -= penalty;
-    }
+    if (board.bbSide[colorIdx].getBit(sq)) score += PIECE_CENTER_BONUS[board.pieceList[sq]] ?? 10;
+    else if (board.bbSide[oppIdx].getBit(sq)) score -= PIECE_CENTER_BONUS[board.pieceList[sq]] ?? 10;
   }
-  
-  // Extended center
   for (const sq of EXTENDED_CENTER) {
-    if (board.bbSide[colorIdx].getBit(sq)) {
-      score += 5;
-      details.extendedCenter.push(sq);
-    }
-    if (board.bbSide[oppositeColorIdx].getBit(sq)) {
-      score -= 5;
-    }
+    if (board.bbSide[colorIdx].getBit(sq)) score += 5;
+    else if (board.bbSide[oppIdx].getBit(sq)) score -= 5;
   }
-  
-  const weightedScore = Math.round(score * weight);
-  
-  logger.heuristicCalc('CenterControl', color, weightedScore, details);
-  
-  return weightedScore;
+  const weighted = Math.round(score * weight);
+  if (__LOG__ && LOG.heuristics) {
+    logger.heuristics('trace', { h: 'centerControl', c: color, s: weighted }, `center ${weighted}`);
+  }
+  return weighted;
 }

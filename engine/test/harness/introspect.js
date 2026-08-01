@@ -6,7 +6,7 @@
  */
 
 import { Board } from '../../src/core/board.js';
-import { generateAllLegalMoves, isInCheck } from '../../src/core/moveGeneration.js';
+import { generateAllLegalMoves, generateMoves, freshList, isInCheck } from '../../src/core/moveGeneration.js';
 import { PIECES, WHITE_IDX, BLACK_IDX, DEFAULT_CONFIG, SCORE } from '../../src/core/constants.js';
 import { Evaluator } from '../../src/evaluation/evaluate.js';
 import { evaluateMaterial } from '../../src/evaluation/material.js';
@@ -239,7 +239,7 @@ export function traceQSearch(fen, { maxQDepth = 8, config = {} } = {}) {
   };
 
   const score = quiescenceSearch(
-    board, -SCORE.INFINITY, SCORE.INFINITY, color, tracingEvaluator, 0, maxQDepth
+    board, -SCORE.INFINITY, SCORE.INFINITY, color, tracingEvaluator, 0, 0, maxQDepth
   );
 
   const pv = [];
@@ -280,6 +280,7 @@ export function ordering(fen, { bookHints = null, ttMove = 0, config = {} } = {}
     rank: i + 1,
     move: m.algebraic,
     orderScore: m.orderScore,
+    see: m.capturedPiece !== null ? m.seeScore : null,
     tier: m.isTTMove ? 'TT'
         : m.isBookMove ? 'BOOK'
         : m.isPromotion ? 'PROMO'
@@ -288,7 +289,7 @@ export function ordering(fen, { bookHints = null, ttMove = 0, config = {} } = {}
         : m.isCounterMove ? 'COUNTER'
         : m.orderScore > 0 ? 'HISTORY'
         : 'QUIET',
-    capture: m.capturedPiece !== null ? m.capturedPiece : null,
+    capture: m.capturedPiece,
   }));
 }
 

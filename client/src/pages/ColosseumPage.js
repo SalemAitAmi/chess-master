@@ -5,7 +5,7 @@ import GameOverModal from "../components/GameOverModal";
 import GameInfoPanel from "../components/GameInfoPanel";
 import MoveHistory from "../components/MoveHistory";
 import CapturedPieces from "../components/CapturedPieces";
-import { indexToSquare, squareToIndex, indexToRowCol } from "../utils/bitboard";
+import { squareToIndex, indexToRowCol } from "../utils/bitboard";
 
 const STARTING_FEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
 const DIFFICULTY_DEPTHS = { 1:4, 2:6, 3:8, 4:12 };
@@ -27,6 +27,7 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
   const initRef = useRef(false);
   const moveInProgressRef = useRef(false);
   const runningRef = useRef(false);
+  const roundTimerRef = useRef(null);
 
   useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; runningRef.current = false; }; }, []);
   useEffect(() => { runningRef.current = running && !paused; }, [running, paused]);
@@ -63,7 +64,7 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
         const ns = await engine.makeMove(result.move);
         if (ns && mountedRef.current) {
           setGameState(p => ({...p,...ns}));
-          setMoveHistory(p => [...p, result.move]);
+          setMoveHistory(p => [...p, ns.lastmovesan ?? result.move]);
           return ns.status === 'ongoing';
         }
       }
@@ -85,21 +86,23 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
     return () => clearTimeout(timer);
   }, [initialized, running, paused, gameState.status, makeOneMove]);
 
+  useEffect(() => () => clearTimeout(roundTimerRef.current), []);
+  
   useEffect(() => {
     if (gameState.status === 'ongoing' || !running) return;
-    const result = { round:currentRound+1, winner:gameState.winner==='none'?'draw':gameState.winner,
-      status:gameState.status, moves:moveHistory.length, whiteBot:currentBots.white, blackBot:currentBots.black };
+    const result = { round: currentRound + 1, winner: gameState.winner === 'none' ? 'draw' : gameState.winner,
+      status: gameState.status, moves: moveHistory.length,
+      whiteBot: currentBots.white, blackBot: currentBots.black };
     setResults(p => [...p, result]);
-    if (currentRound + 1 >= config.maxRounds) { setRunning(false); runningRef.current = false; }
-    else {
-      setTimeout(async () => {
-        if (!mountedRef.current) return;
-        setCurrentRound(r => r + 1);
-        try { await engine.newGame(); const ns = await engine.getGameState();
-          if (ns && mountedRef.current) { setGameState({...initialGameState,...ns}); setMoveHistory([]); } }
-        catch (e) { console.error('Failed to start next round:', e); }
-      }, 2000);
-    }
+    if (currentRound + 1 >= config.maxRounds) { setRunning(false); runningRef.current = false; return; }
+    roundTimerRef.current = setTimeout(async () => {
+      if (!mountedRef.current) return;
+      setCurrentRound(r => r + 1);
+      try { await engine.newGame(); const ns = await engine.getGameState();
+        if (ns && mountedRef.current) { setGameState({...initialGameState,...ns}); setMoveHistory([]); } }
+      catch (e) { console.error('Failed to start next round:', e); }
+    }, 2000);
+    return () => clearTimeout(roundTimerRef.current);
   }, [gameState.status, running, currentRound, config.maxRounds, currentBots, moveHistory.length, engine.newGame, engine.getGameState]);
 
   const handleStart   = () => { setRunning(true); setPaused(false); };
@@ -128,7 +131,7 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
   if (!initialized) return (<div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-gray-800 to-gray-900"><div className="text-white text-xl">Initializing...</div></div>);
 
   const gameOver = gameState.status !== 'ongoing';
-  const winner   = gameState.winner === 'none' ? null : gameState.winner;
+  const winner = (gameState.winner === 'none' || gameState.winner === 'draw') ? null : gameState.winner;
 
   return (
     <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-gray-800 to-gray-900 relative font-sans p-4">
@@ -190,7 +193,10 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
       {gameOver && running && (
         <div className="mt-4 px-6 py-3 bg-gray-700 rounded-lg text-center">
           <span className="text-xl font-bold text-white">
-            {winner ? `${winner} wins!` : gameState.status === 'threefold' ? 'Draw — Threefold Repetition' : gameState.status === 'fifty_move' ? 'Draw — 50-Move Rule' : 'Draw!'}
+            {winner ? `${winner} wins!` : gameState.status === 'threefold' ? 'Draw — Threefold Repetition'
+              : gameState.status === 'fifty_move' ? 'Draw — 50-Move Rule'
+              : gameState.status === 'insufficient_material' ? 'Draw — Insufficient Material'
+              : 'Draw!'}
           </span>
           <span className="ml-4 text-gray-400">Next round...</span>
         </div>)}
@@ -202,7 +208,7 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
           <div className="text-lg font-bold mt-2 text-purple-300">{whiteWins>blackWins?'White Wins!':blackWins>whiteWins?'Black Wins!':'Draw!'}</div>
         </div>)}
 
-      <GameOverModal gameOver={gameOver && !running} winner={winner} status={gameState.status} onRestart={handleRestart} />
+      <GameOverModal gameOver={gameOver} winner={winner} status={gameState.status} onRestart={handleRestart} />
     </div>
   );
 };

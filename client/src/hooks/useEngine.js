@@ -1,17 +1,6 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import EngineClient from '../engine/EngineClient';
 
-export const LOG_CATEGORY = {
-  NONE: 0,
-  SEARCH: 1 << 0,
-  EVAL: 1 << 1,
-  MOVE_ORDER: 1 << 2,
-  TT: 1 << 3,
-  UCI: 1 << 4,
-  BOOK: 1 << 5,
-  ALL: 0x3FF
-};
-
 // Singleton engine client - shared across all components
 let sharedEngine = null;
 let connectionPromise = null;
@@ -115,12 +104,9 @@ export function useEngine(serverUrl = 'ws://localhost:8080') {
       mountedRef.current = false;
       listenerCount--;
       
-      // Only disconnect if no more listeners AND we're actually connected
-      // Don't disconnect on page navigation - keep connection alive
-      if (listenerCount === 0 && sharedEngine?.isConnected()) {
-        // Keep connection alive for now - only close on app unmount
-        // This prevents reconnection delays when navigating between pages
-      }
+      // The WebSocket is intentionally kept open across page navigation —
+      // reconnecting on every route change costs ~1s and drops engine state.
+      // It is closed only by explicit reconnect() or by the browser on unload.
     };
   }, [serverUrl]);
 

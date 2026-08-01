@@ -36,29 +36,3 @@ export function indexToRowCol(index) {
   const file = index % 8;
   return [7 - rank, file];
 }
-
-// Create UCI move string from UI coordinates
-export function createMoveString(fromRow, fromCol, toRow, toCol, promotion = null) {
-  const from = indexToSquare(rowColToIndex(fromRow, fromCol));
-  const to = indexToSquare(rowColToIndex(toRow, toCol));
-  return from + to + (promotion || '');
-}
-
-// Parse UCI move string to UI coordinates
-export function parseMoveString(moveStr) {
-  if (!moveStr || moveStr.length < 4) return null;
-  
-  const fromSquare = moveStr.slice(0, 2);
-  const toSquare = moveStr.slice(2, 4);
-  const promotion = moveStr.length > 4 ? moveStr[4] : null;
-  
-  const fromIndex = squareToIndex(fromSquare);
-  const toIndex = squareToIndex(toSquare);
-  
-  if (fromIndex === -1 || toIndex === -1) return null;
-  
-  const [fromRow, fromCol] = indexToRowCol(fromIndex);
-  const [toRow, toCol] = indexToRowCol(toIndex);
-  
-  return { fromRow, fromCol, toRow, toCol, promotion };
-}

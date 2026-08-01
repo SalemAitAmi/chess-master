@@ -11,10 +11,11 @@
 import { PIECES, CASTLING, WHITE_IDX, BLACK_IDX } from './constants.js';
 import {
   BitBoard, initializeBitboards, initializePieceList,
-  squareToIndex, indexToSquare, colorToIndex, getPieceColor
+  squareToIndex, indexToSquare, colorToIndex, getPieceColor,
 } from './bitboard.js';
 import {
-  computeZobristKey, getEnPassantZobristIndex, PIECE_SQUARE_KEYS, CASTLING_KEYS, SIDE_KEYS, EN_PASSANT_KEYS
+  computeZobristKey, getEnPassantZobristIndex,
+  PIECE_SQUARE_KEYS, CASTLING_KEYS, SIDE_KEYS, EN_PASSANT_KEYS,
 } from '../tables/zobrist.js';
 
 // Undo stack depth: game moves (~300 max) + search depth (~128) + safety
@@ -55,17 +56,6 @@ export class GameState {
     this.fullMoveCount = 1;
     this.zobristKey = 0n;
   }
-
-  clone() {
-    const s = new GameState();
-    s.activeColor = this.activeColor;
-    s.castling = this.castling;
-    s.halfMoveClock = this.halfMoveClock;
-    s.enPassantSquare = this.enPassantSquare;
-    s.fullMoveCount = this.fullMoveCount;
-    s.zobristKey = this.zobristKey;
-    return s;
-  }
 }
 
 export class Board {
@@ -89,33 +79,6 @@ export class Board {
 
   /** Number of half-moves made on this board (game moves + search moves). */
   get plyCount() { return this._undoPly; }
-
-  /**
-   * Lightweight clone for search — fresh undo stack, shared nothing else.
-   * Cost: ~14 BitBoard clones + 1 array slice + 1 GameState clone.
-   * Use this sparingly; search should use make/unmake on one board.
-   */
-  clone() {
-    const b = Object.create(Board.prototype);
-
-    b.bbPieces = { [WHITE_IDX]: {}, [BLACK_IDX]: {} };
-    b.bbSide = {
-      [WHITE_IDX]: this.bbSide[WHITE_IDX].clone(),
-      [BLACK_IDX]: this.bbSide[BLACK_IDX].clone(),
-    };
-    for (let p = PIECES.KING; p <= PIECES.PAWN; p++) {
-      b.bbPieces[WHITE_IDX][p] = this.bbPieces[WHITE_IDX][p].clone();
-      b.bbPieces[BLACK_IDX][p] = this.bbPieces[BLACK_IDX][p].clone();
-    }
-    b.pieceList = this.pieceList.slice();
-    b.gameState = this.gameState.clone();
-
-    b._undo = new Array(UNDO_STACK_SIZE);
-    for (let i = 0; i < UNDO_STACK_SIZE; i++) b._undo[i] = createUndoFrame();
-    b._undoPly = 0;
-
-    return b;
-  }
 
   /**
    * Count how many times the current Zobrist key appears in the undo history.
@@ -158,12 +121,16 @@ export class Board {
   // All undo info is written into the pre-allocated frame at _undo[_undoPly].
   // ─────────────────────────────────────────────────────────────────────────
   makeMove(fromSquare, toSquare, promotionPiece = null) {
-    if (fromSquare < 0 || fromSquare >= 64 || toSquare < 0 || toSquare >= 64) {
-      return false;
+    if (fromSquare < 0 || fromSquare >= 64 || toSquare < 0 || toSquare >= 64) return false;
+    // Guard the fixed-size ring. A real game plus search depth cannot reach
+    // 512 plies, but a runaway loop silently corrupting frame 0 would be a
+    // nightmare to diagnose — fail loudly instead.
+    if (this._undoPly >= UNDO_STACK_SIZE) {
+      throw new Error(`Board undo stack overflow at ply ${this._undoPly}`);
     }
-
+    
     const gs = this.gameState;
-    const u = this._undo[this._undoPly++];   // ← grab reusable frame
+    const u = this._undo[this._undoPly++];
 
     const movingPiece = this.pieceList[fromSquare];
     const capturedPiece = this.pieceList[toSquare];

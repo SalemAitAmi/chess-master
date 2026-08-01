@@ -75,16 +75,6 @@ export function parseUCICommand(line) {
 
     case 'showstage':
       return { type: 'showstage' };
-
-    case 'showdecision':
-      return { type: 'showdecision' };
-
-    case 'logstage':
-      return { 
-        type: 'logstage', 
-        stage: args[0], 
-        enabled: args[1] !== 'off' 
-      };
       
     default:
       return { type: 'unknown', command, args };
@@ -116,29 +106,21 @@ function parseSetOption(args) {
 
 function parsePosition(args) {
   const result = { type: 'position', fen: null, moves: [] };
-  
   let i = 0;
+
   if (args[i] === 'startpos') {
     result.fen = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
     i++;
   } else if (args[i] === 'fen') {
     i++;
     const fenParts = [];
-    while (i < args.length && args[i] !== 'moves') {
-      fenParts.push(args[i]);
-      i++;
-    }
+    while (i < args.length && args[i] !== 'moves') fenParts.push(args[i++]);
     result.fen = fenParts.join(' ');
   }
-  
-  if (args[i] === 'moves') {
-    i++;
-    while (i < args.length) {
-      result.moves.push(args[i]);
-      i++;
-    }
+
+  if (i < args.length && args[i] === 'moves') {
+    for (i++; i < args.length; i++) result.moves.push(args[i]);
   }
-  
   return result;
 }
 

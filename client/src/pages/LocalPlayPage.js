@@ -47,46 +47,12 @@ const LocalPlayPage = ({ onBackToMenu }) => {
     return () => { mountedRef.current = false; };
   }, []);
 
-  // Update game state from engine, preserving client history
-  const updateGameState = useCallback((engineState, appendMove = null) => {
+  const updateGameState = useCallback((engineState) => {
     if (!engineState) return;
-    
-    setGameState(prev => ({
-      ...prev,
-      ...engineState,
-      // Don't overwrite with engine's truncated history
-    }));
-    
-    // Append new move to client history if provided
-    if (appendMove) {
-      setMoveHistory(prev => [...prev, appendMove]);
-    }
-  }, []);
-
-  // Sync history from engine (used after undo/restart)
-  const syncHistoryFromEngine = useCallback((engineState) => {
-    if (!engineState) return;
-    
-    // Engine sends last 20 moves, but we need to handle cases where
-    // we have fewer than 20 moves total
-    const engineHistory = engineState.history || [];
-    const moveCount = engineState.movecount || 0;
-    
-    // If engine history matches expected count, use it directly
-    if (engineHistory.length === moveCount) {
-      setMoveHistory(engineHistory);
-    } else {
-      // Otherwise, we need to figure out the full history
-      // This happens after undo - engine history is truncated
-      // We'll use our cached history trimmed to moveCount
-      setMoveHistory(prev => {
-        if (moveCount <= prev.length) {
-          return prev.slice(0, moveCount);
-        }
-        // Fallback: use engine history
-        return engineHistory;
-      });
-    }
+    setGameState(prev => ({ ...prev, ...engineState }));
+    // Display history comes from the engine's SAN, appended per move. The
+    // engine only sends a 20-move window, so the client keeps the full list.
+    if (engineState.lastmovesan) setMoveHistory(prev => [...prev, engineState.lastmovesan]);
   }, []);
 
   // Initialize game
@@ -161,7 +127,7 @@ const LocalPlayPage = ({ onBackToMenu }) => {
         try {
           const newState = await engine.makeMove(moveStr);
           if (newState && mountedRef.current) {
-            updateGameState(newState, moveStr);
+            updateGameState(newState);
             setSelected(null);
             setLegalMoves([]);
           }
@@ -201,14 +167,17 @@ const LocalPlayPage = ({ onBackToMenu }) => {
     try {
       const newState = await engine.makeMove(moveStr);
       if (newState && mountedRef.current) {
-        updateGameState(newState, moveStr);
+        updateGameState(newState);
         setSelected(null);
         setLegalMoves([]);
         setPromotion(null);
       }
-    } catch (err) {
-      console.error('Promotion failed:', err);
-    }
+    } catch (e) {
+        console.error('Promotion failed:', e);
+        setPromotion(null);          // NOTE: never leave the modal up on failure
+        setSelected(null);
+        setLegalMoves([]);
+      }
     setLoading(false);
   }, [promotion, engine.connected, engine.makeMove, updateGameState]);
 
@@ -284,7 +253,7 @@ const LocalPlayPage = ({ onBackToMenu }) => {
   } : null;
 
   const gameOver = gameState.status !== 'ongoing';
-  const winner = gameState.winner === 'none' ? null : gameState.winner;
+  const winner = (gameState.winner === 'none' || gameState.winner === 'draw') ? null : gameState.winner;
 
   if (!engine.connected) {
     return (
@@ -383,7 +352,7 @@ const LocalPlayPage = ({ onBackToMenu }) => {
       </div>
 
       <PromotionModal promotion={promotion} onPromotion={handlePromotion} />
-      <GameOverModal gameOver={gameOver} winner={winner} onRestart={handleRestart} />
+      <GameOverModal gameOver={gameOver} winner={winner} status={gameState.status} onRestart={handleRestart} />
     </div>
   );
 };

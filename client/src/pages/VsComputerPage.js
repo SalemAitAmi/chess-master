@@ -35,10 +35,12 @@ const VsComputerPage = ({ playerColor, difficulty, onBackToMenu }) => {
 
   const isPlayerTurn = gameState.turn === currentPlayerColor;
 
-  const updateGameState = useCallback((engineState, appendMove = null) => {
+    const updateGameState = useCallback((engineState) => {
     if (!engineState) return;
     setGameState(prev => ({ ...prev, ...engineState }));
-    if (appendMove) setMoveHistory(prev => [...prev, appendMove]);
+    // Display history comes from the engine's SAN, appended per move. The
+    // engine only sends a 20-move window, so the client keeps the full list.
+    if (engineState.lastmovesan) setMoveHistory(prev => [...prev, engineState.lastmovesan]);
   }, []);
 
   useEffect(() => {
@@ -68,7 +70,7 @@ const VsComputerPage = ({ playerColor, difficulty, onBackToMenu }) => {
       if (!mountedRef.current) return;
       if (result?.move && result.move !== '(none)') {
         const newState = await engine.makeMove(result.move);
-        if (newState && mountedRef.current) updateGameState(newState, result.move);
+        if (newState && mountedRef.current) updateGameState(newState);
       }
     } catch (err) { console.error('Engine move error:', err); }
     finally { if (mountedRef.current) setEngineThinking(false); engineMoveRef.current = false; }
@@ -102,7 +104,7 @@ const VsComputerPage = ({ playerColor, difficulty, onBackToMenu }) => {
         const promoMoves = legalMoves.filter(m => m.startsWith(moveStr) && m.length > 4);
         if (promoMoves.length > 0) { setPromotion({ from:fromSquare, to:clickedSquare, color:gameState.turn==='white'?'w':'b' }); return; }
         setLoading(true);
-        try { const ns = await engine.makeMove(moveStr); if (ns && mountedRef.current) { updateGameState(ns, moveStr); setSelected(null); setLegalMoves([]); } }
+        try { const ns = await engine.makeMove(moveStr); if (ns && mountedRef.current) { updateGameState(ns); setSelected(null); setLegalMoves([]); } }
         catch (e) { console.error('Move failed:', e); }
         setLoading(false); return;
       }
@@ -118,8 +120,13 @@ const VsComputerPage = ({ playerColor, difficulty, onBackToMenu }) => {
     if (!promotion || !engine.connected) return;
     const moveStr = promotion.from + promotion.to + pieceType;
     setLoading(true);
-    try { const ns = await engine.makeMove(moveStr); if (ns && mountedRef.current) { updateGameState(ns, moveStr); setSelected(null); setLegalMoves([]); setPromotion(null); } }
-    catch (e) { console.error('Promotion failed:', e); }
+    try { const ns = await engine.makeMove(moveStr); if (ns && mountedRef.current) { updateGameState(ns); setSelected(null); setLegalMoves([]); setPromotion(null); } }
+    catch (e) {
+      console.error('Promotion failed:', e);
+      setPromotion(null);          // NOTE: never leave the modal up on failure
+      setSelected(null);
+      setLegalMoves([]);
+    }
     setLoading(false);
   }, [promotion, engine.connected, engine.makeMove, updateGameState]);
 
@@ -153,7 +160,10 @@ const VsComputerPage = ({ playerColor, difficulty, onBackToMenu }) => {
   const lastMove = gameState.lastmove ? (() => { const f=squareToIndex(gameState.lastmove.slice(0,2)), t=squareToIndex(gameState.lastmove.slice(2,4)); return (f===-1||t===-1)?null:{from:indexToRowCol(f),to:indexToRowCol(t)}; })() : null;
   const selectedWithMoves = selected ? { row:selected[0], col:selected[1], moves:legalMoves.map(m=>{const i=squareToIndex(m.slice(2,4));return i!==-1?indexToRowCol(i):null;}).filter(Boolean) } : null;
   const gameOver = gameState.status !== 'ongoing';
-  const winner = gameState.winner === 'none' ? null : gameState.winner;
+  // NOTE: engine sends winner='draw' for all drawn terminations and
+  // winner='none' only while the game is still undecided. Both mean "no winner".
+  const winner = (gameState.winner === 'none' || gameState.winner === 'draw')
+    ? null : gameState.winner;
 
   if (!engine.connected) return (
     <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-gray-800 to-gray-900">

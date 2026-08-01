@@ -3,21 +3,6 @@
  * Extended with local play support commands
  */
 
-export const LOG_CATEGORY = {
-  NONE:       0,
-  SEARCH:     1 << 0,
-  EVAL:       1 << 1,
-  MOVE_ORDER: 1 << 2,
-  TT:         1 << 3,
-  UCI:        1 << 4,
-  BOOK:       1 << 5,
-  HEURISTICS: 1 << 6,
-  MOVES:      1 << 7,
-  PV:         1 << 8,
-  TIME:       1 << 9,
-  ALL:        0x3FF
-};
-
 export class EngineClient {
   constructor(serverUrl = 'ws://localhost:8080') {
     this.serverUrl = serverUrl;
@@ -116,9 +101,10 @@ export class EngineClient {
     
     // Check if this is a multi-line response (gamestate, etc.)
     if (this.pendingMultiLineResponse) {
-      const parsed = this._parseMultiLineResponse(lines);
-      this.pendingMultiLineResponse.resolve(parsed);
+      const pending = this.pendingMultiLineResponse;
       this.pendingMultiLineResponse = null;
+      try { pending.resolve(this._parseMultiLineResponse(lines)); }
+      catch (err) { pending.reject(err); }
       return;
     }
 
@@ -182,6 +168,10 @@ export class EngineClient {
   }
 
   _parseMultiLineResponse(lines) {
+    const first = lines.find(l => l.trim());
+    if (first && (first.startsWith('error ') || first.startsWith('valid false'))) {
+      throw new Error(first);                 // rejected by the wrapper below
+    }
     const result = {};
     for (const line of lines) {
       const spaceIdx = line.indexOf(' ');
@@ -398,9 +388,8 @@ export class EngineClient {
     this.send(`setoption name ${name} value ${value}`);
   }
 
-  setLogMask(mask) {
-    this.send(`setlog ${mask}`);
-  }
+  /** @param {number} mask Bitmask from the engine's LOG_CATEGORY (0 = silent). */
+  setLogMask(mask) { this.send(`setlog ${mask}`); }
 
   // ═══════════════════════════════════════════════════════════════════════════
   // EXTENDED UCI COMMANDS FOR LOCAL PLAY

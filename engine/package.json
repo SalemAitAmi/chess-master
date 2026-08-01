@@ -4,12 +4,11 @@
   "description": "Modular chess engine with UCI protocol",
   "type": "module",
   "main": "src/server.js",
-  "scripts": {
+    "scripts": {
     "build:dev": "node build.mjs",
     "build:prod": "node build.mjs --prod",
     "start": "node dist/dev/server.js",
     "start:prod": "node dist/prod/server.js",
-    "bench": "node dist/prod/engine.js",
     "dev": "node --watch src/server.js",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -19,8 +18,8 @@
     "test:zobrist": "vitest run test/zobrist.test.js",
     "test:repetition": "vitest run test/repetition.test.js",
     "test:endgame": "vitest run test/endgame.test.js",
+    "test:uci": "vitest run test/uci.test.js",
     "test:eval": "vitest run test/evaluation/",
-    "test:legacy": "node --expose-gc --test",
     "clean": "node -e \"const fs=require('fs'); const path=require('path'); const {rimrafSync}=require('rimraf'); const ig=require('ignore')(); const root=require('child_process').execSync('git rev-parse --show-toplevel',{encoding:'utf8'}).trim(); ig.add(fs.readFileSync(path.join(root,'.gitignore'),'utf8')); const walk=d=>{for(const e of fs.readdirSync(d,{withFileTypes:true})){const p=path.join(d,e.name); const rel=path.relative(root,p); if(ig.ignores(rel)) rimrafSync(p); else if(e.isDirectory()) walk(p);} }; walk(process.cwd());\""
   },
   "dependencies": {

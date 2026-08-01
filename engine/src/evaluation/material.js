@@ -1,89 +1,57 @@
 /**
- * Material evaluation heuristic with Piece-Square Tables
+ * Material + piece-square-table evaluation.
+ *
+ * Called once per leaf and once per quiescence node. The previous version
+ * built a nested `details.material` / `details.pst` object graph and invoked
+ * logger.heuristicCalc() unconditionally — the guard was inside the logger,
+ * so the allocation happened even with logging disabled.
  */
-
 import { PIECES, PIECE_VALUES } from '../core/constants.js';
 import { colorToIndex } from '../core/bitboard.js';
 import { getPSTValue } from './pieceSquareTables.js';
-import logger from '../logging/logger.js';
+import logger, { LOG } from '../logging/logger.js';
 
-/**
- * Evaluate material balance and piece positioning
- * @param {Board} board - Current board state
- * @param {string} color - Color to evaluate for
- * @param {number} weight - Heuristic weight multiplier
- * @param {number} gamePhase - Game phase (0=endgame, 1=middlegame)
- * @returns {number} Material score in centipawns
- */
+const __LOG__ = globalThis.__LOG__ ?? true;
+const PIECE_KEYS = ['king', 'queen', 'rook', 'bishop', 'knight', 'pawn'];
+
 export function evaluateMaterial(board, color, weight = 1.0, gamePhase = 1) {
   const colorIdx = colorToIndex(color);
-  const oppositeColorIdx = colorToIndex(color === 'white' ? 'black' : 'white');
+  const oppIdx = colorIdx ^ 1;
   const isWhite = color === 'white';
-  
+
   let materialScore = 0;
   let pstScore = 0;
-  const details = {
-    material: {},
-    pst: {}
-  };
-  
+
+  // Only built when someone will read it.
+  const wantDetails = __LOG__ && LOG.heuristics;
+  const details = wantDetails ? {} : null;
+
   for (let piece = PIECES.KING; piece <= PIECES.PAWN; piece++) {
-    const pieceNames = ['king', 'queen', 'rook', 'bishop', 'knight', 'pawn'];
-    const pieceName = pieceNames[piece];
-    
-    // Count pieces
     const ourCount = board.bbPieces[colorIdx][piece].popCount();
-    const theirCount = board.bbPieces[oppositeColorIdx][piece].popCount();
-    const diff = ourCount - theirCount;
-    const pieceMaterialScore = diff * PIECE_VALUES[piece];
-    materialScore += pieceMaterialScore;
-    
-    // PST for our pieces
+    const theirCount = board.bbPieces[oppIdx][piece].popCount();
+    materialScore += (ourCount - theirCount) * PIECE_VALUES[piece];
+
     let ourPST = 0;
-    const ourPiecesBB = board.bbPieces[colorIdx][piece].clone();
-    while (!ourPiecesBB.isEmpty()) {
-      const sq = ourPiecesBB.popLSB();
-      ourPST += getPSTValue(piece, sq, isWhite, gamePhase);
-    }
-    
-    // PST for their pieces
+    const ours = board.bbPieces[colorIdx][piece].clone();
+    while (!ours.isEmpty()) ourPST += getPSTValue(piece, ours.popLSB(), isWhite, gamePhase);
+
     let theirPST = 0;
-    const theirPiecesBB = board.bbPieces[oppositeColorIdx][piece].clone();
-    while (!theirPiecesBB.isEmpty()) {
-      const sq = theirPiecesBB.popLSB();
-      theirPST += getPSTValue(piece, sq, !isWhite, gamePhase);
-    }
-    
-    const piecePSTScore = ourPST - theirPST;
-    pstScore += piecePSTScore;
-    
-    // Store details for logging
-    if (diff !== 0 || piecePSTScore !== 0) {
-      details.material[pieceName] = {
-        ours: ourCount,
-        theirs: theirCount,
-        diff,
-        value: pieceMaterialScore
-      };
-      details.pst[pieceName] = {
-        ours: ourPST,
-        theirs: theirPST,
-        net: piecePSTScore
-      };
+    const theirs = board.bbPieces[oppIdx][piece].clone();
+    while (!theirs.isEmpty()) theirPST += getPSTValue(piece, theirs.popLSB(), !isWhite, gamePhase);
+
+    pstScore += ourPST - theirPST;
+
+    if (details) {
+      details[PIECE_KEYS[piece]] = { ours: ourCount, theirs: theirCount, pst: ourPST - theirPST };
     }
   }
-  
-  const totalScore = materialScore + pstScore;
-  const weightedScore = Math.round(totalScore * weight);
-  
-  logger.heuristicCalc('Material+PST', color, weightedScore, {
-    rawMaterial: materialScore,
-    rawPST: pstScore,
-    total: totalScore,
-    weighted: weightedScore,
-    gamePhase: gamePhase.toFixed(2),
-    details
-  });
-  
-  return weightedScore;
+
+  const weighted = Math.round((materialScore + pstScore) * weight);
+
+  if (wantDetails) {
+    logger.heuristics('trace',
+      { h: 'material', c: color, s: weighted, rawMaterial: materialScore, rawPST: pstScore, details },
+      `material ${weighted}`);
+  }
+  return weighted;
 }

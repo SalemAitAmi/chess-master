@@ -53,8 +53,6 @@
  * Values are in centipawns (100 = 1 pawn)
  */
 
-import logger from '../logging/logger.js';
-
 // Middlegame tables - values from White's perspective (a1 = index 0)
 // Tables are stored with a1 at index 0, h8 at index 63
 // For Black, we mirror vertically
@@ -214,134 +212,24 @@ const PST_ENDGAME = {
   ]
 };
 
+const PIECE_NAMES_PST = ['king', 'queen', 'rook', 'bishop', 'knight', 'pawn'];
+
 /**
  * Mirror a square index for black pieces
  * White sees board with rank 1 at bottom; flip for black
  */
-export function mirrorSquare(square) {
-  // Flip vertically: XOR with 56 swaps ranks 1<->8, 2<->7, etc.
-  return square ^ 56;
-}
+export function mirrorSquare(square) { return square ^ 56; }
 
 /**
- * Get piece name for table lookup
- */
-function getPieceName(pieceType) {
-  const names = ['king', 'queen', 'rook', 'bishop', 'knight', 'pawn'];
-  return names[pieceType];
-}
-
-/**
- * Get PST value for a piece at a square
- * @param {number} pieceType - Piece type (0=King, 1=Queen, 2=Rook, 3=Bishop, 4=Knight, 5=Pawn)
- * @param {number} square - Square index (0-63, a1=0, h8=63)
- * @param {boolean} isWhite - True for white pieces
- * @param {number} phase - Game phase (0=endgame, 1=middlegame)
- * @returns {number} PST value in centipawns
+ * PST value for a piece, interpolated between middlegame and endgame tables.
+ * phase: 1 = middlegame, 0 = endgame.
  */
 export function getPSTValue(pieceType, square, isWhite, phase = 1) {
-  const pieceName = getPieceName(pieceType);
-  
-  if (!pieceName || !PST_MIDDLEGAME[pieceName]) {
-    logger.heuristics('warn', { pieceType, square }, 'Unknown piece type for PST');
-    return 0;
-  }
-  
-  // For white, we use the square directly
-  // For black, we mirror the square (flip board)
+  const name = PIECE_NAMES_PST[pieceType];
+  if (name === undefined) return 0;
   const sq = isWhite ? square : mirrorSquare(square);
-  
-  // Clamp phase to [0, 1]
-  const clampedPhase = Math.max(0, Math.min(1, phase));
-  
-  // Interpolate between middlegame and endgame values
-  const mgValue = PST_MIDDLEGAME[pieceName][sq] || 0;
-  const egValue = PST_ENDGAME[pieceName][sq] || 0;
-  
-  const value = Math.round(mgValue * clampedPhase + egValue * (1 - clampedPhase));
-  
-  logger.heuristics('trace', {
-    pieceType,
-    pieceName,
-    square,
-    isWhite,
-    phase: clampedPhase.toFixed(2),
-    mgValue,
-    egValue,
-    interpolatedValue: value
-  }, `PST ${pieceName} on ${squareToName(square)}: ${value}`);
-  
-  return value;
+  const p = phase < 0 ? 0 : phase > 1 ? 1 : phase;
+  const mg = PST_MIDDLEGAME[name][sq];
+  const eg = PST_ENDGAME[name][sq];
+  return Math.round(mg * p + eg * (1 - p));
 }
-
-/**
- * Helper to convert square index to algebraic notation for logging
- */
-function squareToName(square) {
-  const file = String.fromCharCode('a'.charCodeAt(0) + (square % 8));
-  const rank = Math.floor(square / 8) + 1;
-  return `${file}${rank}`;
-}
-
-/**
- * Calculate total PST bonus for a position
- * @param {Board} board - Board to evaluate
- * @param {string} color - Color to evaluate for
- * @param {number} phase - Game phase (0=endgame, 1=middlegame)
- * @returns {number} PST score in centipawns
- */
-export function calculatePSTScore(board, color, phase = 1) {
-  const colorIdx = color === 'white' ? 0 : 1;
-  const oppositeColorIdx = 1 - colorIdx;
-  const isWhite = color === 'white';
-  
-  let score = 0;
-  const breakdown = {};
-  
-  // For each piece type
-  for (let pieceType = 0; pieceType <= 5; pieceType++) {
-    const pieceName = getPieceName(pieceType);
-    let pieceScore = 0;
-    const positions = [];
-    
-    // Our pieces (positive)
-    const ourPieces = board.bbPieces[colorIdx][pieceType].clone();
-    while (!ourPieces.isEmpty()) {
-      const sq = ourPieces.popLSB();
-      const pstValue = getPSTValue(pieceType, sq, isWhite, phase);
-      pieceScore += pstValue;
-      positions.push({ square: squareToName(sq), value: pstValue, side: 'ours' });
-    }
-    
-    // Their pieces (negative)
-    const theirPieces = board.bbPieces[oppositeColorIdx][pieceType].clone();
-    while (!theirPieces.isEmpty()) {
-      const sq = theirPieces.popLSB();
-      const pstValue = getPSTValue(pieceType, sq, !isWhite, phase);
-      pieceScore -= pstValue;
-      positions.push({ square: squareToName(sq), value: -pstValue, side: 'theirs' });
-    }
-    
-    score += pieceScore;
-    if (positions.length > 0) {
-      breakdown[pieceName] = { total: pieceScore, positions };
-    }
-  }
-  
-  logger.heuristics('debug', {
-    color,
-    phase: phase.toFixed(2),
-    totalPST: score,
-    breakdown
-  }, `PST evaluation: ${score}`);
-  
-  return score;
-}
-
-export default {
-  getPSTValue,
-  calculatePSTScore,
-  mirrorSquare,
-  PST_MIDDLEGAME,
-  PST_ENDGAME
-};

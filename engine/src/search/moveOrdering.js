@@ -10,16 +10,18 @@
 import { PIECE_VALUES, PIECES } from '../core/constants.js';
 import { evaluatePawnPush } from '../evaluation/pawnPush.js';
 import { encodedMatches } from '../tables/transposition.js';
+import { seeFast } from './see.js';
 import { LOG } from '../logging/logger.js';
 
+const __LOG__ = globalThis.__LOG__ ?? true;
 const MAX_PLY = 128;
 
 export const MOVE_PRIORITY = {
   TT_MOVE:          2_000_000,
-  BOOK_MOVE:        1_500_000,   // ← between TT and everything else
+  BOOK_MOVE:        1_500_000,
   PROMOTION_QUEEN:  1_200_000,
-  PROMOTION_OTHER:  1_100_000,
   WINNING_CAPTURE:  1_000_000,
+  PROMOTION_OTHER:    950_000,   // ← below winning captures; see note
   KILLER_MOVE_1:      900_000,
   KILLER_MOVE_2:      850_000,
   COUNTER_MOVE:       800_000,
@@ -29,20 +31,23 @@ export const MOVE_PRIORITY = {
   HISTORY_BASE:             0,
 };
 
-// Polyglot weights cap at 65535. Scale so max weight adds ~100K — enough
-// to order within the book tier, not enough to jump tiers.
 const BOOK_WEIGHT_SCALE = 2;
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MVV-LVA — no state, so just a free function
-// ─────────────────────────────────────────────────────────────────────────────
-function mvvLvaScore(move) {
-  const victim = PIECE_VALUES[move.capturedPiece] || 0;
-  const attacker = PIECE_VALUES[move.piece] || 0;
-  const delta = victim * 10 - attacker;
-  if (delta > 0)   return MOVE_PRIORITY.WINNING_CAPTURE + delta;
-  if (delta === 0) return MOVE_PRIORITY.EQUAL_CAPTURE;
-  return MOVE_PRIORITY.LOSING_CAPTURE + delta;
+/**
+ * Intra-tier ordering key. MVV dominates (victim × 16); LVA breaks ties by
+ * preferring the cheapest attacker.
+ *
+ * This is ONLY a sort key — it no longer decides the tier. The old code used
+ * `victim*10 - attacker > 0` to pick the tier, and since victim*10 >= 1000 >
+ * any attacker value, that test was always true: every capture landed in
+ * WINNING_CAPTURE, above killers and counter-moves, and the EQUAL_CAPTURE and
+ * LOSING_CAPTURE tiers were unreachable dead code. A queen grabbing a defended
+ * pawn was searched before a quiet move that won a piece.
+ */
+function mvvLvaKey(move) {
+  const victim = PIECE_VALUES[move.capturedPiece] ?? 0;
+  const attacker = PIECE_VALUES[move.piece] ?? 0;
+  return victim * 16 + (PIECE_VALUES[PIECES.QUEEN] - attacker);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -152,74 +157,50 @@ export class CounterMoveTable {
 // ─────────────────────────────────────────────────────────────────────────────
 export class MoveOrderer {
   constructor(config = {}) {
-    this.killers  = config.useKillerMoves      !== false ? new KillerMoveTable()  : null;
-    this.history  = config.useHistoryHeuristic !== false ? new HistoryTable()     : null;
+    this.killers  = config.useKillerMoves      !== false ? new KillerMoveTable() : null;
+    this.history  = config.useHistoryHeuristic !== false ? new HistoryTable()    : null;
     this.counters = new CounterMoveTable();
     this.usePawnPush = config.usePawnPush !== false;
   }
-
-  /**
-   * Order moves in place. Returns the SAME array reference.
-   *
-   * @param {Array}       moves      Legal moves — mutated in place
-   * @param {number}      ply        Search ply
-   * @param {Board}       board
-   * @param {string}      color
-   * @param {number}      ttMove     Encoded TT move (integer), or 0
-   * @param {Object|null} lastMove   Previous move (for counter-move lookup)
-   * @param {Map|null}    bookHints  Map<algebraic, weight> — root only
-   */
   orderMoves(moves, ply, board, color, ttMove = 0, lastMove = null, bookHints = null) {
-    // scoreBreakdown is a debugging aid. Only build it when someone will
-    // actually read it — otherwise it's a per-move object allocation that
-    // gets retained by the TT (via bestMove reference in the old design).
-    const wantBreakdown = LOG.moveOrder;
-
-    // Decode counter-move once, outside the loop.
+    const wantBreakdown = __LOG__ && LOG.moveOrder;
     const counterEnc = this.counters.getEncoded(lastMove);
-
     for (let i = 0; i < moves.length; i++) {
       const move = moves[i];
       let score = 0;
-      let breakdown = null;
-      if (wantBreakdown) breakdown = {};
-
-      // Reset ordering annotations from prior iterations. Without this,
-      // flags from a previous depth's ordering leak into the next.
-      move.isTTMove = false;
-      move.isKiller = false;
-      move.isCounterMove = false;
-      move.isBookMove = false;
-
-      // ── TT move — highest tier, it's proven by prior search ──
+      const breakdown = wantBreakdown ? {} : null;
+      // Annotations are reset by the generator now, not here.
       if (ttMove !== 0 && encodedMatches(ttMove, move)) {
         score = MOVE_PRIORITY.TT_MOVE;
         move.isTTMove = true;
         if (breakdown) breakdown.tt = score;
       }
-      // ── Book move — searched early, but TT (actual search evidence) beats it.
-      //    When a book line is bad, a depth-N search produces a TT entry for
-      //    a better move; at depth N+1 that TT move outranks the book hint,
-      //    naturally escaping the bad line. ──
       else if (bookHints && bookHints.has(move.algebraic)) {
-        const weight = bookHints.get(move.algebraic);
-        score = MOVE_PRIORITY.BOOK_MOVE + weight * BOOK_WEIGHT_SCALE;
+        score = MOVE_PRIORITY.BOOK_MOVE + bookHints.get(move.algebraic) * BOOK_WEIGHT_SCALE;
         move.isBookMove = true;
         if (breakdown) breakdown.book = score;
       }
-      // ── Promotions ──
-      else if (move.isPromotion) {
-        score = move.promotionPiece === PIECES.QUEEN
-          ? MOVE_PRIORITY.PROMOTION_QUEEN
-          : MOVE_PRIORITY.PROMOTION_OTHER;
+      // Queen promotions jump the queue. Under-promotions are almost always
+      // wrong, so they sit BELOW winning captures instead of above them — the
+      // old PROMOTION_OTHER tier (1.1M) searched =R/=B/=N before every capture
+      // in the position, which is 3 wasted full-depth searches per promotion.
+      else if (move.isPromotion && move.promotionPiece === PIECES.QUEEN) {
+        score = MOVE_PRIORITY.PROMOTION_QUEEN;
         if (breakdown) breakdown.promo = score;
       }
-      // ── Captures ──
       else if (move.capturedPiece !== null) {
-        score = mvvLvaScore(move);
-        if (breakdown) breakdown.capture = score;
+        // SEE decides the tier; MVV-LVA orders within it.
+        const s = seeFast(board, move);
+        move.seeScore = s;
+        if (s > 0)        score = MOVE_PRIORITY.WINNING_CAPTURE + mvvLvaKey(move);
+        else if (s === 0) score = MOVE_PRIORITY.EQUAL_CAPTURE + mvvLvaKey(move);
+        else              score = MOVE_PRIORITY.LOSING_CAPTURE + s;   // worst losses last
+        if (breakdown) { breakdown.capture = score; breakdown.see = s; }
       }
-      // ── Quiet moves: killers → counter → history → pawn push ──
+      else if (move.isPromotion) {
+        score = MOVE_PRIORITY.PROMOTION_OTHER;
+        if (breakdown) breakdown.promo = score;
+      }
       else {
         if (this.killers) {
           const ks = this.killers.getScore(move, ply);
@@ -239,26 +220,17 @@ export class MoveOrderer {
           if (pb > 0) { score = MOVE_PRIORITY.PAWN_DOUBLE_PUSH + pb; if (breakdown) breakdown.pawnPush = score; }
         }
       }
-
       move.orderScore = score;
       if (breakdown) move.scoreBreakdown = breakdown;
     }
-
-    // In-place sort — no new array.
     moves.sort((a, b) => b.orderScore - a.orderScore);
     return moves;
   }
-
-  addKiller(move, ply)            { this.killers?.add(move, ply); }
-  updateHistory(move, depth, ok)  { this.history?.update(move, depth, ok); }
-  updateCounterMove(last, good)   { this.counters.update(last, good); }
-  prepareNewSearch()              { this.history?.age(); }
-
-  clear() {
-    this.killers?.clear();
-    this.history?.clear();
-    this.counters.clear();
-  }
+  addKiller(move, ply)           { this.killers?.add(move, ply); }
+  updateHistory(move, depth, ok) { this.history?.update(move, depth, ok); }
+  updateCounterMove(last, good)  { this.counters.update(last, good); }
+  prepareNewSearch()             { this.history?.age(); }
+  clear() { this.killers?.clear(); this.history?.clear(); this.counters.clear(); }
 }
 
 export default MoveOrderer;
