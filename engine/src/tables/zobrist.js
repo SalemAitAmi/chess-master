@@ -2,6 +2,8 @@
  * Zobrist hashing using pre-generated seeds with minimum hamming distance of 25
  */
 
+import { BitBoardIterator } from '../core/bitboard.js';
+
 // Import seeds from shared constants
 // These are the same seeds used in the original implementation
 export const ZOBRIST_SEEDS = {
@@ -267,40 +269,36 @@ export const CASTLING_KEYS = ZOBRIST_SEEDS.castling;
 export const SIDE_KEYS = ZOBRIST_SEEDS.sides;
 export const EN_PASSANT_KEYS = ZOBRIST_SEEDS.enPassant;
 
+// Non-destructive: the old version cloned 12 bitboards per call. fromFen(),
+// board construction and the zobrist test all hit this.
+const Z_IT = new BitBoardIterator();
+
 /**
  * Compute Zobrist hash from scratch for a given board position
  */
 export function computeZobristKey(board) {
   let key = 0n;
 
-  // Hash pieces on the board
   for (let color = 0; color < 2; color++) {
     for (let pieceType = 0; pieceType < 6; pieceType++) {
-      const pieceBB = board.bbPieces[color][pieceType].clone();
-      while (!pieceBB.isEmpty()) {
-        const square = pieceBB.popLSB();
-        key ^= PIECE_SQUARE_KEYS[color][pieceType][square];
+      const bb = board.bbPieces[color][pieceType];
+      for (let sq = Z_IT.init(bb).next(); sq >= 0; sq = Z_IT.next()) {
+        key ^= PIECE_SQUARE_KEYS[color][pieceType][sq];
       }
     }
   }
 
-  // Hash castling rights
   key ^= CASTLING_KEYS[board.gameState.castling];
-
-  // Hash side to move
   key ^= SIDE_KEYS[board.gameState.activeColor === 'white' ? 0 : 1];
 
-  // Hash en passant
   if (board.gameState.enPassantSquare !== -1) {
-    const file = board.gameState.enPassantSquare % 8;
-    const rank = Math.floor(board.gameState.enPassantSquare / 8);
-    // Rank 2 = white pawn can be captured, Rank 5 = black pawn can be captured
-    if (rank === 2) {
-      key ^= EN_PASSANT_KEYS[file];
-    } else if (rank === 5) {
-      key ^= EN_PASSANT_KEYS[8 + file];
-    }
-  } else {
+    const file = board.gameState.enPassantSquare & 7;
+    const rank = board.gameState.enPassantSquare >> 3;
+    if (rank === 2)      key ^= EN_PASSANT_KEYS[file];
+    else if (rank === 5) key ^= EN_PASSANT_KEYS[8 + file];
+    else                 key ^= EN_PASSANT_KEYS[16];
+  } 
+  else {
     key ^= EN_PASSANT_KEYS[16];
   }
 

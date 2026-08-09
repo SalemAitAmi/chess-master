@@ -1,18 +1,19 @@
 /**
  * Material + piece-square-table evaluation.
  *
- * Called once per leaf and once per quiescence node. The previous version
- * built a nested `details.material` / `details.pst` object graph and invoked
- * logger.heuristicCalc() unconditionally — the guard was inside the logger,
- * so the allocation happened even with logging disabled.
+ * The `clone().popLSB()` loops allocated one BitBoard per piece type per side
+ * per evaluation — 12 per leaf node. Replaced by a single non-destructive
+ * iterator reused for all 24 walks (eval is synchronous and never nests).
  */
 import { PIECES, PIECE_VALUES } from '../core/constants.js';
-import { colorToIndex } from '../core/bitboard.js';
+import { colorToIndex, BitBoardIterator } from '../core/bitboard.js';
 import { getPSTValue } from './pieceSquareTables.js';
-import logger, { LOG } from '../logging/logger.js';
+import logger, { LOG, CAT } from '../logging/logger.js';
 
 const __LOG__ = globalThis.__LOG__ ?? true;
 const PIECE_KEYS = ['king', 'queen', 'rook', 'bishop', 'knight', 'pawn'];
+
+const IT = new BitBoardIterator();
 
 export function evaluateMaterial(board, color, weight = 1.0, gamePhase = 1) {
   const colorIdx = colorToIndex(color);
@@ -22,23 +23,25 @@ export function evaluateMaterial(board, color, weight = 1.0, gamePhase = 1) {
   let materialScore = 0;
   let pstScore = 0;
 
-  // Only built when someone will read it.
   const wantDetails = __LOG__ && LOG.heuristics;
   const details = wantDetails ? {} : null;
 
   for (let piece = PIECES.KING; piece <= PIECES.PAWN; piece++) {
-    const ourCount = board.bbPieces[colorIdx][piece].popCount();
-    const theirCount = board.bbPieces[oppIdx][piece].popCount();
+    const ourBB = board.bbPieces[colorIdx][piece];
+    const theirBB = board.bbPieces[oppIdx][piece];
+
+    const ourCount = ourBB.popCount();
+    const theirCount = theirBB.popCount();
     materialScore += (ourCount - theirCount) * PIECE_VALUES[piece];
 
     let ourPST = 0;
-    const ours = board.bbPieces[colorIdx][piece].clone();
-    while (!ours.isEmpty()) ourPST += getPSTValue(piece, ours.popLSB(), isWhite, gamePhase);
-
+    for (let s = IT.init(ourBB).next(); s >= 0; s = IT.next()) {
+      ourPST += getPSTValue(piece, s, isWhite, gamePhase);
+    }
     let theirPST = 0;
-    const theirs = board.bbPieces[oppIdx][piece].clone();
-    while (!theirs.isEmpty()) theirPST += getPSTValue(piece, theirs.popLSB(), !isWhite, gamePhase);
-
+    for (let s = IT.init(theirBB).next(); s >= 0; s = IT.next()) {
+      theirPST += getPSTValue(piece, s, !isWhite, gamePhase);
+    }
     pstScore += ourPST - theirPST;
 
     if (details) {
@@ -48,10 +51,9 @@ export function evaluateMaterial(board, color, weight = 1.0, gamePhase = 1) {
 
   const weighted = Math.round((materialScore + pstScore) * weight);
 
-  if (wantDetails) {
-    logger.heuristics('trace',
-      { h: 'material', c: color, s: weighted, rawMaterial: materialScore, rawPST: pstScore, details },
-      `material ${weighted}`);
+  if (__LOG__ && LOG.heuristics) {
+    logger.trace(CAT.HEURISTIC, 'center', { c: color, s: weighted });
   }
+  
   return weighted;
 }

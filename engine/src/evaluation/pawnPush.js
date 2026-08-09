@@ -3,7 +3,7 @@
  */
 import { PIECES } from '../core/constants.js';
 import { colorToIndex } from '../core/bitboard.js';
-import logger, { LOG } from '../logging/logger.js';
+import logger, { LOG, CAT } from '../logging/logger.js';
 
 const __LOG__ = globalThis.__LOG__ ?? true;
 const CENTRAL_SQUARES = [27, 28, 35, 36];   // d4 e4 d5 e5
@@ -35,7 +35,7 @@ export function evaluatePawnPush(move, board, color) {
   if (oppInCentre && file >= 2 && file <= 5) bonus += 15;
 
   if (__LOG__ && LOG.heuristics) {
-    logger.heuristics('trace', { h: 'pawnPush', c: color, s: bonus, file }, `push ${bonus}`);
+    logger.trace(CAT.HEURISTIC, 'pawn-push', { c: color, s: bonus, file });
   }
   return bonus;
 }

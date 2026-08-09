@@ -39,6 +39,8 @@ export const DEFAULT_CONFIG = {
   useLateMovereduction: true,
   useFutilityPruning: true,
   useSEEPruning: true,
+  useSoftPinOrdering: true,        // ← new: pin-risk term in move ordering
+  useMoveVariation: true,          // ← new: root variation in the opening
   useAspirationWindows: true,
   usePVS: true,
   useIID: true,
@@ -48,8 +50,16 @@ export const DEFAULT_CONFIG = {
     material: 1.0, centerControl: 1.0, development: 1.0,
     pawnStructure: 1.0, kingSafety: 1.0, pawnPush: 1.0,
   },
-  // Max draw-contempt magnitude (centipawns).
+  // Draw policy. The old defaults were effectively "draws are free":
+  // contempt bottomed out at 1cp at level material.
   drawContemptMax: 50,
+  neutralContempt: 25,             // a draw at level material costs 25cp
+  repetitionMargin: 90,            // give up this much rather than repeat
+  repetitionContempt: 30,
+  variationMargin: 10,             // randomise among root moves within 15cp
+  variationMaxScore: 90,           // above this |score| the position is decided — play the best
+  variationMaxMoves: 4,
+  randomSeed: 0x2545F491,          // ucinewgame reseeds from the clock
   // Hard wall-clock ceiling per search (ms). The iterative-deepening loop
   // refuses to start a depth it predicts will exceed this.
   maxSearchTime: 30000,

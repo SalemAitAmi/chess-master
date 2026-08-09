@@ -10,7 +10,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { PolyglotBook } from './polyglotReader.js';
-import logger, { LOG } from '../logging/logger.js';
+import logger, { LOG, CAT } from '../logging/logger.js';
 
 const __LOG__ = globalThis.__LOG__ ?? true;
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -41,9 +41,8 @@ export async function loadOpeningBook() {
 
       const sizeKB = Math.round(fs.statSync(BOOK_PATH).size / 1024);
       console.log(`[BOOK] Loaded: ${sizeKB}KB, ${instance.entries.size} positions`);
-      if (LOG.book) {
-        logger.book('info', { sizeKB, positions: instance.entries.size }, 'Book loaded');
-      }
+      
+      if (__LOG__ && LOG.book) logger.event(CAT.BOOK, 'loaded', { sizeKB, positions: instance.entries.size });
 
       book = instance;
       return book;
@@ -99,9 +98,9 @@ export function lookupAllBookMoves(board, legalMoves) {
 
   if (__LOG__ && LOG.book) {
     const top = [...hints.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3);
-    logger.book('debug',
-      { count: hints.size, top: top.map(([m, w]) => `${m}(${w})`).join(' ') },
-      `Book: ${hints.size} hint(s)`);
+    logger.event(CAT.BOOK, 'hints', {
+      count: hints.size, top: top.map(([m, w]) => `${m}(${w})`).join(' ')
+    });
   }
 
   return hints;

@@ -4,7 +4,7 @@
 
 import { PIECES } from '../core/constants.js';
 import { colorToIndex, rowColToIndex } from '../core/bitboard.js';
-import logger, { LOG } from '../logging/logger.js';
+import logger, { LOG, CAT } from '../logging/logger.js';
 const __LOG__ = globalThis.__LOG__ ?? true;
 
 const CENTER_SQUARES = [
@@ -45,7 +45,7 @@ export function evaluateCenterControl(board, color, weight = 1.0) {
   }
   const weighted = Math.round(score * weight);
   if (__LOG__ && LOG.heuristics) {
-    logger.heuristics('trace', { h: 'centerControl', c: color, s: weighted }, `center ${weighted}`);
+    logger.trace(CAT.HEURISTIC, 'centerControl', { h: 'centerControl', c: color, s: weighted , center: `center ${weighted}` });
   }
   return weighted;
 }

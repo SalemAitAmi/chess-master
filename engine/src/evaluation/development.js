@@ -3,7 +3,7 @@
  */
 import { PIECES } from '../core/constants.js';
 import { colorToIndex, rowColToIndex, indexToRowCol } from '../core/bitboard.js';
-import logger, { LOG } from '../logging/logger.js';
+import logger, { LOG, CAT } from '../logging/logger.js';
 
 const __LOG__ = globalThis.__LOG__ ?? true;
 
@@ -25,7 +25,7 @@ export function evaluateDevelopment(board, color, moveCount, weight = 1.0) {
               - evaluateSideDevelopment(board, oppositeColor, colorToIndex(oppositeColor), moveCount);
   const weighted = Math.round(score * weight);
   if (__LOG__ && LOG.heuristics) {
-    logger.heuristics('trace', { h: 'development', c: color, s: weighted, moveCount }, `dev ${weighted}`);
+    logger.trace(CAT.HEURISTIC, 'dev', { c: color, s: weighted, moveCount });
   }
   return weighted;
 }

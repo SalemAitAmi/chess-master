@@ -16,7 +16,9 @@
  * used ~150+ bytes plus retained move-object graphs — real size was ~400MB.
  */
 
-import { LOG } from '../logging/logger.js';
+import logger, { LOG, CAT } from '../logging/logger.js';
+
+const __LOG__ = globalThis.__LOG__ ?? true;
 
 export const TT_FLAG = {
   EXACT: 0,
@@ -81,8 +83,8 @@ export class TranspositionTable {
     // which matters because probe is called once per node.
     this._probeResult = { hit: false, usable: false, score: 0, flag: 0, move: 0 };
 
-    if (LOG.tt) {
-      console.log(`[TT] ${sizeMB}MB → ${this.size} entries (${(this.size * BYTES_PER_ENTRY / 1024 / 1024).toFixed(1)}MB actual)`);
+    if (__LOG__ && LOG.tt) {
+      logger.event(CAT.TT, 'init', { mb: sizeMB, entries: this.size, actual: (this.size * BYTES_PER_ENTRY / 1024 / 1024).toFixed(1) });
     }
   }
 

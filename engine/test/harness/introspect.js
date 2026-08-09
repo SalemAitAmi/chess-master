@@ -8,7 +8,7 @@
 import { Board } from '../../src/core/board.js';
 import { generateAllLegalMoves, generateMoves, freshList, isInCheck } from '../../src/core/moveGeneration.js';
 import { PIECES, WHITE_IDX, BLACK_IDX, DEFAULT_CONFIG, SCORE } from '../../src/core/constants.js';
-import { Evaluator } from '../../src/evaluation/evaluate.js';
+import { Evaluator, evaluateMopUp } from '../../src/evaluation/evaluate.js';
 import { evaluateMaterial } from '../../src/evaluation/material.js';
 import { evaluateCenterControl } from '../../src/evaluation/centerControl.js';
 import { evaluateDevelopment } from '../../src/evaluation/development.js';
@@ -36,50 +36,6 @@ function computePhase(board) {
        + (wp[PIECES.BISHOP].popCount() + bp[PIECES.BISHOP].popCount()) * PHASE_BISHOP
        + (wp[PIECES.ROOK].popCount() + bp[PIECES.ROOK].popCount()) * PHASE_ROOK
        + (wp[PIECES.QUEEN].popCount() + bp[PIECES.QUEEN].popCount()) * PHASE_QUEEN;
-}
-
-// Mop-up calculation matching evaluate.js
-function computeMopUp(board, color, endgameWeight) {
-  if (endgameWeight < 0.5) return 0;
-  
-  const usIdx = color === 'white' ? WHITE_IDX : BLACK_IDX;
-  const oppIdx = usIdx ^ 1;
-  
-  const ourMat = board.bbPieces[usIdx][PIECES.QUEEN].popCount()
-               + board.bbPieces[usIdx][PIECES.ROOK].popCount()
-               + board.bbPieces[usIdx][PIECES.BISHOP].popCount()
-               + board.bbPieces[usIdx][PIECES.KNIGHT].popCount()
-               + board.bbPieces[usIdx][PIECES.PAWN].popCount();
-  const oppMat = board.bbPieces[oppIdx][PIECES.QUEEN].popCount()
-               + board.bbPieces[oppIdx][PIECES.ROOK].popCount()
-               + board.bbPieces[oppIdx][PIECES.BISHOP].popCount()
-               + board.bbPieces[oppIdx][PIECES.KNIGHT].popCount()
-               + board.bbPieces[oppIdx][PIECES.PAWN].popCount();
-  
-  let sign;
-  if (oppMat === 0 && ourMat > 0) sign = 1;
-  else if (ourMat === 0 && oppMat > 0) sign = -1;
-  else return 0;
-  
-  const ourKingSq = board.bbPieces[usIdx][PIECES.KING].getLSB();
-  const oppKingSq = board.bbPieces[oppIdx][PIECES.KING].getLSB();
-  if (ourKingSq < 0 || oppKingSq < 0) return 0;
-  
-  const defKingSq = sign === 1 ? oppKingSq : ourKingSq;
-  const atkKingSq = sign === 1 ? ourKingSq : oppKingSq;
-  
-  const defF = defKingSq & 7, defR = defKingSq >> 3;
-  const df = defF < 4 ? 3 - defF : defF - 4;
-  const dr = defR < 4 ? 3 - defR : defR - 4;
-  const cmd = df + dr;
-  let edgePush = cmd * cmd * 8;
-  if (defF === 0 || defF === 7 || defR === 0 || defR === 7) edgePush += 40;
-  
-  const atkF = atkKingSq & 7, atkR = atkKingSq >> 3;
-  const kingDist = Math.max(Math.abs(atkF - defF), Math.abs(atkR - defR));
-  const proximity = Math.max(0, 14 - 2 * kingDist) * 6;
-  
-  return sign * Math.round((edgePush + proximity) * endgameWeight);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -137,7 +93,7 @@ export function evalComponents(fen, color = null, weights = {}) {
     development: evaluateDevelopment(board, color, moveCount, w.development),
     pawnStructure: evaluatePawnStructure(board, color, w.pawnStructure),
     kingSafety: evaluateKingSafety(board, color, endgameWeight, w.kingSafety),
-    mopUp: computeMopUp(board, color, endgameWeight),
+    mopUp: evaluateMopUp(board, color, endgameWeight, true),
   };
   
   const total = Object.values(components).reduce((s, v) => s + v, 0);

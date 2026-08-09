@@ -21,7 +21,7 @@ import { generateAllLegalMoves, isInCheck } from '../core/moveGeneration.js';
 import { loadOpeningBook, lookupAllBookMoves, isBookLoaded, getBookStats } from '../book/openingBook.js';
 import { squareToIndex } from '../core/bitboard.js';
 import { PIECES, PIECE_VALUES, PIECE_CHARS, WHITE_IDX, BLACK_IDX, DEFAULT_CONFIG } from '../core/constants.js';
-import logger, { LOG } from '../logging/logger.js';
+import logger, { LOG, CAT } from '../logging/logger.js';
 import { parseUCICommand } from './uciParser.js';
 import { moveToSan } from './san.js';
 import { detectGameStage, getStagePriorities } from '../utils/gameStage.js';
@@ -53,11 +53,11 @@ export class UCIHandler {
     if (this.config.useOpeningBook) {
       this.bookReadyPromise = loadOpeningBook()
         .then(book => {
-          if (book && __LOG__ && LOG.book) logger.book('info', getBookStats(), 'Book ready');
+          if (book && __LOG__ && LOG.book) logger.event(CAT.UCI, 'book loaded', { sizeKB, positions: instance.entries.size });
           return book;
         })
         .catch(err => {
-          logger.uci('warn', { error: err.message }, 'Opening book load failed');
+          logger.event(CAT.UCI, 'warn', { error: err.message , msg:'Opening book load failed'});
           return null;
         });
     }
@@ -65,7 +65,7 @@ export class UCIHandler {
 
   async handleCommand(line) {
     const cmd = parseUCICommand(line);
-    if (__LOG__ && LOG.uci) logger.uci('debug', { command: cmd.type, raw: line }, `UCI: ${cmd.type}`);
+    if (__LOG__ && LOG.uci) logger.event(CAT.UCI, 'cmd', { type: cmd.type, raw: line });
 
     switch (cmd.type) {
       case 'uci':        return this.uci();
@@ -90,7 +90,7 @@ export class UCIHandler {
       case 'showstage':  return this.showStage();
 
       default:
-        logger.uci('warn', { command: cmd.command }, 'Unknown command');
+        logger.event(CAT.UCI, 'warn', { command: cmd.command, msg: 'Unknown command'});
         return `info string Unknown command: ${cmd.command ?? ''}`;
     }
   }
@@ -367,6 +367,11 @@ export class UCIHandler {
       'option name UseNullMovePruning type check default true',
       'option name UseLateMovereduction type check default true',
       'option name LogMask type spin default 0 min 0 max 2047',
+      'option name Variation type spin default 15 min 0 max 100',
+      'option name Contempt type spin default 60 min 0 max 200',
+      'option name Seed type spin default 0 min 0 max 2147483647',
+      'option name UseMoveVariation type check default true',
+      'option name UseSoftPinOrdering type check default true',
       '',
       'uciok',
     ].join('\n');
@@ -385,13 +390,17 @@ export class UCIHandler {
         break;
       case 'ownbook':   this.config.useOpeningBook = boolValue; break;
       case 'movetime':  this._set('maxSearchTime', intValue); break;
-      case 'logmask':   logger.setEnabledCategories(intValue); break;
+      case 'logmask':   logger.setMask(n); break;
+      case 'seed':            this._set('randomSeed', intValue); break;
+      case 'variation':       this._set('variationMargin', intValue); break;
+      case 'contempt':        this._set('drawContemptMax', intValue); break;
+      case 'repetitionmargin':this._set('repetitionMargin', intValue); break;
       default: {
         // Map `UseFooBar` → config key `useFooBar` generically instead of the
         // old 13-case switch that duplicated every flag by hand.
         const key = name.charAt(0).toLowerCase() + name.slice(1);
         if (key in this.config) this._set(key, boolValue);
-        else logger.uci('warn', { name }, 'Unknown option');
+        else if (__LOG__ && LOG.uci) logger.event(CAT.UCI, 'unknown-option', { name });
       }
     }
     return null;
@@ -409,7 +418,8 @@ export class UCIHandler {
     this.initialCounts = this._snapshotCounts();
     this.previousEval = 0;
     this.engine.tt?.clear();
-    if (__LOG__) logger.startNewGame();
+    this.engine.reseed();                 // ← games must not be identical
+    if (__LOG__) logger.startGame();
     return null;
   }
 
@@ -423,7 +433,7 @@ export class UCIHandler {
 
     for (const moveStr of moves) {
       if (!this._applyMove(moveStr)) {
-        logger.uci('warn', { moveStr, fen: this.board.toFen() }, 'Illegal move in position command');
+        if (__LOG__ && LOG.uci) logger.event(CAT.UCI, 'illegal-move', { moveStr, fen: this.board.toFen() });
         break;
       }
     }
@@ -473,7 +483,7 @@ export class UCIHandler {
       );
       responses.push(`bestmove ${result.bestMove?.algebraic ?? '(none)'}`);
     } catch (err) {
-      logger.uci('error', { error: err.message, stack: err.stack }, 'Search error');
+      logger.event(CAT.UCI, 'error', { error: err.message, stack: err.stack });
       responses.push(`info string Error: ${err.message}`);
       responses.push('bestmove (none)');
     } finally {
@@ -486,8 +496,8 @@ export class UCIHandler {
   stop() { this.engine.stop(); this.searching = false; return null; }
   quit() { return 'quit'; }
 
-  setLogMask(mask) { logger.setEnabledCategories(mask); return `info string Log mask set to ${mask}`; }
-  clearLogs()      { logger.clearLogs(); return 'info string Logs cleared'; }
+  setLogMask(mask) { logger.setMask(mask); return `info string Log mask set to ${mask}`; }
+  clearLogs() { logger.clear(); return 'info string Logs cleared'; }
 
   showStage() {
     const s = detectGameStage(this.board);

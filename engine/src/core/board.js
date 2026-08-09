@@ -120,18 +120,14 @@ export class Board {
   // makeMove — ZERO ALLOCATIONS
   // All undo info is written into the pre-allocated frame at _undo[_undoPly].
   // ─────────────────────────────────────────────────────────────────────────
-  makeMove(fromSquare, toSquare, promotionPiece = null) {
+    makeMove(fromSquare, toSquare, promotionPiece = null) {
     if (fromSquare < 0 || fromSquare >= 64 || toSquare < 0 || toSquare >= 64) return false;
-    // Guard the fixed-size ring. A real game plus search depth cannot reach
-    // 512 plies, but a runaway loop silently corrupting frame 0 would be a
-    // nightmare to diagnose — fail loudly instead.
     if (this._undoPly >= UNDO_STACK_SIZE) {
       throw new Error(`Board undo stack overflow at ply ${this._undoPly}`);
     }
-    
+
     const gs = this.gameState;
     const u = this._undo[this._undoPly++];
-
     const movingPiece = this.pieceList[fromSquare];
     const capturedPiece = this.pieceList[toSquare];
     const movingColor = gs.activeColor;
@@ -139,9 +135,44 @@ export class Board {
     const movingColorIdx = colorToIndex(movingColor);
     const oppositeColorIdx = colorToIndex(oppositeColor);
 
-    // ── Snapshot GameState scalars into the frame (replaces the old clone) ──
-    u.from = fromSquare;
-    u.to = toSquare;
+    this._snapshotUndo(u, fromSquare, toSquare, movingPiece, capturedPiece, promotionPiece, gs);
+    this._liftPiece(gs, movingColorIdx, movingPiece, fromSquare);
+
+    if (capturedPiece !== PIECES.NONE) {
+      this._removeCapture(gs, oppositeColorIdx, capturedPiece, toSquare);
+    } else {
+      gs.halfMoveClock++;
+    }
+
+    let finalPiece = movingPiece;
+
+    if (movingPiece === PIECES.PAWN) {
+      finalPiece = this._handlePawnMove(
+        gs, u, fromSquare, toSquare, promotionPiece,
+        movingColor, movingColorIdx, oppositeColor, oppositeColorIdx
+      );
+    } else {
+      gs.enPassantSquare = -1;
+    }
+
+    if (movingPiece === PIECES.KING) {
+      this._handleKingMove(gs, u, fromSquare, toSquare, movingColor, movingColorIdx);
+    }
+
+    this._updateCastlingRights(gs, movingPiece, capturedPiece, fromSquare, toSquare, movingColor);
+    this._placePiece(gs, movingColorIdx, finalPiece, toSquare);
+
+    if (movingColor === 'black') gs.fullMoveCount++;
+
+    this._updateZobristEpAndCastling(gs, u.prevCastling, u.prevEpSquare);
+    this._flipSideToMove(gs, movingColor, oppositeColor);
+
+    return true;
+  }
+
+  _snapshotUndo(u, from, to, movingPiece, capturedPiece, promotionPiece, gs) {
+    u.from = from;
+    u.to = to;
     u.movingPiece = movingPiece;
     u.capturedPiece = capturedPiece;
     u.promotionPiece = promotionPiece || 0;
@@ -153,147 +184,147 @@ export class Board {
     u.prevHalfMove = gs.halfMoveClock;
     u.prevFullMove = gs.fullMoveCount;
     u.prevZobrist = gs.zobristKey;
+  }
 
-    const previousEnPassant = gs.enPassantSquare;
-    const previousCastling = gs.castling;
+  _liftPiece(gs, colorIdx, piece, square) {
+    gs.zobristKey ^= PIECE_SQUARE_KEYS[colorIdx][piece][square];
+    this.bbPieces[colorIdx][piece].clearBit(square);
+    this.bbSide[colorIdx].clearBit(square);
+    this.pieceList[square] = PIECES.NONE;
+  }
 
-    // ── Remove piece from source ──
-    gs.zobristKey ^= PIECE_SQUARE_KEYS[movingColorIdx][movingPiece][fromSquare];
-    this.bbPieces[movingColorIdx][movingPiece].clearBit(fromSquare);
-    this.bbSide[movingColorIdx].clearBit(fromSquare);
-    this.pieceList[fromSquare] = PIECES.NONE;
+  _placePiece(gs, colorIdx, piece, square) {
+    gs.zobristKey ^= PIECE_SQUARE_KEYS[colorIdx][piece][square];
+    this.bbPieces[colorIdx][piece].setBit(square);
+    this.bbSide[colorIdx].setBit(square);
+    this.pieceList[square] = piece;
+  }
 
-    // ── Capture ──
-    if (capturedPiece !== PIECES.NONE) {
-      gs.zobristKey ^= PIECE_SQUARE_KEYS[oppositeColorIdx][capturedPiece][toSquare];
-      this.bbPieces[oppositeColorIdx][capturedPiece].clearBit(toSquare);
-      this.bbSide[oppositeColorIdx].clearBit(toSquare);
-      gs.halfMoveClock = 0;
+  _removeCapture(gs, oppositeColorIdx, capturedPiece, square) {
+    gs.zobristKey ^= PIECE_SQUARE_KEYS[oppositeColorIdx][capturedPiece][square];
+    this.bbPieces[oppositeColorIdx][capturedPiece].clearBit(square);
+    this.bbSide[oppositeColorIdx].clearBit(square);
+    gs.halfMoveClock = 0;
+  }
+
+  _handlePawnMove(gs, u, from, to, promotionPiece, movingColor, movingColorIdx, oppositeColor, oppositeColorIdx) {
+    gs.halfMoveClock = 0;
+
+    this._handleEnPassantCapture(gs, u, from, to, oppositeColor, oppositeColorIdx);
+
+    gs.enPassantSquare = -1;
+    this._handleDoublePush(gs, from, to, movingColor);
+
+    return this._handlePromotion(u, from, to, promotionPiece, movingColor);
+  }
+
+  _handleEnPassantCapture(gs, u, from, to, oppositeColor, oppositeColorIdx) {
+    if (gs.enPassantSquare === -1) return;
+
+    const fromRank = from >> 3, fromFile = from & 7;
+    const toRank = to >> 3, toFile = to & 7;
+
+    if (Math.abs(fromFile - toFile) !== 1 || Math.abs(fromRank - toRank) !== 1) return;
+    if (this.pieceList[to] !== PIECES.NONE) return;   // normal capture, not e.p.
+
+    const captureSquare = (fromRank << 3) | toFile;
+
+    if (this.pieceList[captureSquare] !== PIECES.PAWN) return;
+    if (getPieceColor(this.bbSide, captureSquare) !== oppositeColor) return;
+
+    gs.zobristKey ^= PIECE_SQUARE_KEYS[oppositeColorIdx][PIECES.PAWN][captureSquare];
+    this.bbPieces[oppositeColorIdx][PIECES.PAWN].clearBit(captureSquare);
+    this.bbSide[oppositeColorIdx].clearBit(captureSquare);
+    this.pieceList[captureSquare] = PIECES.NONE;
+    u.epCaptureSquare = captureSquare;
+  }
+
+  _handleDoublePush(gs, from, to, movingColor) {
+    const fromRank = from >> 3, toRank = to >> 3;
+    if (Math.abs(fromRank - toRank) === 2) {
+      gs.enPassantSquare = movingColor === 'white' ? to - 8 : to + 8;
+    }
+  }
+
+  _handlePromotion(u, from, to, promotionPiece, movingColor) {
+    const toRank = to >> 3;
+    const isPromoRank = (movingColor === 'white' && toRank === 7) ||
+                        (movingColor === 'black' && toRank === 0);
+    if (!isPromoRank) return PIECES.PAWN;
+
+    const finalPiece = promotionPiece || PIECES.QUEEN;
+    u.promotionPiece = finalPiece;
+    return finalPiece;
+  }
+
+  _handleKingMove(gs, u, from, to, movingColor, movingColorIdx) {
+    if (movingColor === 'white') {
+      gs.castling &= ~(CASTLING.WHITE_KINGSIDE | CASTLING.WHITE_QUEENSIDE);
     } else {
-      gs.halfMoveClock++;
+      gs.castling &= ~(CASTLING.BLACK_KINGSIDE | CASTLING.BLACK_QUEENSIDE);
     }
 
-    let finalPiece = movingPiece;
+    const fileDiff = (to & 7) - (from & 7);
+    if (Math.abs(fileDiff) !== 2) return;
 
-    // ── Pawn logic ──
-    if (movingPiece === PIECES.PAWN) {
-      gs.halfMoveClock = 0;
+    this._moveCastlingRook(gs, u, from, fileDiff, movingColorIdx);
+  }
 
-      // En passant capture
-      if (previousEnPassant !== -1) {
-        const fromRank = fromSquare >> 3;
-        const fromFile = fromSquare & 7;
-        const toRank = toSquare >> 3;
-        const toFile = toSquare & 7;
+  _moveCastlingRook(gs, u, kingFrom, fileDiff, colorIdx) {
+    const rank = kingFrom >> 3;
+    let rookFrom, rookTo;
 
-        if (Math.abs(fromFile - toFile) === 1 &&
-            Math.abs(fromRank - toRank) === 1 &&
-            capturedPiece === PIECES.NONE) {
-          const captureSquare = (fromRank << 3) | toFile;
-          if (this.pieceList[captureSquare] === PIECES.PAWN &&
-              getPieceColor(this.bbSide, captureSquare) === oppositeColor) {
-            gs.zobristKey ^= PIECE_SQUARE_KEYS[oppositeColorIdx][PIECES.PAWN][captureSquare];
-            this.bbPieces[oppositeColorIdx][PIECES.PAWN].clearBit(captureSquare);
-            this.bbSide[oppositeColorIdx].clearBit(captureSquare);
-            this.pieceList[captureSquare] = PIECES.NONE;
-            u.epCaptureSquare = captureSquare;
-          }
-        }
-      }
-
-      gs.enPassantSquare = -1;
-
-      // Double push sets EP target
-      const fromRank = fromSquare >> 3;
-      const toRank = toSquare >> 3;
-      if (Math.abs(fromRank - toRank) === 2) {
-        gs.enPassantSquare = movingColor === 'white' ? toSquare - 8 : toSquare + 8;
-      }
-
-      // Promotion
-      if ((movingColor === 'white' && toRank === 7) ||
-          (movingColor === 'black' && toRank === 0)) {
-        finalPiece = promotionPiece || PIECES.QUEEN;
-        u.promotionPiece = finalPiece;   // record actual promo for undo
-      }
+    if (fileDiff > 0) {
+      rookFrom = (rank << 3) | 7;
+      rookTo   = (rank << 3) | 5;
     } else {
-      gs.enPassantSquare = -1;
+      rookFrom = (rank << 3);
+      rookTo   = (rank << 3) | 3;
     }
 
-    // ── King logic ──
-    if (movingPiece === PIECES.KING) {
-      if (movingColor === 'white') {
-        gs.castling &= ~(CASTLING.WHITE_KINGSIDE | CASTLING.WHITE_QUEENSIDE);
-      } else {
-        gs.castling &= ~(CASTLING.BLACK_KINGSIDE | CASTLING.BLACK_QUEENSIDE);
-      }
+    gs.zobristKey ^= PIECE_SQUARE_KEYS[colorIdx][PIECES.ROOK][rookFrom];
+    gs.zobristKey ^= PIECE_SQUARE_KEYS[colorIdx][PIECES.ROOK][rookTo];
+    this.bbPieces[colorIdx][PIECES.ROOK].clearBit(rookFrom).setBit(rookTo);
+    this.bbSide[colorIdx].clearBit(rookFrom).setBit(rookTo);
+    this.pieceList[rookFrom] = PIECES.NONE;
+    this.pieceList[rookTo] = PIECES.ROOK;
+    u.castleRookFrom = rookFrom;
+    u.castleRookTo = rookTo;
+  }
 
-      // Castling: move the rook too
-      const fileDiff = (toSquare & 7) - (fromSquare & 7);
-      if (Math.abs(fileDiff) === 2) {
-        const rank = fromSquare >> 3;
-        let rookFrom, rookTo;
-        if (fileDiff > 0) { rookFrom = (rank << 3) | 7; rookTo = (rank << 3) | 5; }  // kingside
-        else              { rookFrom = (rank << 3);     rookTo = (rank << 3) | 3; }  // queenside
-
-        gs.zobristKey ^= PIECE_SQUARE_KEYS[movingColorIdx][PIECES.ROOK][rookFrom];
-        gs.zobristKey ^= PIECE_SQUARE_KEYS[movingColorIdx][PIECES.ROOK][rookTo];
-        this.bbPieces[movingColorIdx][PIECES.ROOK].clearBit(rookFrom).setBit(rookTo);
-        this.bbSide[movingColorIdx].clearBit(rookFrom).setBit(rookTo);
-        this.pieceList[rookFrom] = PIECES.NONE;
-        this.pieceList[rookTo] = PIECES.ROOK;
-        u.castleRookFrom = rookFrom;
-        u.castleRookTo = rookTo;
-      }
-    }
-
-    // ── Rook moves/captures strip castling rights ──
+  _updateCastlingRights(gs, movingPiece, capturedPiece, from, to, movingColor) {
     if (movingPiece === PIECES.ROOK) {
       if (movingColor === 'white') {
-        if (fromSquare === 0) gs.castling &= ~CASTLING.WHITE_QUEENSIDE;
-        if (fromSquare === 7) gs.castling &= ~CASTLING.WHITE_KINGSIDE;
+        if (from === 0) gs.castling &= ~CASTLING.WHITE_QUEENSIDE;
+        if (from === 7) gs.castling &= ~CASTLING.WHITE_KINGSIDE;
       } else {
-        if (fromSquare === 56) gs.castling &= ~CASTLING.BLACK_QUEENSIDE;
-        if (fromSquare === 63) gs.castling &= ~CASTLING.BLACK_KINGSIDE;
+        if (from === 56) gs.castling &= ~CASTLING.BLACK_QUEENSIDE;
+        if (from === 63) gs.castling &= ~CASTLING.BLACK_KINGSIDE;
       }
     }
     if (capturedPiece === PIECES.ROOK) {
-      if (toSquare === 0)  gs.castling &= ~CASTLING.WHITE_QUEENSIDE;
-      if (toSquare === 7)  gs.castling &= ~CASTLING.WHITE_KINGSIDE;
-      if (toSquare === 56) gs.castling &= ~CASTLING.BLACK_QUEENSIDE;
-      if (toSquare === 63) gs.castling &= ~CASTLING.BLACK_KINGSIDE;
+      if (to === 0)  gs.castling &= ~CASTLING.WHITE_QUEENSIDE;
+      if (to === 7)  gs.castling &= ~CASTLING.WHITE_KINGSIDE;
+      if (to === 56) gs.castling &= ~CASTLING.BLACK_QUEENSIDE;
+      if (to === 63) gs.castling &= ~CASTLING.BLACK_KINGSIDE;
     }
+  }
 
-    // ── Place piece at destination ──
-    gs.zobristKey ^= PIECE_SQUARE_KEYS[movingColorIdx][finalPiece][toSquare];
-    this.bbPieces[movingColorIdx][finalPiece].setBit(toSquare);
-    this.bbSide[movingColorIdx].setBit(toSquare);
-    this.pieceList[toSquare] = finalPiece;
-
-    // ── Counters ──
-    if (movingColor === 'black') gs.fullMoveCount++;
-
-    // ── Zobrist: EP file ──
-    // CRITICAL: computeZobristKey() uses a 17-entry scheme (0–7 white rank,
-    // 8–15 black rank, 16 = no EP). The old code here used only indices 0–8,
-    // causing permanent hash drift after any double pawn push. That drift
-    // poisoned the TT and made repetition detection by hash impossible.
-    if (previousEnPassant !== gs.enPassantSquare) {
-      gs.zobristKey ^= EN_PASSANT_KEYS[getEnPassantZobristIndex(previousEnPassant)];
+  _updateZobristEpAndCastling(gs, prevCastling, prevEpSquare) {
+    if (prevEpSquare !== gs.enPassantSquare) {
+      gs.zobristKey ^= EN_PASSANT_KEYS[getEnPassantZobristIndex(prevEpSquare)];
       gs.zobristKey ^= EN_PASSANT_KEYS[getEnPassantZobristIndex(gs.enPassantSquare)];
     }
-    // ── Zobrist: castling ──
-    if (previousCastling !== gs.castling) {
-      gs.zobristKey ^= CASTLING_KEYS[previousCastling];
+    if (prevCastling !== gs.castling) {
+      gs.zobristKey ^= CASTLING_KEYS[prevCastling];
       gs.zobristKey ^= CASTLING_KEYS[gs.castling];
     }
+  }
 
-    // ── Zobrist: side ──
+  _flipSideToMove(gs, movingColor, oppositeColor) {
     gs.zobristKey ^= SIDE_KEYS[movingColor === 'white' ? 0 : 1];
     gs.zobristKey ^= SIDE_KEYS[oppositeColor === 'white' ? 0 : 1];
     gs.activeColor = oppositeColor;
-
-    return true;
   }
 
   // ─────────────────────────────────────────────────────────────────────────

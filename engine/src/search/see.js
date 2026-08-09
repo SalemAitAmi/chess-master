@@ -1,27 +1,34 @@
 /**
- * Static Exchange Evaluation.
+ * Static Exchange Evaluation — exact negamax over the capture sequence.
  *
- * Plays out the capture sequence on one square, always recapturing with the
- * least valuable attacker, and returns the material swing in centipawns for
- * the side that initiates it. Handles x-rays (a rook behind a rook becomes an
- * attacker once the front rook is removed) because attackers are recomputed
- * against a live "removed" mask rather than enumerated up front.
+ * Plays the sequence out on one square, always recapturing with the least
+ * valuable attacker, and returns the centipawn swing for the initiator.
+ * X-rays fall out for free because attackers are recomputed against a live
+ * "removed" mask rather than enumerated up front.
  *
- * This replaces two broken approximations:
- *   - moveOrdering's `victim*10 - attacker`, which classified EVERY capture as
- *     winning, and
- *   - quiescence's `victim - attacker`, which ignored whether the victim was
- *     defended — pruning QxR when the rook was free while exploring NxB when
- *     the bishop was defended.
+ * WHY NO PRUNE. The canonical CPW swap algorithm breaks on
+ * `max(-gain[d-1], gain[d]) < 0`, discarding gain[d]. That is SIGN-exact but
+ * not MAGNITUDE-exact: in
  *
- * NOT reentrant: it uses module-level scratch state. Safe because it never
- * recurses and never calls anything that calls it.
+ *     3r2k1/6pp/2p5/3p4/8/8/3R2PP/3R2K1 w - - 0 1   Rxd5
+ *
+ * the prune fires one ply before the doubled rook recaptures. We use SEE
+ * magnitudes to pick the ordering tier (WINNING / EQUAL / LOSING + score) and
+ * to rank quiescence captures, so the sequence is played to exhaustion.
+ * `seeFast` keeps the cheap cases off this path entirely.
+ *
+ * The previous implementation had the worst of both: it wrote gain[d] AND
+ * unwound over it after the prune, which silently lost 100cp on every x-ray
+ * and mis-valued the "defender refuses the recapture" case by a full pawn.
+ *
+ * NOT REENTRANT: module-level scratch. Never recurses, never calls anything
+ * that calls it.
  */
 import { PIECES, WHITE_IDX } from '../core/constants.js';
 import { KNIGHT_ATTACKS, KING_ATTACKS, ORTHO, DIAG } from '../core/moveGeneration.js';
 
-// King value is large but finite: it makes the min/max refuse to trade the
-// king, and `leastValuableAttacker` returns it last.
+// King value is large but finite: min/max then refuses to trade the king, and
+// `leastValuableAttacker` returns it last.
 const SEE_VALUES = new Int32Array(7);
 SEE_VALUES[PIECES.KING]   = 10000;
 SEE_VALUES[PIECES.QUEEN]  = 900;
@@ -33,9 +40,8 @@ SEE_VALUES[PIECES.NONE]   = 0;
 
 export function seeValue(piece) { return SEE_VALUES[piece]; }
 
-// Scratch state (see the reentrancy note above).
 let remLo = 0, remHi = 0;
-const GAIN = new Int32Array(40);
+const GAIN = new Int32Array(34);
 
 function markRemoved(sq) {
   if (sq < 32) remLo |= (1 << sq); else remHi |= (1 << (sq - 32));
@@ -50,72 +56,83 @@ function isRemoved(sq) {
  */
 export function see(board, move) {
   const target = move.toSquare;
-  const pieceList = board.pieceList;
-
   remLo = 0; remHi = 0;
 
-  // Victim value. For en passant the captured pawn is not on `target`.
-  let victimValue;
-  if (move.isEnPassant) {
-    victimValue = SEE_VALUES[PIECES.PAWN];
-    markRemoved(board.bbSide[WHITE_IDX].getBit(move.fromSquare) ? target - 8 : target + 8);
-  } else {
-    victimValue = SEE_VALUES[pieceList[target]];
-  }
+  const moverIsWhite = board.bbSide[WHITE_IDX].getBit(move.fromSquare);
+  const victimValue = computeVictimValue(board, move, target, moverIsWhite);
+  const initialOccupant = computeInitialOccupant(move);
 
   markRemoved(move.fromSquare);
+  const startingSide = (moverIsWhite ? WHITE_IDX : 1) ^ 1;
 
-  // Whatever now stands on the target square — this is what the opponent wins
-  // if they recapture.
-  let occupant = SEE_VALUES[move.piece];
-  if (move.isPromotion) {
-    const promo = move.promotionPiece ?? PIECES.QUEEN;
-    occupant = SEE_VALUES[promo];
-    victimValue += SEE_VALUES[promo] - SEE_VALUES[PIECES.PAWN];
+  const depth = playOutCaptures(board, target, startingSide, initialOccupant, victimValue);
+  unwindGains(depth);
+
+  return GAIN[0];
+}
+
+function computeVictimValue(board, move, target, moverIsWhite) {
+  if (move.isEnPassant) {
+    const victimSq = moverIsWhite ? target - 8 : target + 8;
+    markRemoved(victimSq);
+    return SEE_VALUES[PIECES.PAWN];
   }
 
-  const moverIdx = board.bbSide[WHITE_IDX].getBit(move.fromSquare) ? WHITE_IDX : 1;
-  let side = moverIdx ^ 1;
+  let value = SEE_VALUES[board.pieceList[target]];
 
+  if (move.isPromotion) {
+    const promo = move.promotionPiece ?? PIECES.QUEEN;
+    value += SEE_VALUES[promo] - SEE_VALUES[PIECES.PAWN];
+  }
+  return value;
+}
+
+function computeInitialOccupant(move) {
+  if (move.isPromotion) {
+    const promo = move.promotionPiece ?? PIECES.QUEEN;
+    return SEE_VALUES[promo];
+  }
+  return SEE_VALUES[move.piece];
+}
+
+function playOutCaptures(board, target, startingSide, initialOccupant, victimValue) {
+  let occupant = initialOccupant;
+  let side = startingSide;
   let d = 0;
   GAIN[0] = victimValue;
 
-  while (true) {
+  for (;;) {
     const atkSq = leastValuableAttacker(board, target, side);
     if (atkSq < 0) break;
 
+    const atkPiece = board.pieceList[atkSq];
+    if (isIllegalKingCapture(board, target, side, atkPiece)) break;
+
+    if (d + 1 >= GAIN.length) break;
     d++;
-    if (d >= GAIN.length - 1) break;
     GAIN[d] = occupant - GAIN[d - 1];
-
-    // Pruning: once neither side can improve on the running balance, the rest
-    // of the sequence cannot change the result.
-    if (Math.max(-GAIN[d - 1], GAIN[d]) < 0) break;
-
-    const atkPiece = pieceList[atkSq];
-    if (atkPiece === PIECES.KING && leastValuableAttacker(board, target, side ^ 1) >= 0) {
-      // The king cannot capture onto a square the opponent still attacks, so
-      // this continuation does not exist — retract it.
-      d--;
-      break;
-    }
 
     markRemoved(atkSq);
     occupant = SEE_VALUES[atkPiece];
     side ^= 1;
   }
+  return d;
+}
 
-  // Unwind: each side takes the better of "capture" and "stand pat".
+function isIllegalKingCapture(board, target, side, atkPiece) {
+  if (atkPiece !== PIECES.KING) return false;
+  return leastValuableAttacker(board, target, side ^ 1) >= 0;
+}
+
+function unwindGains(d) {
   for (let i = d; i > 0; i--) {
     GAIN[i - 1] = -Math.max(-GAIN[i - 1], GAIN[i]);
   }
-  return GAIN[0];
 }
 
 /**
  * Square of the least valuable `sideIdx` piece attacking `sq`, ignoring
- * already-removed pieces. -1 if none. Checked in value order: pawn, knight,
- * bishop/rook/queen (min of the ray blockers), king.
+ * already-removed pieces. -1 if none.
  */
 function leastValuableAttacker(board, sq, sideIdx) {
   const bb = board.bbPieces[sideIdx];
@@ -143,8 +160,8 @@ function leastValuableAttacker(board, sq, sideIdx) {
     if (!isRemoved(s) && bb[PIECES.KNIGHT].getBit(s)) return s;
   }
 
-  // Walk all eight rays once, taking the first live piece on each. X-rays fall
-  // out for free: a removed front piece is skipped, exposing the one behind.
+  // Walk all eight rays once, taking the first live piece on each. A removed
+  // front piece is skipped, exposing the x-ray behind it.
   let best = -1, bestVal = 0x7fffffff;
   for (let pass = 0; pass < 2; pass++) {
     const dirs = pass === 0 ? DIAG : ORTHO;
@@ -177,16 +194,18 @@ function leastValuableAttacker(board, sq, sideIdx) {
 }
 
 /**
- * SEE with a cheap short-circuit: when the victim is worth at least as much as
+ * SEE with a sound short-circuit: when the victim is worth at least as much as
  * the attacker, the worst case is losing the attacker, so the swing is
- * >= victim - attacker >= 0 and the full sequence never needs playing out.
- * This keeps SEE off the vast majority of captures.
+ * >= victim - attacker >= 0. The exact value may be higher; the LOWER BOUND is
+ * all the ordering tiers and the quiescence `seeScore < 0` gate need, and it
+ * keeps the full swap off the vast majority of captures.
  */
 export function seeFast(board, move) {
-  const victim = move.isEnPassant ? SEE_VALUES[PIECES.PAWN]
-                                  : SEE_VALUES[board.pieceList[move.toSquare]];
-  if (victim >= SEE_VALUES[move.piece] && !move.isPromotion) {
-    return victim - SEE_VALUES[move.piece] >= 0 ? Math.max(0, victim - SEE_VALUES[move.piece]) : 0;
+  if (!move.isPromotion) {
+    const victim = move.isEnPassant ? SEE_VALUES[PIECES.PAWN]
+                                    : SEE_VALUES[board.pieceList[move.toSquare]];
+    const attacker = SEE_VALUES[move.piece];
+    if (victim >= attacker) return victim - attacker;   // ≥ 0 by construction
   }
   return see(board, move);
 }

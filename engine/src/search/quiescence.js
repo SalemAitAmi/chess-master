@@ -10,7 +10,7 @@
 import { PIECE_VALUES, PIECES, SCORE } from '../core/constants.js';
 import { generateMoves, listForPly, isInCheck, moveAlgebraic } from '../core/moveGeneration.js';
 import { see, seeFast } from './see.js';
-import logger, { LOG } from '../logging/logger.js';
+import logger, { LOG, CAT } from '../logging/logger.js';
 
 const __LOG__ = globalThis.__LOG__ ?? true;
 
@@ -51,8 +51,7 @@ export function quiescenceSearch(
   moves.sort((a, b) => b._qScore - a._qScore);
 
   if (__LOG__ && LOG.search) {
-    logger.search('trace', { q: qDepth, ply, n: moves.length, top: moveAlgebraic(moves[0]) },
-                  `q${qDepth} ${moves.length} tactical`);
+    logger.trace(CAT.SEARCH, 'qnode', { q: qDepth, ply, n: moves.length, top: moveAlgebraic(moves[0]) });
   }
 
   for (let i = 0; i < moves.length; i++) {

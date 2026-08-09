@@ -4,7 +4,7 @@
 
 import { PIECES } from '../core/constants.js';
 import { colorToIndex, indexToRowCol } from '../core/bitboard.js';
-import logger, { LOG } from '../logging/logger.js';
+import logger, { LOG, CAT } from '../logging/logger.js';
 
 const __LOG__ = globalThis.__LOG__ ?? true;
 
@@ -21,7 +21,7 @@ export function evaluateKingSafety(board, color, endgameWeight, weight = 1.0) {
 
   const weighted = Math.round(score * weight);
   if (__LOG__ && LOG.heuristics) {
-    logger.heuristics('trace', { h: 'kingSafety', c: color, s: weighted, safetyWeight }, `king ${weighted}`);
+    logger.trace(CAT.HEURISTIC, 'king-safety', { c: color, s: weighted, safetyWeight });
   }
   return weighted;
 }

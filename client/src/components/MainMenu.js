@@ -15,7 +15,7 @@ const MainMenu = ({ onGameStart }) => {
   const [difficulty, setDifficulty] = useState(2);
   
   // Colosseum config
-  const [whiteBot, setWhiteBot] = useState(2);
+  const [whiteBot, setWhiteBot] = useState(3);
   const [blackBot, setBlackBot] = useState(3);
   const [maxRounds, setMaxRounds] = useState(5);
 
