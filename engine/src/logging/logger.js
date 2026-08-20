@@ -93,7 +93,7 @@ class FileLogger {
     this.dir = path.join(LOG_ROOT, stamp());
     fs.mkdirSync(this.dir, { recursive: true });
     this.timer = setInterval(() => this._flushAll(), 5000);
-    this.timer.unref?.();
+    if (this.timer && this.timer.unref) this.timer.unref();
     return this.dir;
   }
 

@@ -1,61 +1,174 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import EngineClient from '../engine/EngineClient';
+import { reportFailure } from '../utils/failure';
 
-// Singleton engine client - shared across all components
+// ═══════════════════════════════════════════════════════════════════════════
+// Module state — singleton engine client shared across all components
+// ═══════════════════════════════════════════════════════════════════════════
+const DEFAULT_SERVER_URL = 'ws://localhost:8080';
+
 let sharedEngine = null;
 let connectionPromise = null;
 let listenerCount = 0;
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Module helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
 function getSharedEngine(serverUrl) {
-  if (!sharedEngine) {
-    sharedEngine = new EngineClient(serverUrl);
-  }
+  if (sharedEngine === null) sharedEngine = new EngineClient(serverUrl);
   return sharedEngine;
 }
 
 async function connectSharedEngine(engine) {
-  if (engine.isConnected()) {
-    return true;
-  }
-  
-  if (connectionPromise) {
-    return connectionPromise;
-  }
-  
+  if (engine.isConnected()) return true;
+  if (connectionPromise !== null) return connectionPromise;
+
   connectionPromise = (async () => {
     try {
       await engine.connect();
       await engine.initialize();
       return true;
     } catch (err) {
-      console.error('Engine connection failed:', err);
+      reportFailure('useEngine.connectSharedEngine', err);
       return false;
     } finally {
       connectionPromise = null;
     }
   })();
-  
+
   return connectionPromise;
 }
 
-export function useEngine(serverUrl = 'ws://localhost:8080') {
+// ═══════════════════════════════════════════════════════════════════════════
+// Hook
+//
+// Every method REJECTS when the engine is not connected. Callers are expected
+// to catch and surface the failure — nothing here returns a silent null.
+// ═══════════════════════════════════════════════════════════════════════════
+export function useEngine(serverUrl = DEFAULT_SERVER_URL) {
+  // ── State ──
   const [connected, setConnected] = useState(false);
   const [thinking, setThinking] = useState(false);
   const [searchInfo, setSearchInfo] = useState(null);
   const [error, setError] = useState(null);
-  
+
+  // ── Refs ──
   const mountedRef = useRef(true);
   const engineRef = useRef(null);
 
-  // Initialize and connect
+  // ── Callbacks: guard ──
+  const requireEngine = useCallback(() => {
+    const engine = engineRef.current;
+    if (engine === null || !engine.isConnected()) {
+      throw reportFailure('useEngine', new Error('Engine not connected'));
+    }
+    return engine;
+  }, []);
+
+  // ── Callbacks: standard UCI ──
+  const newGame = useCallback(async () => {
+    const engine = requireEngine();
+    await engine.newGame();
+  }, [requireEngine]);
+
+  const setPosition = useCallback(async (fen, moves = []) => {
+    const engine = requireEngine();
+    await engine.setPosition(fen, moves);
+  }, [requireEngine]);
+
+  const go = useCallback(async (options = {}) => {
+    const engine = requireEngine();
+    setThinking(true);
+    setSearchInfo(null);
+    try {
+      const result = await engine.go(options);
+      if (!result || typeof result.move !== 'string') {
+        throw new Error(`go returned no bestmove: ${JSON.stringify(result)}`);
+      }
+      return result;
+    } finally {
+      if (mountedRef.current) setThinking(false);
+    }
+  }, [requireEngine]);
+
+  const stop = useCallback(() => {
+    const engine = engineRef.current;
+    if (engine !== null && engine.isConnected()) {
+      try { engine.stop(); }
+      catch (e) { reportFailure('useEngine.stop', e); }
+    }
+    setThinking(false);
+  }, []);
+
+  const setOption = useCallback((name, value) => {
+    const engine = requireEngine();
+    engine.setOption(name, value);
+  }, [requireEngine]);
+
+  // ── Callbacks: interactive extensions ──
+  const validateMove = useCallback(async (move) => {
+    const engine = requireEngine();
+    return engine.validateMove(move);
+  }, [requireEngine]);
+
+  const getLegalMoves = useCallback(async (square = null) => {
+    const engine = requireEngine();
+    return engine.getLegalMoves(square);
+  }, [requireEngine]);
+
+  const makeMove = useCallback(async (move) => {
+    const engine = requireEngine();
+    return engine.makeMove(move);
+  }, [requireEngine]);
+
+  const undoMove = useCallback(async () => {
+    const engine = requireEngine();
+    return engine.undoMove();
+  }, [requireEngine]);
+
+  const getGameState = useCallback(async () => {
+    const engine = requireEngine();
+    return engine.getGameState();
+  }, [requireEngine]);
+
+  // ── Callbacks: connection ──
+  const reconnect = useCallback(async () => {
+    if (sharedEngine !== null) {
+      try { sharedEngine.disconnect(); }
+      catch (e) { reportFailure('useEngine.reconnect.disconnect', e); }
+      sharedEngine = null;
+    }
+    connectionPromise = null;
+
+    const engine = getSharedEngine(serverUrl);
+    engineRef.current = engine;
+    engine.onConnectionChange = (isConnected) => {
+      if (!mountedRef.current) return;
+      setConnected(isConnected);
+      if (!isConnected) setThinking(false);
+    };
+
+    setError(null);
+    let success = false;
+    try {
+      success = await connectSharedEngine(engine);
+    } catch (err) {
+      reportFailure('useEngine.reconnect', err);
+    }
+    if (!mountedRef.current) return;
+    setConnected(success);
+    if (!success) setError('Failed to reconnect to engine server');
+  }, [serverUrl]);
+
+  // ── Effects ──
   useEffect(() => {
     mountedRef.current = true;
     listenerCount++;
-    
+
     const engine = getSharedEngine(serverUrl);
     engineRef.current = engine;
 
-    // Set up callbacks
     const prevOnInfo = engine.onInfo;
     const prevOnConnectionChange = engine.onConnectionChange;
     const prevOnError = engine.onError;
@@ -79,195 +192,38 @@ export function useEngine(serverUrl = 'ws://localhost:8080') {
     };
 
     engine.onError = (err) => {
-      if (mountedRef.current) {
-        setError(err.message || 'Engine error');
-      }
+      if (mountedRef.current) setError(err && err.message ? err.message : 'Engine error');
       if (prevOnError) prevOnError(err);
     };
 
-    // Connect
     connectSharedEngine(engine).then(success => {
-      if (mountedRef.current) {
-        setConnected(success);
-        if (!success) {
-          setError('Failed to connect to engine server');
-        }
-      }
+      if (!mountedRef.current) return;
+      setConnected(success);
+      if (!success) setError('Failed to connect to engine server');
     });
 
-    // Update state if already connected
-    if (engine.isConnected()) {
-      setConnected(true);
-    }
+    if (engine.isConnected()) setConnected(true);
 
     return () => {
       mountedRef.current = false;
       listenerCount--;
-      
       // The WebSocket is intentionally kept open across page navigation —
       // reconnecting on every route change costs ~1s and drops engine state.
       // It is closed only by explicit reconnect() or by the browser on unload.
     };
   }, [serverUrl]);
 
-  // Stable method references
-  const newGame = useCallback(async () => {
-    const engine = engineRef.current;
-    if (!engine?.isConnected()) return;
-    try {
-      await engine.newGame();
-    } catch (err) {
-      console.error('Failed to start new game:', err);
-    }
-  }, []);
-
-  const setPosition = useCallback(async (fen, moves = []) => {
-    const engine = engineRef.current;
-    if (!engine?.isConnected()) return;
-    try {
-      await engine.setPosition(fen, moves);
-    } catch (err) {
-      console.error('Failed to set position:', err);
-    }
-  }, []);
-
-  const go = useCallback(async (options = {}) => {
-    const engine = engineRef.current;
-    if (!engine?.isConnected()) {
-      throw new Error('Engine not connected');
-    }
-    
-    setThinking(true);
-    setSearchInfo(null);
-
-    try {
-      const result = await engine.go(options);
-      return result;
-    } finally {
-      if (mountedRef.current) setThinking(false);
-    }
-  }, []);
-
-  const stop = useCallback(() => {
-    const engine = engineRef.current;
-    if (engine?.isConnected()) {
-      try {
-        engine.stop();
-      } catch (e) {
-        console.warn('Failed to stop:', e);
-      }
-    }
-    setThinking(false);
-  }, []);
-
-  const validateMove = useCallback(async (move) => {
-    const engine = engineRef.current;
-    if (!engine?.isConnected()) return { valid: false, reason: 'not_connected' };
-    try {
-      return await engine.validateMove(move);
-    } catch (err) {
-      return { valid: false, reason: err.message };
-    }
-  }, []);
-
-  const getLegalMoves = useCallback(async (square = null) => {
-    const engine = engineRef.current;
-    if (!engine?.isConnected()) return { moves: [], error: 'not_connected' };
-    try {
-      return await engine.getLegalMoves(square);
-    } catch (err) {
-      return { moves: [], error: err.message };
-    }
-  }, []);
-
-  const makeMove = useCallback(async (move) => {
-    const engine = engineRef.current;
-    if (!engine?.isConnected()) return null;
-    try {
-      return await engine.makeMove(move);
-    } catch (err) {
-      console.error('makeMove failed:', err);
-      return null;
-    }
-  }, []);
-
-  const undoMove = useCallback(async () => {
-    const engine = engineRef.current;
-    if (!engine?.isConnected()) return null;
-    try {
-      return await engine.undoMove();
-    } catch (err) {
-      console.error('undoMove failed:', err);
-      return null;
-    }
-  }, []);
-
-  const getGameState = useCallback(async () => {
-    const engine = engineRef.current;
-    if (!engine?.isConnected()) return null;
-    try {
-      return await engine.getGameState();
-    } catch (err) {
-      console.error('getGameState failed:', err);
-      return null;
-    }
-  }, []);
-
-  const reconnect = useCallback(async () => {
-    // Force new connection
-    if (sharedEngine) {
-      try {
-        sharedEngine.disconnect();
-      } catch (e) {
-        // ignore
-      }
-      sharedEngine = null;
-    }
-    connectionPromise = null;
-    
-    const engine = getSharedEngine(serverUrl);
-    engineRef.current = engine;
-    
-    engine.onConnectionChange = (isConnected) => {
-      if (mountedRef.current) {
-        setConnected(isConnected);
-        if (!isConnected) setThinking(false);
-      }
-    };
-
-    try {
-      setError(null);
-      const success = await connectSharedEngine(engine);
-      setConnected(success);
-      if (!success) {
-        setError('Failed to reconnect');
-      }
-    } catch (err) {
-      setError('Failed to reconnect: ' + err.message);
-      setConnected(false);
-    }
-  }, [serverUrl]);
-
-  // Return a stable object using useMemo
+  // ── Return ──
   return useMemo(() => ({
-    connected,
-    thinking,
-    searchInfo,
-    error,
-    newGame,
-    setPosition,
-    go,
-    stop,
-    validateMove,
-    getLegalMoves,
-    makeMove,
-    undoMove,
-    getGameState,
+    connected, thinking, searchInfo, error,
+    newGame, setPosition, go, stop, setOption,
+    validateMove, getLegalMoves, makeMove, undoMove, getGameState,
     reconnect,
   }), [
     connected, thinking, searchInfo, error,
-    newGame, setPosition, go, stop,
-    validateMove, getLegalMoves, makeMove, undoMove, getGameState, reconnect
+    newGame, setPosition, go, stop, setOption,
+    validateMove, getLegalMoves, makeMove, undoMove, getGameState,
+    reconnect,
   ]);
 }
 

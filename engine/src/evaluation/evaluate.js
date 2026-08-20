@@ -125,6 +125,7 @@ export function evaluateMopUp(board, color, endgameWeight, usePST = true) {
 
 export class Evaluator {
   constructor(config = {}) {
+    const w = config.weights || {};
     this.config = {
       useMaterial:      config.useMaterial      !== false,
       useCenterControl: config.useCenterControl !== false,
@@ -132,11 +133,11 @@ export class Evaluator {
       usePawnStructure: config.usePawnStructure !== false,
       useKingSafety:    config.useKingSafety    !== false,
       weights: {
-        material:      config.weights?.material      ?? 1.0,
-        centerControl: config.weights?.centerControl ?? 1.0,
-        development:   config.weights?.development   ?? 1.0,
-        pawnStructure: config.weights?.pawnStructure ?? 1.0,
-        kingSafety:    config.weights?.kingSafety    ?? 1.0,
+        material:      w.material ?? 1.0,
+        centerControl: w.centerControl ?? 1.0,
+        development:   w.development ?? 1.0,
+        pawnStructure: w.pawnStructure ?? 1.0,
+        kingSafety:    w.kingSafety ?? 1.0,
       },
     };
 

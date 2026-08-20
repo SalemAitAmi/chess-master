@@ -1,359 +1,151 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useCallback } from "react";
 import { useEngine } from "../hooks/useEngine";
+import { useGameSession } from "../hooks/useGameSession";
+import { useMoveSelection } from "../hooks/useMoveSelection";
+import GamePageLayout, { EngineGate } from "../components/GamePageLayout";
 import ChessBoard from "../components/ChessBoard";
 import PromotionModal from "../components/PromotionModal";
 import GameOverModal from "../components/GameOverModal";
 import GameInfoPanel from "../components/GameInfoPanel";
 import MoveHistory from "../components/MoveHistory";
 import CapturedPieces from "../components/CapturedPieces";
-import { indexToSquare, rowColToIndex, squareToIndex, indexToRowCol } from "../utils/bitboard";
+import { lastMoveToCoords, selectionToBoard } from "../utils/chessUtils";
+import { reportFailure } from "../utils/failure";
 
-const STARTING_FEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
-
-const initialGameState = {
-  fen: STARTING_FEN,
-  turn: 'white',
-  fullmove: 1,
-  halfmove: 0,
-  status: 'ongoing',
-  winner: 'none',
-  incheck: false,
-  eval: 0,
-  material_white: 3900,
-  material_black: 3900,
-  captured_white: [],
-  captured_black: [],
-  canundo: false,
-  blunder: false,
-  lastmove: null
-};
+const BTN = 'px-6 py-3 rounded-lg text-lg font-semibold transition-all';
 
 const LocalPlayPage = ({ onBackToMenu }) => {
+  // ═════════════════════════════════════════════════════════════════════════
+  // HOOKS
+  // ═════════════════════════════════════════════════════════════════════════
   const engine = useEngine();
-  
-  const [gameState, setGameState] = useState(initialGameState);
-  const [moveHistory, setMoveHistory] = useState([]); // Client-side history cache
-  const [selected, setSelected] = useState(null);
-  const [legalMoves, setLegalMoves] = useState([]);
-  const [promotion, setPromotion] = useState(null);
-  const [initialized, setInitialized] = useState(false);
-  const [loading, setLoading] = useState(false);
-  
-  const mountedRef = useRef(true);
-  const initRef = useRef(false);
-
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => { mountedRef.current = false; };
-  }, []);
-
-  const updateGameState = useCallback((engineState) => {
-    if (!engineState) return;
-    setGameState(prev => ({ ...prev, ...engineState }));
-    // Display history comes from the engine's SAN, appended per move. The
-    // engine only sends a 20-move window, so the client keeps the full list.
-    if (engineState.lastmovesan) setMoveHistory(prev => [...prev, engineState.lastmovesan]);
-  }, []);
-
-  // Initialize game
-  useEffect(() => {
-    if (!engine.connected || initRef.current) return;
-    
-    const init = async () => {
-      initRef.current = true;
-      try {
-        await engine.newGame();
-        const state = await engine.getGameState();
-        if (state && mountedRef.current) {
-          setGameState({
-            ...initialGameState,
-            ...state
-          });
-          setMoveHistory([]); // Fresh game, no history
-          setInitialized(true);
-        }
-      } catch (err) {
-        console.error('Failed to initialize game:', err);
-        initRef.current = false;
-      }
-    };
-    
-    init();
-  }, [engine.connected]);
-
-  // Fetch legal moves
-  const fetchLegalMoves = useCallback(async (row, col) => {
-    if (!engine.connected) return [];
-    
-    const square = indexToSquare(rowColToIndex(row, col));
-    try {
-      const result = await engine.getLegalMoves(square);
-      return result?.moves || [];
-    } catch (err) {
-      console.error('Failed to get legal moves:', err);
-      return [];
-    }
-  }, [engine.connected, engine.getLegalMoves]);
-
-  const handleSquareClick = useCallback(async (row, col) => {
-    if (gameState.status !== 'ongoing' || promotion || loading) return;
-    if (!engine.connected) return;
-
-    const clickedSquare = indexToSquare(rowColToIndex(row, col));
-
-    if (selected) {
-      const [selRow, selCol] = selected;
-      const fromSquare = indexToSquare(rowColToIndex(selRow, selCol));
-      const moveStr = fromSquare + clickedSquare;
-
-      // Check if valid move
-      const isValidMove = legalMoves.some(m => m === moveStr || m.startsWith(moveStr));
-
-      if (isValidMove) {
-        // Check if promotion needed
-        const promotionMoves = legalMoves.filter(m => m.startsWith(moveStr) && m.length > 4);
-        
-        if (promotionMoves.length > 0) {
-          setPromotion({
-            from: fromSquare,
-            to: clickedSquare,
-            color: gameState.turn === 'white' ? 'w' : 'b'
-          });
-          return;
-        }
-
-        // Execute move
-        setLoading(true);
-        try {
-          const newState = await engine.makeMove(moveStr);
-          if (newState && mountedRef.current) {
-            updateGameState(newState);
-            setSelected(null);
-            setLegalMoves([]);
-          }
-        } catch (err) {
-          console.error('Move failed:', err);
-        }
-        setLoading(false);
-        return;
-      }
-
-      // Check if clicked on own piece
-      const moves = await fetchLegalMoves(row, col);
-      if (moves.length > 0) {
-        setSelected([row, col]);
-        setLegalMoves(moves);
-      } else {
-        setSelected(null);
-        setLegalMoves([]);
-      }
-    } else {
-      // Try to select piece
-      const moves = await fetchLegalMoves(row, col);
-      if (moves.length > 0) {
-        setSelected([row, col]);
-        setLegalMoves(moves);
-      }
-    }
-  }, [selected, legalMoves, gameState.status, gameState.turn, promotion, loading, 
-      engine.connected, engine.makeMove, fetchLegalMoves, updateGameState]);
-
-  const handlePromotion = useCallback(async (pieceType) => {
-    if (!promotion || !engine.connected) return;
-
-    const moveStr = promotion.from + promotion.to + pieceType;
-    
-    setLoading(true);
-    try {
-      const newState = await engine.makeMove(moveStr);
-      if (newState && mountedRef.current) {
-        updateGameState(newState);
-        setSelected(null);
-        setLegalMoves([]);
-        setPromotion(null);
-      }
-    } catch (e) {
-        console.error('Promotion failed:', e);
-        setPromotion(null);          // NOTE: never leave the modal up on failure
-        setSelected(null);
-        setLegalMoves([]);
-      }
-    setLoading(false);
-  }, [promotion, engine.connected, engine.makeMove, updateGameState]);
-
-  const handleUndo = useCallback(async () => {
-    if (!gameState.canundo || !engine.connected || loading) return;
-
-    setLoading(true);
-    try {
-      const newState = await engine.undoMove();
-      if (newState && mountedRef.current) {
-        // Pop the last move from client history
-        setMoveHistory(prev => prev.slice(0, -1));
-        updateGameState(newState);
-        setSelected(null);
-        setLegalMoves([]);
-      }
-    } catch (err) {
-      console.error('Undo failed:', err);
-    }
-    setLoading(false);
-  }, [gameState.canundo, loading, engine.connected, engine.undoMove, updateGameState]);
-
-  const handleSurrender = useCallback(() => {
-    setGameState(prev => ({
-      ...prev,
-      status: 'resignation',
-      winner: prev.turn === 'white' ? 'black' : 'white'
-    }));
-  }, []);
-
-  const handleRestart = useCallback(async () => {
-    if (!engine.connected) return;
-    
-    setLoading(true);
-    initRef.current = false; // Allow re-init
-    
-    try {
-      await engine.newGame();
-      const newState = await engine.getGameState();
-      if (newState && mountedRef.current) {
-        setGameState({
-          ...initialGameState,
-          ...newState
-        });
-        setMoveHistory([]); // Clear history for new game
-        setSelected(null);
-        setLegalMoves([]);
-        setPromotion(null);
-        setInitialized(true);
-      }
-    } catch (err) {
-      console.error('Restart failed:', err);
-    }
-    setLoading(false);
-  }, [engine.connected, engine.newGame, engine.getGameState]);
-
-  // Calculate last move for highlighting
-  const lastMove = gameState.lastmove ? (() => {
-    const from = squareToIndex(gameState.lastmove.slice(0, 2));
-    const to = squareToIndex(gameState.lastmove.slice(2, 4));
-    if (from === -1 || to === -1) return null;
-    return { from: indexToRowCol(from), to: indexToRowCol(to) };
-  })() : null;
-
-  // Convert legal moves to board coordinates for highlighting
-  const selectedWithMoves = selected ? {
-    row: selected[0],
-    col: selected[1],
-    moves: legalMoves.map(m => {
-      const toIdx = squareToIndex(m.slice(2, 4));
-      return toIdx !== -1 ? indexToRowCol(toIdx) : null;
-    }).filter(Boolean)
-  } : null;
+  const session = useGameSession(engine);
+  const { gameState, moveHistory, busy, setBusy, applyEngineState, rollbackHistory, resign, startNewGame } = session;
 
   const gameOver = gameState.status !== 'ongoing';
+  const selection = useMoveSelection({
+    engine,
+    enabled: engine.connected && !gameOver && !busy,
+    turn: gameState.turn,
+    applyEngineState,
+    setBusy,
+  });
+
+  // ═════════════════════════════════════════════════════════════════════════
+  // DERIVED
+  // ═════════════════════════════════════════════════════════════════════════
+  const lastMove = lastMoveToCoords(gameState.lastmove);
+  const selectedWithMoves = selectionToBoard(selection.selected, selection.legalMoves);
+  // The engine reports winner='draw' for every drawn termination and 'none'
+  // while undecided. Both mean "no winner".
   const winner = (gameState.winner === 'none' || gameState.winner === 'draw') ? null : gameState.winner;
+  const canUndo = gameState.canundo && !busy && !gameOver;
 
-  if (!engine.connected) {
-    return (
-      <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-gray-800 to-gray-900">
-        <div className="text-white text-xl mb-4">Connecting to engine...</div>
-        {engine.error && <div className="text-red-400 mb-4">{engine.error}</div>}
-        <button
-          onClick={engine.reconnect}
-          className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700"
-        >
-          Retry Connection
-        </button>
-        <button
-          onClick={onBackToMenu}
-          className="mt-4 px-4 py-2 bg-gray-600 text-white rounded hover:bg-gray-700"
-        >
-          Back to Menu
-        </button>
-      </div>
-    );
-  }
+  // ═════════════════════════════════════════════════════════════════════════
+  // CALLBACKS
+  // ═════════════════════════════════════════════════════════════════════════
+  const handleUndo = useCallback(async () => {
+    if (!gameState.canundo || busy) return;
+    setBusy(true);
+    try {
+      const newState = await engine.undoMove();
+      if (!newState) throw new Error('undomove returned no state');
+      rollbackHistory(1);
+      applyEngineState(newState, false);
+      selection.clearSelection();
+    } catch (err) {
+      reportFailure('LocalPlayPage.handleUndo', err);
+    } finally {
+      setBusy(false);
+    }
+  }, [gameState.canundo, busy, setBusy, engine, rollbackHistory, applyEngineState, selection]);
 
-  if (!initialized) {
-    return (
-      <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-gray-800 to-gray-900">
-        <div className="text-white text-xl">Initializing game...</div>
-      </div>
-    );
-  }
+  const handleSurrender = useCallback(() => {
+    resign(gameState.turn);
+  }, [resign, gameState.turn]);
 
+  const handleRestart = useCallback(async () => {
+    selection.clearSelection();
+    await startNewGame();
+  }, [selection, startNewGame]);
+
+  // ═════════════════════════════════════════════════════════════════════════
+  // EFFECTS — none beyond the session hook's init/watchdog
+  // ═════════════════════════════════════════════════════════════════════════
+
+  // ═════════════════════════════════════════════════════════════════════════
+  // RENDER
+  // ═════════════════════════════════════════════════════════════════════════
   return (
-    <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-gray-800 to-gray-900 relative font-sans">
-      <div className="absolute top-4 left-4">
-        <button
-          onClick={onBackToMenu}
-          className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 
-            transition-all duration-200 shadow-md text-sm font-semibold"
-        >
-          ← Main Menu
-        </button>
-      </div>
+    <EngineGate engine={engine} session={session} onBackToMenu={onBackToMenu}>
+      <GamePageLayout
+        title="Local Play"
+        subtitle="Two Player Mode"
+        onBackToMenu={onBackToMenu}
 
-      <div className="mb-6 text-center">
-        <h1 className="text-4xl font-bold text-white mb-2">Local Play</h1>
-        <div className="text-gray-400">Two Player Mode</div>
-      </div>
+        /* ── BANNER ── */
+        banner={busy ? (
+          <div className="px-4 py-2 bg-gray-700 rounded-lg text-gray-300 animate-pulse">Applying move...</div>
+        ) : null}
 
-      <div className="flex gap-6 items-start">
-        <div className="space-y-4">
-          <GameInfoPanel gameState={gameState} />
-          <CapturedPieces
-            capturedWhite={gameState.captured_white}
-            capturedBlack={gameState.captured_black}
-          />
-        </div>
+        /* ── LEFT ── */
+        leftPanels={
+          <>
+            <GameInfoPanel gameState={gameState} />
+            <CapturedPieces
+              capturedWhite={gameState.captured_white}
+              capturedBlack={gameState.captured_black}
+            />
+          </>
+        }
 
-        <div className="flex flex-col items-center">
+        /* ── BOARD ── */
+        board={
           <ChessBoard
             fen={gameState.fen}
             selected={selectedWithMoves}
-            legalMoves={legalMoves}
+            legalMoves={selection.legalMoves}
             lastMove={lastMove}
-            onSquareClick={handleSquareClick}
+            onSquareClick={selection.handleSquareClick}
             flipped={gameState.turn === 'black'}
-            disabled={loading || gameOver}
+            disabled={busy || gameOver}
           />
+        }
 
-          <div className="mt-6 flex gap-4">
-            {!gameOver && !promotion && (
-              <>
-                <button
-                  onClick={handleUndo}
-                  disabled={!gameState.canundo || loading}
-                  className={`px-6 py-3 rounded-lg transition-all text-lg font-semibold
-                    ${gameState.canundo && !loading
-                      ? 'bg-blue-600 hover:bg-blue-700 text-white' 
-                      : 'bg-gray-600 cursor-not-allowed text-gray-400'}`}
-                >
-                  ↶ Undo
-                </button>
-                
-                <button
-                  onClick={handleSurrender}
-                  disabled={loading}
-                  className="px-6 py-3 bg-red-600 hover:bg-red-700 text-white rounded-lg text-lg font-semibold"
-                >
-                  ⚑ Surrender
-                </button>
-              </>
-            )}
-          </div>
-        </div>
+        /* ── CONTROLS ── */
+        controls={!gameOver && selection.promotion === null ? (
+          <>
+            <button
+              onClick={handleUndo}
+              disabled={!canUndo}
+              className={`${BTN} ${canUndo
+                ? 'bg-blue-600 hover:bg-blue-700 text-white'
+                : 'bg-gray-600 cursor-not-allowed text-gray-400'}`}
+            >
+              ↶ Undo
+            </button>
+            <button
+              onClick={handleSurrender}
+              disabled={busy}
+              className={`${BTN} bg-red-600 hover:bg-red-700 text-white`}
+            >
+              ⚑ Surrender
+            </button>
+          </>
+        ) : null}
 
-        {/* Use client-cached history */}
-        <MoveHistory history={moveHistory} />
-      </div>
+        /* ── RIGHT ── */
+        rightPanels={<MoveHistory history={moveHistory} />}
 
-      <PromotionModal promotion={promotion} onPromotion={handlePromotion} />
-      <GameOverModal gameOver={gameOver} winner={winner} status={gameState.status} onRestart={handleRestart} />
-    </div>
+        /* ── OVERLAYS ── */
+        overlays={
+          <>
+            <PromotionModal promotion={selection.promotion} onPromotion={selection.handlePromotion} />
+            <GameOverModal gameOver={gameOver} winner={winner} status={gameState.status} onRestart={handleRestart} />
+          </>
+        }
+      />
+    </EngineGate>
   );
 };
 

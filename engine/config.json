@@ -1,0 +1,53 @@
+{
+  "engine": {
+    "maxDepth": 64,
+    "maxSearchTime": 30000,
+    "hashSizeMB": 64,
+    "useOpeningBook": true,
+    "threads": 1
+  },
+  "evaluation": {
+    "useMaterial": true,
+    "useCenterControl": true,
+    "useDevelopment": true,
+    "usePawnStructure": true,
+    "useKingSafety": true,
+    "weights": {
+      "material": 1.0,
+      "centerControl": 1.0,
+      "development": 1.0,
+      "pawnStructure": 1.0,
+      "kingSafety": 1.0,
+      "pawnPush": 1.0
+    }
+  },
+  "search": {
+    "useQuiescence": true,
+    "quiescenceDepth": 8,
+    "useKillerMoves": true,
+    "useHistoryHeuristic": true,
+    "useTranspositionTable": true,
+    "useNullMovePruning": true,
+    "useLateMovereduction": true,
+    "useFutilityPruning": true,
+    "useSEEPruning": true,
+    "useSoftPinOrdering": true,
+    "useAspirationWindows": true,
+    "usePVS": true,
+    "useIID": true,
+    "useOpeningPrinciples": true,
+    "usePawnPush": true
+  },
+  "contempt": {
+    "drawContemptMax": 50,
+    "neutralContempt": 25,
+    "repetitionMargin": 90,
+    "repetitionContempt": 30
+  },
+  "difficulties": {
+    "rookie":    { "depth": 4,  "label": "Rookie" },
+    "casual":    { "depth": 6,  "label": "Casual" },
+    "strategic": { "depth": 8,  "label": "Strategic" },
+    "master":    { "depth": 12, "label": "Master" }
+  }
+}

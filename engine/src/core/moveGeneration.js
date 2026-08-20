@@ -83,6 +83,8 @@ const SOFT_LINE_LO = new Int32Array(64);
 const SOFT_LINE_HI = new Int32Array(64);
 const SOFT_DIAG    = new Uint8Array(64);
 const SOFT_PAIR    = new Int8Array(2);
+
+let _pcLo = 0, _pcHi = 0;
 let pinnedLo = 0, pinnedHi = 0;
 let softLo   = 0, softHi   = 0;
 let checkLo  = 0, checkHi  = 0, checkCount = 0;
@@ -247,9 +249,9 @@ function computeCheckMasks(board, ksq) {
 }
 
 function computePins(board, ksq, them, occLo, occHi, ourLo, ourHi, theirLo, theirHi) {
-  const candidates = pinCandidates(board, ksq, them);
-  const candLo = candidates.lo;
-  const candHi = candidates.hi;
+  pinCandidates(board, ksq, them);
+  const candLo = _pcLo;
+  const candHi = _pcHi;
 
   for (let s = IT_SCAN.initRaw(candLo, candHi).next(); s >= 0; s = IT_SCAN.next()) {
     const i = (ksq << 6) | s;
@@ -276,11 +278,8 @@ function pinCandidates(board, ksq, them) {
   const rqHi = (tb[PIECES.ROOK].high | tb[PIECES.QUEEN].high) | 0;
   const bqLo = (tb[PIECES.BISHOP].low  | tb[PIECES.QUEEN].low)  | 0;
   const bqHi = (tb[PIECES.BISHOP].high | tb[PIECES.QUEEN].high) | 0;
-
-  return {
-    lo: (RRAY_LO[ksq] & rqLo) | (BRAY_LO[ksq] & bqLo),
-    hi: (RRAY_HI[ksq] & rqHi) | (BRAY_HI[ksq] & bqHi),
-  };
+  _pcLo = (RRAY_LO[ksq] & rqLo) | (BRAY_LO[ksq] & bqLo);
+  _pcHi = (RRAY_HI[ksq] & rqHi) | (BRAY_HI[ksq] & bqHi);
 }
 
 function recordAbsolutePin(bLo, bHi, lineLo, lineHi, ourLo, ourHi) {
