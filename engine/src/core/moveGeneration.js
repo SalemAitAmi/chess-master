@@ -145,7 +145,7 @@ function blankMove() {
     capturedPiece: null, isEnPassant: false,
     isPromotion: false, promotionPiece: null,
     algebraic: null,
-    orderScore: 0, seeScore: 0,
+    orderScore: 0, seeScore: 0, qScore: 0,
     isTTMove: false, isKiller: false, isCounterMove: false, isBookMove: false,
   };
 }
@@ -166,7 +166,7 @@ function emit(slot, from, to, piece, captured, isEnPassant, promo, withAlg) {
   m.algebraic = withAlg
     ? indexToSquare(from) + indexToSquare(to) + (promo !== null ? PROMO_SUFFIX[promo] : '')
     : null;
-  m.orderScore = 0; m.seeScore = 0;
+  m.orderScore = 0; m.seeScore = 0; m.qScore = 0;
   m.isTTMove = false; m.isKiller = false; m.isCounterMove = false; m.isBookMove = false;
   slot.list.push(m);
   return m;

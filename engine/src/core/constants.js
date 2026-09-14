@@ -28,6 +28,7 @@ export const DEFAULT_CONFIG = {
   useDevelopment: true,
   usePawnStructure: true,
   useKingSafety: true,
+  useInitiative: true,
   // Search features
   usePawnPush: true,
   useQuiescence: true,

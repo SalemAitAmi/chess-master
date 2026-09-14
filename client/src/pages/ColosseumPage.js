@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { useEngine } from "../hooks/useEngine";
 import { useGameSession } from "../hooks/useGameSession";
 import GamePageLayout, { EngineGate } from "../components/GamePageLayout";
@@ -17,13 +17,19 @@ const NO_ROUND_RECORDED = -1;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Module helpers
+//
+// Two engine INSTANCES, "A" and "B", each on its own WebSocket with its own
+// profile, config and transposition table. Colours alternate each round by
+// deciding which instance plays white — the instances never change config, so
+// a profile stays bound to one table and one log `eng` id for the whole match.
 // ═══════════════════════════════════════════════════════════════════════════
+
+function aPlaysWhite(round) { return round % 2 === 0; }
+
 function botsForRound(config, round) {
-  const swapped = round % 2 === 1;
-  return {
-    white: swapped ? config.blackBot : config.whiteBot,
-    black: swapped ? config.whiteBot : config.blackBot,
-  };
+  const A = { depth: config.whiteBot, profile: config.whiteProfile || 'baseline', id: 'A' };
+  const B = { depth: config.blackBot, profile: config.blackProfile || 'baseline', id: 'B' };
+  return aPlaysWhite(round) ? { white: A, black: B } : { white: B, black: A };
 }
 
 function drawLabel(status) {
@@ -33,13 +39,26 @@ function drawLabel(status) {
   return 'Draw!';
 }
 
+function botLabel(bot) { return `${DIFFICULTY_NAMES[bot.depth]}/${bot.profile}`; }
+
 // ═══════════════════════════════════════════════════════════════════════════
+
 const ColosseumPage = ({ config, onBackToMenu }) => {
   // ═════════════════════════════════════════════════════════════════════════
   // HOOKS
   // ═════════════════════════════════════════════════════════════════════════
-  const engine = useEngine();
-  const session = useGameSession(engine);
+  // One session id per mounted match. Both sockets join it; the server rotates
+  // the game directory once BOTH instances have sent ucinewgame.
+  const sessionIdRef = useRef(`colosseum-${Date.now().toString(36)}`);
+  const sessionId = sessionIdRef.current;
+
+  const engineA = useEngine(undefined, { session: sessionId, instance: 'A', profile: config.whiteProfile || 'baseline' });
+  const engineB = useEngine(undefined, { session: sessionId, instance: 'B', profile: config.blackProfile || 'baseline' });
+
+  // The session hook owns the displayed board via engine A. Engine B is the
+  // shadow: every move is mirrored to it so both boards stay identical and
+  // each keeps full history for threefold / 50-move detection.
+  const session = useGameSession(engineA);
   const { gameState, moveHistory, initialized, applyEngineState, startNewGame, mountedRef } = session;
 
   const [currentRound, setCurrentRound] = useState(0);
@@ -47,15 +66,24 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
   const [running, setRunning] = useState(false);
   const [paused, setPaused] = useState(false);
   const [moveError, setMoveError] = useState(null);
+  const [shadowReady, setShadowReady] = useState(false);
 
   const runningRef = useRef(false);
   const moveInProgressRef = useRef(false);
   const loopIdRef = useRef(0);
   const recordedRoundRef = useRef(NO_ROUND_RECORDED);
   const roundTimerRef = useRef(null);
-  // Values the round-transition effect reads without wanting to re-run on
-  // every change (see the sync effect below).
+  const shadowInitRef = useRef(false);
   const latestRef = useRef({ currentRound: 0, moveCount: 0, bots: botsForRound(config, 0) });
+
+  // Combined view of both connections, for the gate and the controls. Both
+  // must be UCI-ready before the page is usable.
+  const engines = useMemo(() => ({
+    connected: engineA.connected && engineB.connected,
+    error: engineA.error || engineB.error,
+    reconnect: () => { engineA.reconnect(); engineB.reconnect(); },
+    stop: () => { engineA.stop(); engineB.stop(); },
+  }), [engineA, engineB]);
 
   // ═════════════════════════════════════════════════════════════════════════
   // DERIVED
@@ -68,31 +96,46 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
   const blackWins = results.filter(r => r.winner === 'black').length;
   const draws = results.filter(r => r.winner === 'draw').length;
   const matchComplete = !running && results.length >= config.maxRounds;
-  const loopActive = initialized && running && !paused && !gameOver && moveError === null;
+  const loopActive = initialized && shadowReady && running && !paused && !gameOver && moveError === null;
 
   // ═════════════════════════════════════════════════════════════════════════
   // CALLBACKS
   // ═════════════════════════════════════════════════════════════════════════
+  const engineFor = useCallback((botId) => (botId === 'A' ? engineA : engineB), [engineA, engineB]);
 
-  /* ── Single move — NO setPosition so the board keeps full undo history
-       and the server can detect threefold / 50-move draws. ── */
+  /* ── Single move. The mover searches; the move is applied to BOTH boards.
+       No setPosition anywhere, so both engines retain full undo history. ── */
   const makeOneMove = useCallback(async () => {
     if (moveInProgressRef.current) return false;
     moveInProgressRef.current = true;
     try {
-      const current = await engine.getGameState();
+      const roundBots = latestRef.current.bots;
+      const moverBot  = gameState.turn === 'white' ? roundBots.white : roundBots.black;
+      const shadowBot = gameState.turn === 'white' ? roundBots.black : roundBots.white;
+      const mover  = engineFor(moverBot.id);
+      const shadow = engineFor(shadowBot.id);
+
+      const current = await mover.getGameState();
       if (!current) throw new Error('gamestate returned nothing before bot move');
       if (!mountedRef.current || current.status !== 'ongoing') return false;
-
-      const bot = current.turn === 'white' ? latestRef.current.bots.white : latestRef.current.bots.black;
-      const result = await engine.go({ depth: DIFFICULTY_DEPTHS[bot] });
-      if (!mountedRef.current) return false;
-      if (!result.move || result.move === '(none)') {
-        throw new Error(`bot returned no move (bestmove ${result.move})`);
+      if (current.turn !== gameState.turn) {
+        throw new Error(`board desync: page says ${gameState.turn}, engine ${moverBot.id} says ${current.turn}`);
       }
 
-      const newState = await engine.makeMove(result.move);
+      const result = await mover.go({ depth: DIFFICULTY_DEPTHS[moverBot.depth] });
       if (!mountedRef.current) return false;
+      if (!result.move || result.move === '(none)') {
+        throw new Error(`bot ${moverBot.id} returned no move (bestmove ${result.move})`);
+      }
+
+      const newState = await mover.makeMove(result.move);
+      if (!mountedRef.current) return false;
+      const shadowState = await shadow.makeMove(result.move);
+      if (!mountedRef.current) return false;
+      if (shadowState.fen !== newState.fen) {
+        throw new Error(`board desync after ${result.move}: ${newState.fen} vs ${shadowState.fen}`);
+      }
+
       if (!applyEngineState(newState)) throw new Error(`makemove ${result.move} rejected`);
       return newState.status === 'ongoing';
     } catch (err) {
@@ -102,22 +145,37 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
     } finally {
       moveInProgressRef.current = false;
     }
-  }, [engine, applyEngineState, mountedRef]);
+  }, [gameState.turn, engineFor, applyEngineState, mountedRef]);
+
+  /** @returns {Promise<boolean>} true when the shadow board is at the start. */
+  const resetShadow = useCallback(async () => {
+    setShadowReady(false);
+    try {
+      await engineB.newGame();
+      if (mountedRef.current) setShadowReady(true);
+      return true;
+    } catch (err) {
+      reportFailure('ColosseumPage.resetShadow', err);
+      if (mountedRef.current) setMoveError(err.message || 'Shadow engine reset failed');
+      return false;
+    }
+  }, [engineB, mountedRef]);
 
   const resetBoardForRound = useCallback(async () => {
     moveInProgressRef.current = false;
     setMoveError(null);
-    await startNewGame();
-  }, [startNewGame]);
+    await Promise.all([startNewGame(), resetShadow()]);
+  }, [startNewGame, resetShadow]);
 
   const handleStart = useCallback(() => { setMoveError(null); setRunning(true); setPaused(false); }, []);
   const handlePause = useCallback(() => setPaused(true), []);
   const handleResume = useCallback(() => { setMoveError(null); setPaused(false); }, []);
+
   const handleStop = useCallback(() => {
     setRunning(false);
     runningRef.current = false;
-    engine.stop();
-  }, [engine]);
+    engines.stop();
+  }, [engines]);
 
   const handleRestart = useCallback(async () => {
     clearTimeout(roundTimerRef.current);
@@ -133,8 +191,6 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
   // ═════════════════════════════════════════════════════════════════════════
   // EFFECTS
   // ═════════════════════════════════════════════════════════════════════════
-
-  // Sync latest values for effects that must not re-run on every change.
   useEffect(() => {
     latestRef.current = { currentRound, moveCount: moveHistory.length, bots };
   });
@@ -145,6 +201,19 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
     runningRef.current = false;
     clearTimeout(roundTimerRef.current);
   }, []);
+
+  // useGameSession initialises engine A. Engine B needs the same reset once it
+  // is UCI-ready; the latch is cleared on disconnect so a reconnect retries.
+  useEffect(() => {
+    if (!engineB.connected) {
+      shadowInitRef.current = false;
+      setShadowReady(false);
+      return;
+    }
+    if (shadowInitRef.current) return;
+    shadowInitRef.current = true;
+    resetShadow().then(ok => { if (!ok) shadowInitRef.current = false; });
+  }, [engineB.connected, resetShadow]);
 
   // Move loop. One chain per activation; loopIdRef invalidates stale chains.
   useEffect(() => {
@@ -169,15 +238,14 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
     if (recordedRoundRef.current === round) return;
     recordedRoundRef.current = round;
 
-    const result = {
+    const rb = latestRef.current.bots;
+    setResults(prev => [...prev, {
       round: round + 1,
       winner: gameState.winner === 'none' ? 'draw' : gameState.winner,
       status: gameState.status,
       moves: latestRef.current.moveCount,
-      whiteBot: latestRef.current.bots.white,
-      blackBot: latestRef.current.bots.black,
-    };
-    setResults(prev => [...prev, result]);
+      whiteBot: rb.white, blackBot: rb.black,
+    }]);
 
     if (round + 1 >= config.maxRounds) {
       setRunning(false);
@@ -196,6 +264,8 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
   // ═════════════════════════════════════════════════════════════════════════
   // RENDER
   // ═════════════════════════════════════════════════════════════════════════
+  const thinkingBot = gameState.turn === 'white' ? bots.white : bots.black;
+
   const banner = moveError !== null ? (
     <div className="px-4 py-2 bg-red-900 rounded-lg text-red-200 flex items-center gap-3">
       <span>⚠ Bot move failed: <span className="font-mono text-sm">{moveError}</span></span>
@@ -208,8 +278,10 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
     </div>
   ) : running && !paused ? (
     <div className="px-4 py-2 bg-gray-700 rounded-lg text-gray-300 animate-pulse">
-      🤖 {DIFFICULTY_NAMES[gameState.turn === 'white' ? bots.white : bots.black]} ({gameState.turn}) is thinking...
+      🤖 {botLabel(thinkingBot)} ({gameState.turn}, engine {thinkingBot.id}) is thinking...
     </div>
+  ) : !shadowReady ? (
+    <div className="px-4 py-2 bg-gray-700 rounded-lg text-gray-300 animate-pulse">Synchronising engines...</div>
   ) : null;
 
   const scoreCard = (
@@ -226,13 +298,18 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
           {running ? (paused ? 'Paused' : 'Running') : 'Stopped'}
         </span>
       </div>
+      <div className="mt-3 text-xs text-gray-400 space-y-1">
+        <div>A: {botLabel(botsForRound(config, 0).white)} {engineA.connected ? '●' : '○'}</div>
+        <div>B: {botLabel(botsForRound(config, 0).black)} {engineB.connected ? '●' : '○'}</div>
+        <div className="font-mono text-gray-500">{sessionId}</div>
+      </div>
       {results.length > 0 && (
         <div className="mt-4 pt-4 border-t border-gray-600">
           <h4 className="text-sm font-bold text-gray-300 mb-2">History</h4>
           <div className="max-h-40 overflow-y-auto space-y-1 text-xs move-history-scroll">
             {results.map((r, i) => (
               <div key={i} className="flex justify-between text-gray-400">
-                <span>Round {r.round}</span>
+                <span>R{r.round} {r.whiteBot.id}v{r.blackBot.id}</span>
                 <span className={r.winner === 'white' ? 'text-yellow-300' : r.winner === 'black' ? 'text-gray-300' : 'text-gray-500'}>
                   {r.winner === 'draw' ? `Draw (${r.status})` : r.winner} ({r.moves})
                 </span>
@@ -245,28 +322,19 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
   );
 
   return (
-    <EngineGate engine={engine} session={session} onBackToMenu={onBackToMenu}>
+    <EngineGate engine={engines} session={session} onBackToMenu={onBackToMenu}>
       <GamePageLayout
         title="⚔️ Colosseum ⚔️"
-        subtitle={`Round ${currentRound + 1} / ${config.maxRounds} • ${DIFFICULTY_NAMES[bots.white]} (White) vs ${DIFFICULTY_NAMES[bots.black]} (Black)`}
+        subtitle={`Round ${currentRound + 1} / ${config.maxRounds} • ${botLabel(bots.white)} (White) vs ${botLabel(bots.black)} (Black)`}
         onBackToMenu={onBackToMenu}
-
-        /* ── BANNER ── */
         banner={banner}
-
-        /* ── LEFT ── */
         leftPanels={
           <>
             <GameInfoPanel gameState={gameState} />
-            <CapturedPieces
-              capturedWhite={gameState.captured_white}
-              capturedBlack={gameState.captured_black}
-            />
+            <CapturedPieces capturedWhite={gameState.captured_white} capturedBlack={gameState.captured_black} />
             {scoreCard}
           </>
         }
-
-        /* ── BOARD ── */
         board={
           <ChessBoard
             fen={gameState.fen}
@@ -274,16 +342,15 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
             legalMoves={[]}
             lastMove={lastMove}
             onSquareClick={() => {}}
-            flipped={currentRound % 2 === 1}
+            flipped={!aPlaysWhite(currentRound)}
             disabled={true}
           />
         }
-
-        /* ── CONTROLS ── */
         controls={
           <>
             {!running ? (
-              <button onClick={handleStart} className={`${BTN} bg-green-600 hover:bg-green-700 text-white`}>
+              <button onClick={handleStart} disabled={!shadowReady}
+                className={`${BTN} ${shadowReady ? 'bg-green-600 hover:bg-green-700' : 'bg-gray-600 cursor-not-allowed'} text-white`}>
                 {results.length > 0 && !matchComplete ? 'Continue' : 'Start Match'}
               </button>
             ) : paused ? (
@@ -299,11 +366,7 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
             )}
           </>
         }
-
-        /* ── RIGHT ── */
         rightPanels={<MoveHistory history={moveHistory} />}
-
-        /* ── FOOTER ── */
         footer={matchComplete ? (
           <div className="px-8 py-4 bg-purple-900 rounded-lg text-center">
             <h2 className="text-2xl font-bold text-white mb-2">Match Complete!</h2>
@@ -313,8 +376,6 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
             </div>
           </div>
         ) : null}
-
-        /* ── OVERLAYS ── */
         overlays={
           <GameOverModal gameOver={gameOver && !running} winner={winner} status={gameState.status} onRestart={handleRestart} />
         }

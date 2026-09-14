@@ -45,7 +45,7 @@ export function evaluateCenterControl(board, color, weight = 1.0) {
   }
   const weighted = Math.round(score * weight);
   if (__LOG__ && LOG.heuristics) {
-    logger.trace(CAT.HEURISTIC, 'centerControl', { h: 'centerControl', c: color, s: weighted , center: `center ${weighted}` });
+    logger.trace(CAT.HEURISTIC, 'center-control', { c: color, s: weighted });
   }
   return weighted;
 }

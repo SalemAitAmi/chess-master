@@ -1,10 +1,16 @@
 /**
  * UCI protocol handler — the engine's sole public interface.
  *
+ * ONE HANDLER PER ENGINE INSTANCE. The handler owns its SearchEngine (and
+ * therefore its transposition table, killer table, history table and counter
+ * moves) and its resolved config. Two engines in one session are two handlers
+ * on two connections; they share nothing but the log session and game number,
+ * which the EngineSession owns.
+ *
  * Standard commands: uci, debug, isready, setoption, ucinewgame, position,
  * go, stop, quit.
  *
- * Extensions for interactive play (documented in UCI-Protocol-Specification.txt):
+ * Extensions for interactive play:
  *   validate <move>        → valid true|false [reason]
  *   legalmoves [square]    → legalmoves <uci>...|none
  *   makemove <move>        → <gamestate block> | error <reason>
@@ -14,9 +20,8 @@
  *   setlog <mask>          → info string ...
  *   clearlogs              → info string ...
  *   showstage              → info string ...
- *
- * Layout: imports → module constants → class (fields grouped in constructor,
- * methods grouped by concern).
+ *   profiles               → info string profile <name> | <label> | <description>
+ *   whoami                 → info string instance ... profile ... cfg ... tt ...
  */
 import { Board } from '../core/board.js';
 import { SearchEngine } from '../search/search.js';
@@ -25,10 +30,10 @@ import { generateAllLegalMoves, isInCheck } from '../core/moveGeneration.js';
 import { loadOpeningBook, lookupAllBookMoves, isBookLoaded, getBookStats } from '../book/openingBook.js';
 import { squareToIndex } from '../core/bitboard.js';
 import { PIECES, PIECE_VALUES, PIECE_CHARS, WHITE_IDX, BLACK_IDX, DEFAULT_CONFIG } from '../core/constants.js';
-import { TranspositionTable } from '../tables/transposition.js';
 import { Evaluator } from '../evaluation/evaluate.js';
 import { detectGameStage, getStagePriorities } from '../utils/gameStage.js';
-import logger, { LOG, CAT } from '../logging/logger.js';
+import { listProfiles, resolveProfile } from '../config/profiles.js';
+import logger, { LOG, CAT, LogContext } from '../logging/logger.js';
 import { parseUCICommand } from './uciParser.js';
 import { moveToSan } from './san.js';
 
@@ -41,42 +46,67 @@ const PROMO_MAP = { q: PIECES.QUEEN, r: PIECES.ROOK, b: PIECES.BISHOP, n: PIECES
 const HISTORY_WINDOW = 20;
 const BLUNDER_CP = 200;
 
-const UCI_OPTIONS = [
-  'option name Hash type spin default 64 min 1 max 1024',
-  'option name Threads type spin default 1 min 1 max 64',
-  'option name OwnBook type check default true',
-  'option name MoveTime type spin default 30000 min 10 max 600000',
-  'option name Contempt type spin default 50 min 0 max 200',
-  'option name RepetitionMargin type spin default 90 min 0 max 500',
-  'option name UseMaterial type check default true',
-  'option name UseCenterControl type check default true',
-  'option name UseDevelopment type check default true',
-  'option name UsePawnStructure type check default true',
-  'option name UseKingSafety type check default true',
-  'option name UsePawnPush type check default true',
-  'option name UseQuiescence type check default true',
-  'option name UseKillerMoves type check default true',
-  'option name UseHistoryHeuristic type check default true',
-  'option name UseTranspositionTable type check default true',
-  'option name UseNullMovePruning type check default true',
-  'option name UseLateMovereduction type check default true',
-  'option name UseSoftPinOrdering type check default true',
-  'option name LogMask type spin default 0 min 0 max 4095',
-];
+function uciOptions() {
+  return [
+    'option name Hash type spin default 64 min 1 max 1024',
+    'option name Threads type spin default 1 min 1 max 64',
+    'option name OwnBook type check default true',
+    'option name MoveTime type spin default 30000 min 10 max 600000',
+    'option name Contempt type spin default 50 min 0 max 200',
+    'option name NeutralContempt type spin default 25 min 0 max 200',
+    'option name RepetitionMargin type spin default 90 min 0 max 500',
+    `option name Profile type combo default baseline ${
+      listProfiles().map(p => `var ${p.name}`).join(' ')}`,
+    'option name UseMaterial type check default true',
+    'option name UseCenterControl type check default true',
+    'option name UseDevelopment type check default true',
+    'option name UsePawnStructure type check default true',
+    'option name UseKingSafety type check default true',
+    'option name UseInitiative type check default true',
+    'option name UsePawnPush type check default true',
+    'option name UseQuiescence type check default true',
+    'option name UseKillerMoves type check default true',
+    'option name UseHistoryHeuristic type check default true',
+    'option name UseTranspositionTable type check default true',
+    'option name UseNullMovePruning type check default true',
+    'option name UseLateMovereduction type check default true',
+    'option name UseSoftPinOrdering type check default true',
+    'option name LogMask type spin default 0 min 0 max 4095',
+  ];
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 export class UCIHandler {
-  constructor(config = {}) {
+  /**
+   * @param {object} config  Flat engine config (from resolveProfile().config).
+   * @param {object} opts    { instanceId, session, logCtx, profile }
+   *                         `session` is an EngineSession; the default is a
+   *                         standalone stub that rotates the log game on every
+   *                         `ucinewgame`, which is the single-engine behaviour
+   *                         tests rely on.
+   */
+  constructor(config = {}, opts = {}) {
+    // ── Identity ──
+    this.instanceId = opts.instanceId ?? 'e0';
+    this.profile = opts.profile ?? null;
+    this.session = opts.session ?? {
+      noteNewGame: () => (__LOG__ ? logger.startGame() : 0),
+      describe: () => 'standalone',
+    };
+    this.logCtx = opts.logCtx ?? new LogContext(this.instanceId);
+
     // ── Configuration ──
     this.config = { ...DEFAULT_CONFIG, ...config };
 
-    // ── Engine components ──
+    // ── Engine components (private to this instance) ──
     this.board = new Board();
     this.engine = new SearchEngine(this.config);
     this.smp = new SmpCoordinator(this.config);
-    // Separate evaluator for the `eval` command and blunder detection, so a
-    // concurrent search can't see a half-reconfigured instance.
+    // Separate evaluator for `eval` and blunder detection, so a concurrent
+    // search can never see a half-reconfigured instance.
     this.evaluator = new Evaluator(this.config);
+
+    if (__LOG__) { logger.bind(this.logCtx); logger.bindBoard(this.board); }
 
     // ── Protocol state ──
     this.debug = false;
@@ -96,10 +126,13 @@ export class UCIHandler {
   // ═══════════════════════════════════════════════════════════════════════
   // Dispatch
   // ═══════════════════════════════════════════════════════════════════════
-
   async handleCommand(line) {
+    // Re-bind on every command: EngineInstance.dispatch does this too, but a
+    // standalone handler (tests) has no dispatcher.
+    if (__LOG__) logger.bind(this.logCtx);
+
     const cmd = parseUCICommand(line);
-    if (__LOG__ && LOG.uci) logger.event(CAT.UCI, 'cmd', { type: cmd.type, raw: line });
+    if (__LOG__ && LOG.uci) logger.event(CAT.UCI, cmd.type, { raw: line });
 
     switch (cmd.type) {
       case 'uci':        return this.uci();
@@ -111,20 +144,21 @@ export class UCIHandler {
       case 'go':         return await this.go(cmd);
       case 'stop':       return this.stop();
       case 'quit':       return this.quit();
-
       case 'validate':   return this.validateMove(cmd.move);
       case 'legalmoves': return this.getLegalMoves(cmd.square);
       case 'makemove':   return this.makeMove(cmd.move);
       case 'undomove':   return this.undoMove();
       case 'gamestate':  return this.getGameState();
       case 'eval':       return `eval ${this._evalScore()}`;
-
       case 'setlog':     return this.setLogMask(cmd.mask);
       case 'clearlogs':  return this.clearLogs();
       case 'showstage':  return this.showStage();
-
+      case 'profiles':   return this.showProfiles();
+      case 'whoami':     return this.whoami();
       default:
-        if (__LOG__ && LOG.uci) logger.event(CAT.UCI, 'warn', { command: cmd.command, msg: 'Unknown command' });
+        if (__LOG__ && LOG.uci) {
+          logger.event(CAT.UCI, 'unknown', { raw: line, command: cmd.command ?? '' });
+        }
         return `info string Unknown command: ${cmd.command !== undefined ? cmd.command : ''}`;
     }
   }
@@ -132,13 +166,12 @@ export class UCIHandler {
   // ═══════════════════════════════════════════════════════════════════════
   // Standard UCI
   // ═══════════════════════════════════════════════════════════════════════
-
   uci() {
     return [
       'id name ChessMaster Engine 1.0',
       'id author Chess Master',
       '',
-      ...UCI_OPTIONS,
+      ...uciOptions(),
       '',
       'uciok',
     ].join('\n');
@@ -158,6 +191,9 @@ export class UCIHandler {
       case 'threads':
         this._setThreads(intValue);
         break;
+      case 'profile':
+        this._applyProfile(value);
+        break;
       case 'ownbook':
         this.config.useOpeningBook = boolValue;
         if (boolValue && this.bookReadyPromise === null) this._beginBookLoad();
@@ -167,6 +203,9 @@ export class UCIHandler {
         break;
       case 'contempt':
         this._set('drawContemptMax', intValue);
+        break;
+      case 'neutralcontempt':
+        this._set('neutralContempt', intValue);
         break;
       case 'repetitionmargin':
         this._set('repetitionMargin', intValue);
@@ -178,7 +217,7 @@ export class UCIHandler {
         // Map `UseFooBar` → config key `useFooBar` generically.
         const key = name.charAt(0).toLowerCase() + name.slice(1);
         if (key in this.config) this._set(key, boolValue);
-        else if (__LOG__ && LOG.uci) logger.event(CAT.UCI, 'unknown-option', { name });
+        else if (__LOG__ && LOG.uci) logger.event(CAT.UCI, 'unknown-option', { name, value });
       }
     }
     return null;
@@ -186,16 +225,20 @@ export class UCIHandler {
 
   newGame() {
     this.board = new Board();
+    if (__LOG__) logger.bindBoard(this.board);
     this.moveHistory = [];
     this.initialCounts = this._snapshotCounts();
     this.previousEval = 0;
     if (this.engine.tt !== null) this.engine.tt.clear();
-    if (__LOG__) logger.startGame();
+    // Log rotation is SESSION-owned: with N instances, `ucinewgame` arrives
+    // N times per game and must rotate exactly once.
+    this.session.noteNewGame(this.instanceId);
     return null;
   }
 
   position(fen, moves) {
     this.board = fen ? Board.fromFen(fen) : new Board();
+    if (__LOG__) logger.bindBoard(this.board);
     this.moveHistory = [];
     // Baseline for captured-piece derivation is whatever the supplied position
     // contains — mid-game FENs report captures relative to that position.
@@ -204,7 +247,9 @@ export class UCIHandler {
 
     for (const moveStr of moves) {
       if (this._applyMove(moveStr) === null) {
-        if (__LOG__ && LOG.uci) logger.event(CAT.UCI, 'illegal-move', { moveStr, fen: this.board.toFen() });
+        if (__LOG__ && LOG.uci) {
+          logger.event(CAT.UCI, 'illegal-move', { raw: moveStr, fen: this.board.toFen() });
+        }
         break;
       }
     }
@@ -221,19 +266,17 @@ export class UCIHandler {
       if (legalMoves.length === 0) return 'bestmove (none)';
 
       const bookHints = await this._bookHintsFor(legalMoves, responses);
+      if (__LOG__) logger.bind(this.logCtx);   // re-bind after the await
       this._noteSmpIntent(responses);
 
       // `movetime` overrides the configured ceiling for this search only.
-      // TODO: wtime/btime/movestogo are parsed but not used — there is no
-      // clock manager yet. `infinite` and `nodes` are likewise accepted and
-      // ignored; the depth/time ceiling always applies.
+      // TODO: wtime/btime/movestogo are parsed but not used — there is no clock
+      // manager yet. `infinite` and `nodes` are accepted and ignored.
       const savedMaxTime = this.engine.config.maxSearchTime;
       if (options.movetime) this.engine.config.maxSearchTime = options.movetime;
 
       let result;
       try {
-        // Single-threaded pipeline. SMP planning is deliberately not invoked here
-        // (see smpCoordinator.js for the transition plan).
         result = this.engine.search(this.board, options.depth || this.config.maxDepth, { bookHints });
       } finally {
         this.engine.config.maxSearchTime = savedMaxTime;
@@ -267,10 +310,26 @@ export class UCIHandler {
     ].join('\n');
   }
 
+  showProfiles() {
+    return listProfiles()
+      .map(p => `info string profile ${p.name} | ${p.label} | ${p.description}`)
+      .join('\n');
+  }
+
+  whoami() {
+    const tt = this.engine.tt;
+    return [
+      `info string instance ${this.instanceId}`,
+      `info string profile ${this.profile !== null ? this.profile.name : 'adhoc'}`,
+      `info string cfg ${this.profile !== null ? this.profile.hash : 'n/a'}`,
+      `info string tt ${tt === null ? 'none' : `${tt.size} entries`}`,
+      `info string session ${this.session.describe()}`,
+    ].join('\n');
+  }
+
   // ═══════════════════════════════════════════════════════════════════════
   // Interactive extensions
   // ═══════════════════════════════════════════════════════════════════════
-
   validateMove(moveStr) {
     if (!moveStr || moveStr.length < 4) return 'valid false invalid_format';
 
@@ -304,11 +363,13 @@ export class UCIHandler {
   getLegalMoves(square = null) {
     const legal = generateAllLegalMoves(this.board, this.board.gameState.activeColor);
     let filtered = legal;
+
     if (square) {
       const from = squareToIndex(square);
       if (from === -1) return 'legalmoves none invalid_square';
       filtered = legal.filter(m => m.fromSquare === from);
     }
+
     if (filtered.length === 0) return 'legalmoves none';
     return 'legalmoves ' + filtered.map(m => m.algebraic).join(' ');
   }
@@ -316,8 +377,6 @@ export class UCIHandler {
   makeMove(moveStr) {
     const validation = this.validateMove(moveStr);
     if (validation !== 'valid true') {
-      // Every failure becomes `error <reason>`. The client distinguishes a
-      // gamestate block from an error by this prefix.
       const reason = validation.startsWith('valid true ')
         ? validation.slice('valid true '.length)
         : validation.slice('valid false '.length);
@@ -330,7 +389,6 @@ export class UCIHandler {
     if (this.board.plyCount === 0) return 'error no_moves_to_undo';
     this.board.undoMove();
     this.moveHistory.pop();
-    // No captured-piece bookkeeping: captures are derived from the board.
     return this.getGameState();
   }
 
@@ -341,6 +399,7 @@ export class UCIHandler {
 
     let status = 'ongoing';
     let winner = 'none';
+
     if (legalMoves.length === 0) {
       if (inCheck) { status = 'checkmate'; winner = gs.activeColor === 'white' ? 'black' : 'white'; }
       else         { status = 'stalemate'; winner = 'draw'; }
@@ -350,8 +409,8 @@ export class UCIHandler {
 
     const material = this._countMaterial();
     const currentEval = this._evalScore();
-
     const lastMove = this.moveHistory.length > 0 ? this.moveHistory[this.moveHistory.length - 1] : null;
+
     const evalDiff = currentEval - this.previousEval;
     const isBlunder = lastMove !== null &&
       ((lastMove.color === 'white' && evalDiff < -BLUNDER_CP) ||
@@ -395,7 +454,6 @@ export class UCIHandler {
   // ═══════════════════════════════════════════════════════════════════════
   // Configuration internals
   // ═══════════════════════════════════════════════════════════════════════
-
   _set(key, value) {
     this.config[key] = value;
     this.engine.setOption(key, value);
@@ -408,6 +466,41 @@ export class UCIHandler {
     this.engine.setOption('threads', applied);
   }
 
+  /**
+   * Swap the entire config set. Rebuilds the search engine, which means a FRESH
+   * transposition table and fresh heuristic tables — comparing profiles with a
+   * warm table from the previous profile would contaminate the measurement.
+   */
+  _applyProfile(name) {
+    let resolved;
+    try {
+      resolved = resolveProfile(name);
+    } catch (err) {
+      if (__LOG__ && LOG.uci) logger.event(CAT.UCI, 'profile-error', { raw: name, error: err.message });
+      return;
+    }
+
+    this.profile = resolved;
+    this.config = { ...resolved.config };
+    this.engine = new SearchEngine(this.config);
+    this.evaluator = new Evaluator(this.config);
+    this.smp = new SmpCoordinator(this.config);
+
+    if (__LOG__) {
+      logger.sessionRecord('instances.ndjson', {
+        session: this.session.describe(),
+        eng: this.instanceId,
+        profile: resolved.name,
+        label: resolved.label,
+        description: resolved.description,
+        configHash: resolved.hash,
+        tt: this.engine.tt === null ? 'none' : `${this.engine.tt.size}@${resolved.hash}`,
+        config: resolved.config,
+      });
+      logger.write(`[INSTANCE] ${this.instanceId} profile→${resolved.name} cfg=${resolved.hash}`);
+    }
+  }
+
   _beginBookLoad() {
     this.bookReadyPromise = loadOpeningBook()
       .then(b => {
@@ -418,9 +511,7 @@ export class UCIHandler {
         return b;
       })
       .catch(err => {
-        if (__LOG__ && LOG.uci) {
-          logger.event(CAT.UCI, 'warn', { error: err.message, msg: 'Opening book load failed' });
-        }
+        if (__LOG__ && LOG.uci) logger.event(CAT.UCI, 'book-error', { error: err.message });
         return null;
       });
   }
@@ -428,7 +519,6 @@ export class UCIHandler {
   // ═══════════════════════════════════════════════════════════════════════
   // Search internals
   // ═══════════════════════════════════════════════════════════════════════
-
   async _bookHintsFor(legalMoves, responses) {
     if (!this.config.useOpeningBook) return null;
     if (this.bookReadyPromise !== null) await this.bookReadyPromise;
@@ -446,14 +536,16 @@ export class UCIHandler {
 
   _formatSearchResult(result, bookHints, responses) {
     const bestAlg = result.bestMove !== null ? result.bestMove.algebraic : '(none)';
+
     if (bookHints !== null && result.bestMove !== null) {
       const verdict = bookHints.has(bestAlg) ? 'confirmed' : 'OVERRIDDEN';
       responses.push(`info string Book ${verdict} (${bestAlg} cp=${result.score})`);
     }
+
     const pvStr = result.pv.length > 0 ? result.pv.map(m => m.algebraic).join(' ') : '';
     responses.push(
-      `info depth ${result.depth} nodes ${result.nodes} time ${result.time} ` +
-      `score cp ${result.score} pv ${pvStr}`
+      `info depth ${result.depth} seldepth ${result.seldepth} nodes ${result.nodes} ` +
+      `time ${result.time} score cp ${result.score} pv ${pvStr}`
     );
     responses.push(`bestmove ${bestAlg}`);
   }
@@ -461,16 +553,12 @@ export class UCIHandler {
   // ═══════════════════════════════════════════════════════════════════════
   // Move internals
   // ═══════════════════════════════════════════════════════════════════════
-
   _candidates(from, to) {
     return generateAllLegalMoves(this.board, this.board.gameState.activeColor)
       .filter(m => m.fromSquare === from && m.toSquare === to);
   }
 
-  /**
-   * Apply a UCI move string. Returns the move object, or null if illegal.
-   * Single implementation shared by `makemove` and `position ... moves`.
-   */
+  /** Apply a UCI move string. Returns the move object, or null if illegal. */
   _applyMove(moveStr) {
     const from = squareToIndex(moveStr.slice(0, 2));
     const to   = squareToIndex(moveStr.slice(2, 4));
@@ -492,7 +580,7 @@ export class UCIHandler {
     }
     if (move === undefined) return null;
 
-    // SAN must be computed BEFORE the move (needs the sibling move list for
+    // SAN must be computed BEFORE the move (it needs the sibling move list for
     // disambiguation); moveToSan make/unmakes internally for the +/# suffix.
     const san = moveToSan(this.board, move, legal);
     const movingColor = this.board.gameState.activeColor;
@@ -510,7 +598,6 @@ export class UCIHandler {
   // ═══════════════════════════════════════════════════════════════════════
   // State-derivation internals
   // ═══════════════════════════════════════════════════════════════════════
-
   _snapshotCounts() {
     const counts = [new Int8Array(6), new Int8Array(6)];
     for (const idx of [WHITE_IDX, BLACK_IDX]) {
@@ -543,6 +630,7 @@ export class UCIHandler {
       let missing = init[p] - bb[p].popCount();
       while (missing-- > 0) out.push(p);
     }
+
     let missingPawns = init[PIECES.PAWN] - bb[PIECES.PAWN].popCount() - promoted;
     while (missingPawns-- > 0) out.push(PIECES.PAWN);
 

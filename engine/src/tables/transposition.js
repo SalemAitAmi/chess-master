@@ -1,21 +1,26 @@
 /**
- * Transposition table — struct-of-arrays layout over typed arrays.
+ * Transposition table — struct-of-arrays over typed arrays, 2-way buckets.
  *
  * Memory accounting (per entry):
- *   BigInt64Array key    : 8 bytes
- *   Int32Array   score   : 4 bytes
- *   Int32Array   move    : 4 bytes  (encoded: from|to<<6|promo<<12)
- *   Int8Array    depth   : 1 byte
- *   Int8Array    flag    : 1 byte
- *   Uint8Array   age     : 1 byte
+ *   BigUint64Array key  : 8 bytes
+ *   Int32Array   score  : 4 bytes
+ *   Int32Array   move   : 4 bytes  (encoded: from|to<<6|promo<<12)
+ *   Int8Array    depth  : 1 byte
+ *   Int8Array    flag   : 1 byte
+ *   Uint8Array   age    : 1 byte
  *   ─────────────────────────────
- *   Total                : 19 bytes
+ *   Total               : 19 bytes
  *
- * A "64MB" table holds ~3.3M entries and uses exactly 64MB.
- * The previous object-array version claimed 40 bytes/entry but actually
- * used ~150+ bytes plus retained move-object graphs — real size was ~400MB.
+ * BUCKETS. A bucket is the slot pair (i, i|1) where i = key & mask (mask has
+ * its low bit cleared, so i is always even). Slot A is depth-preferred, slot B
+ * is always-replace. With a single slot, one deep entry locked out its index
+ * for the remainder of a search, so a stale best-move hint from a fail-low node
+ * kept being served at TT_MOVE priority and re-seeded the same line everywhere.
+ *
+ * NOT SHARED. One table per engine instance. The reusable probe result below is
+ * per-table mutable state; every field is written on every path so a caller can
+ * never read a value left over from a previous probe.
  */
-
 import logger, { LOG, CAT } from '../logging/logger.js';
 
 const __LOG__ = globalThis.__LOG__ ?? true;
@@ -41,7 +46,6 @@ export function decodeFrom(e)  { return e & 0x3F; }
 export function decodeTo(e)    { return (e >>> 6) & 0x3F; }
 export function decodePromo(e) { return (e >>> 12) & 0x7; }
 
-/** Check whether an encoded move matches a move object's from/to/promo. */
 export function encodedMatches(encoded, move) {
   if (encoded === 0) return false;
   return (encoded & 0x3F) === move.fromSquare &&
@@ -50,133 +54,143 @@ export function encodedMatches(encoded, move) {
 }
 
 const BYTES_PER_ENTRY = 19;
+const FILL_SAMPLE = 1024;
 
 export class TranspositionTable {
   constructor(sizeMB = 64) {
-    // Round entry count down to a power of two so indexing is a bitmask,
-    // avoiding BigInt modulo in the hot path.
     let n = Math.floor((sizeMB * 1024 * 1024) / BYTES_PER_ENTRY);
-    let pow2 = 1;
+    let pow2 = 2;
     while (pow2 * 2 <= n) pow2 *= 2;
     this.size = pow2;
-    this.indexMask = BigInt(pow2 - 1);
+    // Low bit cleared so the masked index is always the EVEN slot of a bucket.
+    this.indexMask = BigInt((pow2 - 1) & ~1);
 
-    // Struct-of-arrays. Contiguous, cache-friendly, no per-entry objects.
     this.keys   = new BigUint64Array(this.size);
     this.scores = new Int32Array(this.size);
-    this.moves  = new Int32Array(this.size);     // encoded
+    this.moves  = new Int32Array(this.size);
     this.depths = new Int8Array(this.size);
     this.flags  = new Int8Array(this.size);
     this.ages   = new Uint8Array(this.size);
 
     this.currentAge = 0;
 
-    // Counters — cheap to maintain, useful in tests
     this.hits = 0;
     this.misses = 0;
     this.stores = 0;
     this.collisions = 0;
+    this.hitAgeSum = 0;     // Σ (currentAge - storedAge) & 0xFF over hits
+    this.hitDepthSum = 0;
 
-    // ── Reusable probe result ──
-    // probe() writes into this and returns it. Caller MUST NOT hold a
-    // reference across calls. This avoids one object allocation per probe,
-    // which matters because probe is called once per node.
-    this._probeResult = { hit: false, usable: false, score: 0, flag: 0, move: 0 };
+    // Reusable probe result. Read immediately; never retain.
+    this._probeResult = { hit: false, usable: false, score: 0, flag: 0, move: 0, age: 0, depth: 0 };
 
     if (__LOG__ && LOG.tt) {
-      logger.event(CAT.TT, 'init', { mb: sizeMB, entries: this.size, actual: (this.size * BYTES_PER_ENTRY / 1024 / 1024).toFixed(1) });
+      logger.event(CAT.TT, 'init', {
+        mb: sizeMB, entries: this.size,
+        actualMB: +(this.size * BYTES_PER_ENTRY / 1024 / 1024).toFixed(1),
+      });
     }
   }
 
-  _index(key) {
-    // Low bits of the zobrist key masked to table size. Number() is safe
-    // here because the mask guarantees the result fits in 32 bits.
-    return Number(key & this.indexMask);
-  }
+  /** Even slot of the bucket for `key`. The odd slot is `| 1`. */
+  _bucket(key) { return Number(key & this.indexMask); }
 
-  /**
-   * Store. bestMove is encoded to an integer — this is the critical fix that
-   * stops the TT from retaining move objects (and their scoreBreakdown,
-   * openingAnalysis, etc.) across the entire search.
-   */
-  store(key, depth, score, flag, bestMove) {
-    const i = this._index(key);
-
-    // Replacement: prefer entries from the current search, and deeper ones.
-    // An aged entry is always replaceable — keeps the table fresh.
-    const slotAge = this.ages[i];
-    const slotKey = this.keys[i];
-    if (slotKey !== 0n && slotAge === this.currentAge && this.depths[i] > depth) {
-      return;   // existing entry is better; keep it
-    }
-
-    if (slotKey !== 0n && slotKey !== key) this.collisions++;
-
+  _write(i, key, depth, score, flag, bestMove) {
     this.keys[i]   = key;
     this.depths[i] = depth;
     this.scores[i] = score;
     this.flags[i]  = flag;
-    this.moves[i]  = encodeMove(bestMove);   // ← integer, not object reference
+    this.moves[i]  = encodeMove(bestMove);
     this.ages[i]   = this.currentAge;
     this.stores++;
   }
 
+  store(key, depth, score, flag, bestMove) {
+    const a = this._bucket(key), b = a | 1;
+
+    // Same position already present → refresh unless the stored entry is both
+    // deeper and from this search.
+    let i = this.keys[a] === key ? a : (this.keys[b] === key ? b : -1);
+    if (i >= 0) {
+      if (this.depths[i] > depth && this.ages[i] === this.currentAge) {
+        this.ages[i] = this.currentAge;
+        return;
+      }
+      this._write(i, key, depth, score, flag, bestMove);
+      return;
+    }
+
+    // New position: take the depth-preferred slot if it is stale or shallower,
+    // otherwise the always-replace slot.
+    const aStale = this.keys[a] === 0n || this.ages[a] !== this.currentAge;
+    i = (aStale || this.depths[a] <= depth) ? a : b;
+    if (this.keys[i] !== 0n && this.keys[i] !== key) this.collisions++;
+    this._write(i, key, depth, score, flag, bestMove);
+  }
+
   /**
-   * Probe. Returns the shared _probeResult object — do not retain it.
-   * .hit    : slot matched the key
-   * .move   : encoded best-move hint (always valid when .hit, even if depth insufficient)
-   * .usable : the stored score can be returned directly (depth + bound check passed)
-   * .score  : stored score (only meaningful when .usable)
+   * Probe. Returns the shared _probeResult — do not retain it.
+   * .hit    slot matched the key
+   * .move   encoded best-move hint (valid whenever .hit)
+   * .usable the stored score may be returned directly
+   * .score  stored score (meaningful only when .usable)
+   * .age    generations since the entry was written
    */
   probe(key, depth, alpha, beta) {
     const r = this._probeResult;
-    const i = this._index(key);
+    const a = this._bucket(key), b = a | 1;
+    const i = this.keys[a] === key ? a : (this.keys[b] === key ? b : -1);
 
-    if (this.keys[i] !== key) {
+    if (i < 0) {
       this.misses++;
-      r.hit = false;
+      r.hit = false; r.usable = false; r.move = 0; r.score = 0; r.flag = 0;
+      r.age = 0; r.depth = 0;
       return r;
     }
 
     r.hit = true;
     r.move = this.moves[i];
+    r.age = (this.currentAge - this.ages[i]) & 0xFF;
+    r.depth = this.depths[i];
 
     if (this.depths[i] < depth) {
-      // Depth too shallow to trust the score, but the move hint is still
-      // valuable for ordering — return it via r.move, mark score unusable.
+      // Too shallow to trust the score; the move hint is still worth having.
       this.misses++;
-      r.usable = false;
+      r.usable = false; r.score = 0; r.flag = 0;
       return r;
     }
 
     this.hits++;
+    this.hitAgeSum += r.age;
+    this.hitDepthSum += this.depths[i];
+
     const score = this.scores[i];
     const flag = this.flags[i];
-
     r.score = score;
     r.flag = flag;
     r.usable =
       flag === TT_FLAG.EXACT ||
       (flag === TT_FLAG.LOWER_BOUND && score >= beta) ||
       (flag === TT_FLAG.UPPER_BOUND && score <= alpha);
-
     return r;
   }
 
   /** Encoded best-move hint for a key, or 0 if not found. */
   getBestMove(key) {
-    const i = this._index(key);
-    return this.keys[i] === key ? this.moves[i] : 0;
+    const a = this._bucket(key), b = a | 1;
+    if (this.keys[a] === key) return this.moves[a];
+    if (this.keys[b] === key) return this.moves[b];
+    return 0;
   }
 
   newSearch() {
-    // Wrap at 255 since we store age in a Uint8. When it wraps, all entries
-    // look "aged" and become replaceable — effectively a soft clear.
     this.currentAge = (this.currentAge + 1) & 0xFF;
     this.hits = 0;
     this.misses = 0;
     this.stores = 0;
     this.collisions = 0;
+    this.hitAgeSum = 0;
+    this.hitDepthSum = 0;
   }
 
   clear() {
@@ -189,6 +203,18 @@ export class TranspositionTable {
     this.currentAge = 0;
   }
 
+  /** Occupancy in permille, estimated from a fixed-size sample. */
+  _fillPermille() {
+    const sample = Math.min(FILL_SAMPLE, this.size);
+    const stride = Math.max(1, Math.floor(this.size / sample));
+    let used = 0, seen = 0;
+    for (let i = 0; i < this.size; i += stride) {
+      if (this.keys[i] !== 0n) used++;
+      seen++;
+    }
+    return seen === 0 ? 0 : Math.round((used / seen) * 1000);
+  }
+
   getStats() {
     const total = this.hits + this.misses;
     return {
@@ -197,19 +223,11 @@ export class TranspositionTable {
       stores: this.stores,
       collisions: this.collisions,
       hitRate: total > 0 ? (this.hits / total * 100).toFixed(1) + '%' : 'n/a',
-      usage: this._estimateUsage(),
+      hitAgeAvg:    this.hits > 0 ? +(this.hitAgeSum / this.hits).toFixed(2) : null,
+      hitDepthAvg:  this.hits > 0 ? +(this.hitDepthSum / this.hits).toFixed(2) : null,
+      fillPermille: this._fillPermille(),
+      usage: (this._fillPermille() / 10).toFixed(1) + '%',
     };
-  }
-
-  _estimateUsage() {
-    // Sample 1024 slots rather than scanning the full table.
-    const sample = Math.min(1024, this.size);
-    const stride = Math.max(1, Math.floor(this.size / sample));
-    let used = 0;
-    for (let i = 0; i < this.size; i += stride) {
-      if (this.keys[i] !== 0n) used++;
-    }
-    return ((used * stride / this.size) * 100).toFixed(1) + '%';
   }
 }
 

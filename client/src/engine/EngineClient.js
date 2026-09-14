@@ -1,13 +1,21 @@
 /**
  * UCI Engine Client for communicating with the backend engine server.
  *
+ * ONE CLIENT = ONE ENGINE INSTANCE. The server gives every connection its own
+ * UCIHandler, SearchEngine and transposition table. A multi-engine page opens
+ * one client per engine and identifies them with the `session` handshake:
+ *
+ *     session <sessionId> <instanceName> [profileName]
+ *
+ * The handshake is sent as the first frame after `open`, before any UCI
+ * traffic. It is not a UCI command — it selects WHICH engine you are talking
+ * to, exactly like choosing which engine binary a GUI launches. Everything
+ * after it is pure UCI.
+ *
  * Response routing: a command that expects a reply installs exactly one
  * pending slot (simple / multi-line / search). Every slot is timeout-guarded,
  * including searches, so a lost `bestmove` surfaces as a rejected promise
  * instead of a hung UI.
- *
- * Layout: constants → class (fields grouped in constructor, methods grouped
- * by concern). No optional chaining.
  */
 
 const DEFAULT_SERVER_URL = 'ws://localhost:8080';
@@ -21,12 +29,19 @@ const MULTILINE_KEYS_INT = ['fullmove', 'halfmove', 'legalmovecount', 'eval',
   'material_white', 'material_black', 'material_diff', 'movecount', 'repetitions'];
 
 export class EngineClient {
-  constructor(serverUrl = DEFAULT_SERVER_URL) {
+  constructor(serverUrl = DEFAULT_SERVER_URL, opts = {}) {
     // ── Connection ──
     this.serverUrl = serverUrl;
     this.ws = null;
     this.connected = false;
     this.ready = false;
+
+    // ── Engine instance identity ──
+    this.session = opts.session || 'default';
+    this.instance = opts.instance || 'e0';
+    this.profile = opts.profile || 'baseline';
+    /** Parsed from `option name Profile type combo ... var <name>`. */
+    this.availableProfiles = [];
 
     // ── Pending response slots ──
     this.pendingSimpleResponse = null;
@@ -41,10 +56,11 @@ export class EngineClient {
     this.onGameState = null;
   }
 
+  get label() { return `${this.session}/${this.instance}`; }
+
   // ═══════════════════════════════════════════════════════════════════════
   // CONNECTION LIFECYCLE
   // ═══════════════════════════════════════════════════════════════════════
-
   async connect() {
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -60,7 +76,13 @@ export class EngineClient {
 
       this.ws.onopen = () => {
         this.connected = true;
-        console.log('Connected to engine server');
+        console.log(`[${this.label}] connected to engine server`);
+        // Claim an engine instance before any UCI traffic.
+        try {
+          this.ws.send(`session ${this.session} ${this.instance} ${this.profile}`);
+        } catch (err) {
+          console.warn(`[${this.label}] handshake failed:`, err);
+        }
         this._notifyConnectionChange(true);
         settleResolve();
       };
@@ -70,7 +92,7 @@ export class EngineClient {
       };
 
       this.ws.onerror = (error) => {
-        console.error('WebSocket error:', error);
+        console.error(`[${this.label}] WebSocket error:`, error);
         if (this.onError) this.onError(error);
         if (!this.connected) settleReject(new Error('Failed to connect to engine server'));
       };
@@ -79,7 +101,7 @@ export class EngineClient {
         const wasConnected = this.connected;
         this.connected = false;
         this.ready = false;
-        console.log('Disconnected from engine server', event.code, event.reason);
+        console.log(`[${this.label}] disconnected`, event.code, event.reason);
         this._rejectAllPending(new Error('Connection closed'));
         if (wasConnected) this._notifyConnectionChange(false);
         settleReject(new Error('Connection closed before open'));
@@ -139,7 +161,6 @@ export class EngineClient {
   // ═══════════════════════════════════════════════════════════════════════
   // INBOUND MESSAGE HANDLING
   // ═══════════════════════════════════════════════════════════════════════
-
   handleMessage(data) {
     const lines = String(data).split('\n');
 
@@ -157,22 +178,28 @@ export class EngineClient {
 
     for (const line of lines) {
       if (!line.trim()) continue;
-      console.log('Engine:', line);
       this._routeLine(line);
     }
   }
 
   _routeLine(line) {
+    if (line.startsWith('option name Profile ')) {
+      this._parseProfileOption(line);
+      return;
+    }
+
     if (line === 'uciok') {
       this.ready = true;
       this._notifyConnectionChange(true);
       this._resolveSimple(undefined);
       return;
     }
+
     if (line === 'readyok') {
       this._resolveSimple(undefined);
       return;
     }
+
     if (line.startsWith('bestmove')) {
       const parts = line.split(' ');
       const move = parts[1];
@@ -185,25 +212,45 @@ export class EngineClient {
       }
       return;
     }
+
     if (line.startsWith('info')) {
       if (this.onInfo) this.onInfo(this.parseInfo(line));
       return;
     }
+
     if (line.startsWith('valid ')) {
       this._resolveSimple(this._parseValidateResponse(line));
       return;
     }
+
     if (line.startsWith('legalmoves ')) {
       this._resolveSimple(this._parseLegalMovesResponse(line));
       return;
     }
+
     if (line.startsWith('eval ')) {
       this._resolveSimple({ eval: parseInt(line.split(' ')[1], 10) });
       return;
     }
+
     if (line.startsWith('error ')) {
       this._rejectSimple(new Error(line.slice(6)));
       return;
+    }
+  }
+
+  /** `option name Profile type combo default baseline var a var b ...` */
+  _parseProfileOption(line) {
+    const names = [];
+    const parts = line.split(/\s+/);
+    for (let i = 0; i < parts.length; i++) {
+      if (parts[i] === 'var' && parts[i + 1]) names.push(parts[++i]);
+    }
+    if (names.length > 0) {
+      this.availableProfiles = names.map(n => ({
+        name: n,
+        label: n.charAt(0).toUpperCase() + n.slice(1),
+      }));
     }
   }
 
@@ -226,6 +273,7 @@ export class EngineClient {
     if (first && (first.startsWith('error ') || first.startsWith('valid false'))) {
       throw new Error(first);
     }
+
     const result = {};
     for (const line of lines) {
       const spaceIdx = line.indexOf(' ');
@@ -245,6 +293,7 @@ export class EngineClient {
         result[key] = value;
       }
     }
+
     if (typeof result.fen !== 'string') {
       throw new Error(`gamestate block missing fen: ${lines.slice(0, 2).join(' | ')}`);
     }
@@ -273,43 +322,19 @@ export class EngineClient {
 
     for (let i = 1; i < parts.length; i++) {
       switch (parts[i]) {
-        case 'depth':
-          info.depth = parseInt(parts[++i], 10);
-          break;
-        case 'seldepth':
-          info.seldepth = parseInt(parts[++i], 10);
-          break;
-        case 'nodes':
-          info.nodes = parseInt(parts[++i], 10);
-          break;
-        case 'nps':
-          info.nps = parseInt(parts[++i], 10);
-          break;
-        case 'time':
-          info.time = parseInt(parts[++i], 10);
-          break;
+        case 'depth':    info.depth = parseInt(parts[++i], 10); break;
+        case 'seldepth': info.seldepth = parseInt(parts[++i], 10); break;
+        case 'nodes':    info.nodes = parseInt(parts[++i], 10); break;
+        case 'nps':      info.nps = parseInt(parts[++i], 10); break;
+        case 'time':     info.time = parseInt(parts[++i], 10); break;
         case 'score':
-          if (parts[i + 1] === 'cp') {
-            info.score = parseInt(parts[i + 2], 10);
-            i += 2;
-          } else if (parts[i + 1] === 'mate') {
-            info.mate = parseInt(parts[i + 2], 10);
-            i += 2;
-          }
+          if (parts[i + 1] === 'cp') { info.score = parseInt(parts[i + 2], 10); i += 2; }
+          else if (parts[i + 1] === 'mate') { info.mate = parseInt(parts[i + 2], 10); i += 2; }
           break;
-        case 'pv':
-          info.pv = parts.slice(i + 1);
-          i = parts.length;
-          break;
-        case 'string':
-          info.string = parts.slice(i + 1).join(' ');
-          i = parts.length;
-          break;
-        case 'hashfull':
-          info.hashfull = parseInt(parts[++i], 10);
-          break;
-        default:
-          break;
+        case 'pv':       info.pv = parts.slice(i + 1); i = parts.length; break;
+        case 'string':   info.string = parts.slice(i + 1).join(' '); i = parts.length; break;
+        case 'hashfull': info.hashfull = parseInt(parts[++i], 10); break;
+        default: break;
       }
     }
     return info;
@@ -318,12 +343,10 @@ export class EngineClient {
   // ═══════════════════════════════════════════════════════════════════════
   // OUTBOUND TRANSPORT
   // ═══════════════════════════════════════════════════════════════════════
-
   send(command) {
     if (!this.connected || this.ws === null || this.ws.readyState !== WebSocket.OPEN) {
-      throw new Error('Not connected to engine');
+      throw new Error(`[${this.label}] not connected to engine`);
     }
-    console.log('Sending:', command);
     this.ws.send(command);
   }
 
@@ -331,12 +354,13 @@ export class EngineClient {
   _request(slot, command, timeout) {
     return new Promise((resolve, reject) => {
       if (this[slot] !== null) {
-        reject(new Error(`Command overlap: ${slot} busy when sending "${command}"`));
+        reject(new Error(`[${this.label}] command overlap: ${slot} busy when sending "${command}"`));
         return;
       }
+
       const timeoutId = setTimeout(() => {
         this[slot] = null;
-        reject(new Error(`Command timeout after ${timeout}ms: ${command}`));
+        reject(new Error(`[${this.label}] command timeout after ${timeout}ms: ${command}`));
       }, timeout);
 
       this[slot] = {
@@ -369,7 +393,6 @@ export class EngineClient {
   // ═══════════════════════════════════════════════════════════════════════
   // STANDARD UCI COMMANDS
   // ═══════════════════════════════════════════════════════════════════════
-
   async initialize() {
     await this.sendAndWait('uci');
     await this.sendAndWait('isready');
@@ -403,7 +426,7 @@ export class EngineClient {
   stop() {
     if (!this.connected) return;
     try { this.send('stop'); }
-    catch (e) { console.warn('Failed to send stop:', e); }
+    catch (e) { console.warn(`[${this.label}] failed to send stop:`, e); }
   }
 
   setOption(name, value) {
@@ -416,7 +439,6 @@ export class EngineClient {
   // ═══════════════════════════════════════════════════════════════════════
   // EXTENDED UCI COMMANDS FOR LOCAL PLAY
   // ═══════════════════════════════════════════════════════════════════════
-
   /** @returns {Promise<{valid: boolean, reason: string|null}>} */
   async validateMove(move) {
     return this.sendAndWait(`validate ${move}`);

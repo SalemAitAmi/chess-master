@@ -10,6 +10,7 @@ const __LOG__ = globalThis.__LOG__ ?? true;
 
 const PAWN_SHIELD_BONUS = 12;
 const OPEN_FILE_NEAR_KING_PENALTY = 25;
+const MAX_OPEN_FILES_COUNTED = 2;
 
 export function evaluateKingSafety(board, color, endgameWeight, weight = 1.0) {
   const safetyWeight = Math.max(0.2, 1 - endgameWeight);
@@ -21,7 +22,7 @@ export function evaluateKingSafety(board, color, endgameWeight, weight = 1.0) {
 
   const weighted = Math.round(score * weight);
   if (__LOG__ && LOG.heuristics) {
-    logger.trace(CAT.HEURISTIC, 'king-safety', { c: color, s: weighted, safetyWeight });
+    logger.trace(CAT.HEURISTIC, 'king-safety', { c: color, s: weighted, sw: Math.round(safetyWeight * 100) });
   }
   return weighted;
 }
@@ -51,16 +52,22 @@ function evaluateKingSafetyForSide(board, color, colorIdx, attackerIdx) {
   const backRank = color === 'white' ? 7 : 0;
   const pawnRank = color === 'white' ? 6 : 1;
   const pawns = board.bbPieces[colorIdx][PIECES.PAWN];
+  const pressure = heavyPressure(board, attackerIdx);
   let safety = 0;
 
   if (kingRow === backRank && (kingCol <= 2 || kingCol >= 5)) {
     const rank = 7 - pawnRank;
+    let shield = 0;
     for (let col = Math.max(0, kingCol - 1); col <= Math.min(7, kingCol + 1); col++) {
-      if (pawns.getBit(rank * 8 + col)) safety += PAWN_SHIELD_BONUS;
+      if (pawns.getBit(rank * 8 + col)) shield += PAWN_SHIELD_BONUS;
     }
+    // A pawn shield is worth something only against something. Scaling the
+    // BONUS and the PENALTY by the same `pressure` factor is the point: when
+    // they scaled differently, a queen trade moved them by different amounts
+    // and the residual was a position-independent incentive to trade queens.
+    safety += Math.round(shield * (0.4 + 0.6 * pressure));
   }
 
-  const pressure = heavyPressure(board, attackerIdx);
   if (pressure > 0) {
     let openFiles = 0;
     for (let col = Math.max(0, kingCol - 1); col <= Math.min(7, kingCol + 1); col++) {
@@ -70,6 +77,7 @@ function evaluateKingSafetyForSide(board, color, colorIdx, attackerIdx) {
       }
       if (!hasPawn) openFiles++;
     }
+    if (openFiles > MAX_OPEN_FILES_COUNTED) openFiles = MAX_OPEN_FILES_COUNTED;
     safety -= Math.round(openFiles * OPEN_FILE_NEAR_KING_PENALTY * pressure);
   }
 

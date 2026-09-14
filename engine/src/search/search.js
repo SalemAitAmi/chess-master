@@ -2,19 +2,25 @@
  * Iterative-deepening alpha-beta with PVS, TT, null move, LMR, futility,
  * IID, aspiration windows and quiescence.
  *
- * Root-move policy is deterministic: no randomisation. Move variation is now
- * the job of the SMP layer (see smpCoordinator.js) — each worker receives a
- * root bias that steers it toward a different subtree, and the shared TT lets
- * their findings merge. `options.rootBias` is the hook for that; it is null on
- * the current single-threaded path.
+ * Root-move policy is deterministic. Move variation is the job of the SMP layer
+ * (see smpCoordinator.js); `options.rootBias` is the hook, null on the current
+ * single-threaded path.
+ *
+ * INSTRUMENTATION. The per-turn record carries move quality (chosen vs best
+ * root score), decision margin (best vs runner-up), ordering quality (rank of
+ * the chosen move, first-move cutoff rate), discovery latency (when the final
+ * move last became root-best), PV stability (root best-move changes), TT
+ * usefulness (hits, cutoffs, mean age and depth of hitting entries) and the
+ * root FEN for move-level review. All of it is read by tools/analyze_logs.py.
  *
  * Layout: imports → module constants → pure helpers → class.
  */
-import { SCORE, PIECES, PIECE_VALUES } from '../core/constants.js';
+import { SCORE, PIECES, PIECE_VALUES, PIECE_CHARS } from '../core/constants.js';
 import { generateMoves, listForPly, freshList, isInCheck } from '../core/moveGeneration.js';
 import { Evaluator } from '../evaluation/evaluate.js';
 import { MoveOrderer, pickMove } from './moveOrdering.js';
 import { quiescenceSearch } from './quiescence.js';
+import { SEE_EQUAL_BAND } from './see.js';
 import { TranspositionTable, TT_FLAG, decodeFrom, decodeTo, decodePromo } from '../tables/transposition.js';
 import { SIDE_KEYS, EN_PASSANT_KEYS, getEnPassantZobristIndex } from '../tables/zobrist.js';
 import { detectGameStage, checkOpeningPrinciples, GAME_STAGE } from '../utils/gameStage.js';
@@ -35,11 +41,11 @@ const SIDE_FLIP_KEY = SIDE_KEYS[0] ^ SIDE_KEYS[1];
 const EP_NONE_KEY = EN_PASSANT_KEYS[16];
 const ROOT_VERIFY_LIMIT = 6;
 const DEFAULT_HASH_MB = 64;
+const ROOT_SCORE_DUMP = 8;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Pure helpers
 // ═══════════════════════════════════════════════════════════════════════════
-
 function scoreToTT(score, ply) {
   if (score >  SCORE.MATE_THRESHOLD) return score + ply;
   if (score < -SCORE.MATE_THRESHOLD) return score - ply;
@@ -103,10 +109,28 @@ function applyRootBias(moves, bias) {
   }
 }
 
+/**
+ * Tension rank, for breaking EXACT root ties. Higher is preferred.
+ *   3 winning capture   2 quiet   1 other even capture   0 pure heavy swap
+ *
+ * Fires only on byte-exact equality between two EXACT root scores, which is
+ * rare once the initiative term is active. It exists because the move loop
+ * keeps the FIRST move achieving the maximum score and captures are ordered
+ * first — without this, a materially neutral queen trade won every tie.
+ */
+function tensionRank(m) {
+  if (m.capturedPiece === null) return 2;
+  if (m.seeScore > SEE_EQUAL_BAND) return 3;
+  if (m.piece === m.capturedPiece &&
+      (m.piece === PIECES.QUEEN || m.piece === PIECES.ROOK)) return 0;
+  return 1;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 export class SearchEngine {
   constructor(config) {
     const c = config || {};
+
     // ── Configuration ──
     this.config = {
       maxDepth:              c.maxDepth || 64,
@@ -122,6 +146,7 @@ export class SearchEngine {
       useIID:                c.useIID                !== false,
       useOpeningPrinciples:  c.useOpeningPrinciples  !== false,
       drawContemptMax:       c.drawContemptMax       ?? 50,
+      neutralContempt:       c.neutralContempt       ?? 25,
       repetitionContempt:    c.repetitionContempt    ?? 30,
       repetitionMargin:      c.repetitionMargin      ?? 90,
       maxSearchTime:         c.maxSearchTime         ?? 30000,
@@ -130,7 +155,7 @@ export class SearchEngine {
       ...c,
     };
 
-    // ── Long-lived components ──
+    // ── Long-lived components (private to this engine instance) ──
     this.evaluator   = new Evaluator(this.config);
     this.moveOrderer = new MoveOrderer(this.config);
     this.tt = this.config.useTranspositionTable
@@ -150,17 +175,28 @@ export class SearchEngine {
     this._rootBias = null;
     this._collector = null; this._bookHints = null; this._bookPick = null; this._stageInfo = null;
     this._pvKeys = [];
+
+    // ── Instrumentation ──
+    this._completedDepth = 0;
+    this._iterBest = null;
+    this._firstSeenMs = 0;
+    this._firstSeenDepth = 0;
+    this._rootChanges = 0;
+    this._staticRoot = 0;
+    this._rootN = 0;
+    this._rootCaps = 0;
+
     this.stats = this._emptyStats();
   }
 
   // ═══════════════════════════════════════════════════════════════════════
   // Lifecycle / configuration
   // ═══════════════════════════════════════════════════════════════════════
-
   _emptyStats() {
     return { ttHits: 0, ttCutoffs: 0, nullMoveCutoffs: 0, futilityCutoffs: 0,
              lmrSearches: 0, lmrResearches: 0, pvsResearches: 0, seePrunes: 0,
-             repetitionAvoided: 0, rootVerified: 0 };
+             repetitionAvoided: 0, rootVerified: 0,
+             cutoffs: 0, firstMoveCutoffs: 0, aspLow: 0, aspHigh: 0 };
   }
 
   resetSearchState() {
@@ -171,6 +207,16 @@ export class SearchEngine {
     this._rootScores.length = 0;
     this._rootMoveExact = false;
     this._bookPick = null;
+
+    this._completedDepth = 0;
+    this._iterBest = null;
+    this._firstSeenMs = 0;
+    this._firstSeenDepth = 0;
+    this._rootChanges = 0;
+    this._staticRoot = 0;
+    this._rootN = 0;
+    this._rootCaps = 0;
+
     this.stats = this._emptyStats();
     if (this.tt !== null) this.tt.newSearch();
     this.moveOrderer.prepareNewSearch();
@@ -193,13 +239,24 @@ export class SearchEngine {
   // ═══════════════════════════════════════════════════════════════════════
   // Contempt
   // ═══════════════════════════════════════════════════════════════════════
-
+  /**
+   * `neutralContempt` is the cost of a draw at level material. It was
+   * documented but unread: the old code returned ±1, i.e. a level-material draw
+   * was free, which is a direct cause of shuffle-to-draw endgames.
+   */
   _drawContempt(board, ply) {
     const balance = quickMaterialBalance(board, this.searchColor);
     const absBalance = Math.abs(balance);
     const cap = this.config.drawContemptMax;
-    const absContempt = absBalance > 50 ? Math.min(cap, Math.floor(absBalance / 10)) : 1;
-    const fromSearchPOV = balance > 50 ? -absContempt : balance < -50 ? absContempt : -1;
+    const neutral = this.config.neutralContempt;
+
+    const absContempt = absBalance > 50
+      ? Math.min(cap, Math.max(neutral, Math.floor(absBalance / 10)))
+      : neutral;
+
+    const fromSearchPOV = balance > 50 ? -absContempt
+                        : balance < -50 ? absContempt
+                        : -neutral;
     return (ply & 1) ? -fromSearchPOV : fromSearchPOV;
   }
 
@@ -215,10 +272,9 @@ export class SearchEngine {
   // ═══════════════════════════════════════════════════════════════════════
   // Search driver
   // ═══════════════════════════════════════════════════════════════════════
-
   /**
    * Entry point. `options` is accepted here because this is the public API
-   * boundary (mirrors `go`). Everything below receives explicit parameters.
+   * boundary (it mirrors `go`). Everything below receives explicit parameters.
    *
    *   options.collector : test introspection hook
    *   options.bookHints : Map<algebraic, weight> or null
@@ -244,11 +300,15 @@ export class SearchEngine {
     this._bookPick = heaviestBookMove(bookHints);
     this._rootBias = rootBias;
     this._stageInfo = this._detectStage(board);
+    this._staticRoot = this.evaluator.evaluate(board, this.searchColor).score;
+
+    // Freeze `t` at the root position: every line emitted from anywhere in the
+    // tree is attributed to the turn this search is deciding.
+    if (__LOG__ && LOG.any) logger.lockTurn(board);
 
     if (__LOG__ && LOG.time) {
       logger.event(CAT.TIME, 'search-start', {
-        color: this.searchColor, maxDepth,
-        maxMs: this.config.maxSearchTime,
+        color: this.searchColor, maxDepth, maxMs: this.config.maxSearchTime,
       });
     }
     if (__LOG__ && LOG.stage && this._stageInfo !== null) {
@@ -265,6 +325,7 @@ export class SearchEngine {
 
   _iterativeDeepening(board, depth, collector) {
     let score = 0, lastIterMs = 0;
+
     for (let d = 1; d <= depth; d++) {
       if (this.stopSearch) break;
       if (d > 1 && this._outOfTime(lastIterMs)) break;
@@ -281,7 +342,21 @@ export class SearchEngine {
       if (this._rootBestMove !== null) {
         this._snapshotRootScores();
         this.extractPV(board, d);
-        this._logIteration(d, score, lastIterMs);
+
+        // Discovery latency: _firstSeenMs is the moment the CURRENT best move
+        // became best. Because it is reset on every change, its final value is
+        // "when the move we actually play was found and stayed found".
+        const alg = this._rootBestMove.algebraic;
+        const changed = alg !== this._iterBest;
+        if (changed) {
+          if (this._iterBest !== null) this._rootChanges++;
+          this._iterBest = alg;
+          this._firstSeenMs = Date.now() - this.searchStartTime;
+          this._firstSeenDepth = d;
+        }
+
+        this._completedDepth = d;
+        this._logIteration(d, score, lastIterMs, changed);
         if (Math.abs(score) > SCORE.MATE_THRESHOLD) break;
       }
     }
@@ -297,10 +372,11 @@ export class SearchEngine {
     return true;
   }
 
-  _logIteration(d, score, ms) {
+  _logIteration(d, score, ms, changed) {
     if (__LOG__ && LOG.search) {
       logger.event(CAT.SEARCH, 'iteration', {
         d, best: this._rootBestMove.algebraic, cp: score,
+        changed: changed ? 1 : 0, seldepth: this.maxDepthReached,
         nodes: this.nodes, qnodes: this.qNodes, ms,
       });
     }
@@ -317,18 +393,21 @@ export class SearchEngine {
 
   _searchIteration(board, depth, prevScore) {
     let alpha = -SCORE.INFINITY, beta = SCORE.INFINITY, delta = ASPIRATION_WINDOW;
+
     if (this.config.useAspirationWindows && depth >= ASPIRATION_MIN_DEPTH &&
         Math.abs(prevScore) < SCORE.MATE_THRESHOLD) {
       alpha = prevScore - delta;
       beta  = prevScore + delta;
     }
+
     for (let attempt = 0; attempt < ASPIRATION_MAX_ATTEMPTS; attempt++) {
       const score = this.alphaBeta(board, depth, alpha, beta, this.searchColor, 0, null);
       if (this.stopSearch) return score;
-      if (score <= alpha)      { alpha = Math.max(-SCORE.INFINITY, alpha - delta); delta *= 2; }
-      else if (score >= beta)  { beta  = Math.min( SCORE.INFINITY, beta  + delta); delta *= 2; }
+      if (score <= alpha)     { this.stats.aspLow++;  alpha = Math.max(-SCORE.INFINITY, alpha - delta); delta *= 2; }
+      else if (score >= beta) { this.stats.aspHigh++; beta  = Math.min( SCORE.INFINITY, beta  + delta); delta *= 2; }
       else return score;
     }
+
     return this.alphaBeta(board, depth, -SCORE.INFINITY, SCORE.INFINITY, this.searchColor, 0, null);
   }
 
@@ -341,9 +420,11 @@ export class SearchEngine {
 
   _finish(board, score) {
     this._verifyRootCandidates(board);
+
     const chosen = this._chooseRootMove(board);
     let bestMove = this._rootBestMove;
     let bestScore = score;
+
     if (chosen !== null) {
       bestMove = chosen.move;
       bestScore = chosen.score;
@@ -357,23 +438,66 @@ export class SearchEngine {
     this._collector = null; this._bookHints = null; this._bookPick = null;
     this._stageInfo = null; this._rootBias = null;
 
+    if (__LOG__ && LOG.any) logger.unlockTurn();
+
     return { bestMove, score: bestScore, nodes: this.nodes, qNodes: this.qNodes,
-             depth: this.maxDepthReached, time: totalTime, pv: this.pv,
-             stats: this.stats, stageInfo };
+             depth: this._completedDepth, seldepth: this.maxDepthReached,
+             time: totalTime, pv: this.pv, stats: this.stats, stageInfo };
   }
 
   _logTurnSummary(board, bestMove, bestScore, ms) {
-    if (__LOG__ && LOG.search) {
-      const moveAlg = bestMove !== null ? bestMove.algebraic : null;
-      logger.event(CAT.SEARCH, 'turn', {
-        color: this.searchColor, best: moveAlg, cp: bestScore,
-        depth: this.maxDepthReached, nodes: this.nodes, qnodes: this.qNodes, ms,
-        pv: this.pv.map(m => m.algebraic).join(' '),
-        stage: this._stageInfo !== null ? this._stageInfo.stage : null, ...this.stats,
-      });
+    if (!(__LOG__ && LOG.search)) return;
+
+    const scores = this._rootScores;
+    const bestCp   = scores.length > 0 ? scores[0].score : bestScore;
+    const secondCp = scores.length > 1 ? scores[1].score : null;
+
+    let bestRank = -1;
+    for (let i = 0; i < scores.length; i++) {
+      if (scores[i].move === bestMove) { bestRank = i; break; }
     }
-    if (__LOG__ && LOG.search && this._stageInfo !== null &&
-        this._stageInfo.stage === GAME_STAGE.OPENING &&
+
+    const tt = this.tt !== null ? this.tt.getStats() : null;
+    const mateIn = Math.abs(bestScore) > SCORE.MATE_THRESHOLD
+      ? (bestScore > 0 ? SCORE.MATE - bestScore : -(SCORE.MATE + bestScore))
+      : null;
+
+    logger.event(CAT.SEARCH, 'turn', {
+      color: this.searchColor,
+      best: bestMove !== null ? bestMove.algebraic : null,
+      cp: bestScore, mate: mateIn,
+      bestCp, secondCp,
+      margin: secondCp !== null ? bestCp - secondCp : null,
+      qual: bestMove !== null ? bestScore - bestCp : 0,
+      bestRank, rootN: this._rootN, rootCaps: this._rootCaps,
+      depth: this._completedDepth, seldepth: this.maxDepthReached,
+      nodes: this.nodes, qnodes: this.qNodes, ms,
+      firstSeenMs: this._firstSeenMs, firstSeenDepth: this._firstSeenDepth,
+      rootChanges: this._rootChanges,
+      pv: this.pv.map(m => m.algebraic).join(' '), pvLen: this.pv.length,
+      staticCp: this._staticRoot,
+      ttHit: tt !== null ? tt.hits : 0, ttCut: this.stats.ttCutoffs,
+      ttAgeAvg: tt !== null ? tt.hitAgeAvg : null,
+      ttDepthAvg: tt !== null ? tt.hitDepthAvg : null,
+      ttFill: tt !== null ? tt.fillPermille : null,
+      cap: bestMove !== null && bestMove.capturedPiece !== null
+             ? PIECE_CHARS[bestMove.capturedPiece] : null,
+      capSee: bestMove !== null ? bestMove.seeScore : 0,
+      promo: bestMove !== null && bestMove.isPromotion ? 1 : 0,
+      bal: quickMaterialBalance(board, 'white'),
+      phase: this._stageInfo !== null ? Math.round(this._stageInfo.phasePercent * 100) : null,
+      stage: this._stageInfo !== null ? this._stageInfo.stage : null,
+      fen: board.toFen(),
+      ...this.stats,
+    });
+
+    if (LOG.moveOrder && scores.length > 0) {
+      const top = scores.slice(0, ROOT_SCORE_DUMP)
+        .map(s => `${s.move.algebraic}:${s.score}:${s.exact ? 1 : 0}`).join('|');
+      logger.event(CAT.MOVE_ORDER, 'root-scores', { n: scores.length, top });
+    }
+
+    if (this._stageInfo !== null && this._stageInfo.stage === GAME_STAGE.OPENING &&
         bestMove !== null && this.config.useOpeningPrinciples) {
       const oa = checkOpeningPrinciples(board, bestMove, this.searchColor);
       if (oa.violations.length > 0) {
@@ -382,16 +506,16 @@ export class SearchEngine {
         });
       }
     }
-    if (__LOG__ && LOG.tt && this.tt !== null) logger.event(CAT.TT, 'stats', this.tt.getStats());
-    if (__LOG__ && LOG.time) {
-      logger.event(CAT.TIME, 'search-end', { ms, nodes: this.nodes, depth: this.maxDepthReached });
+
+    if (LOG.tt && this.tt !== null) logger.event(CAT.TT, 'stats', this.tt.getStats());
+    if (LOG.time) {
+      logger.event(CAT.TIME, 'search-end', { ms, nodes: this.nodes, depth: this._completedDepth });
     }
   }
 
   // ═══════════════════════════════════════════════════════════════════════
-  // Root move policy — repetition avoidance only
+  // Root move policy
   // ═══════════════════════════════════════════════════════════════════════
-
   _repetitionsAfter(board, move) {
     board.makeMove(move.fromSquare, move.toSquare, move.promotionPiece);
     const r = board.countRepetitions();
@@ -407,48 +531,58 @@ export class SearchEngine {
   _verifyRootCandidates(board) {
     const scores = this._rootScores;
     if (scores.length === 0) return;
+
     const best = scores[0];
     if (best.move === null) return;
+
     const bestScore = best.score;
     const needRepAvoid = this._repetitionsAfter(board, best.move) >= 3 &&
                          bestScore > -this.config.drawContemptMax;
     if (!needRepAvoid) return;
 
     const slack = this.config.repetitionMargin;
-    const lastDepth = this.maxDepthReached;
+    const lastDepth = this._completedDepth;
     const oppositeColor = this.searchColor === 'white' ? 'black' : 'white';
     let verified = 0;
+
     for (let i = 0; i < scores.length; i++) {
       const s = scores[i];
       if (s.exact) continue;
       if (bestScore - s.score > slack) break;
       if (verified >= ROOT_VERIFY_LIMIT) break;
+
       board.makeMove(s.move.fromSquare, s.move.toSquare, s.move.promotionPiece);
-      s.score = -this.alphaBeta(board, lastDepth - 1, -SCORE.INFINITY, SCORE.INFINITY, oppositeColor, 1, s.move);
+      s.score = -this.alphaBeta(board, Math.max(1, lastDepth - 1),
+                                -SCORE.INFINITY, SCORE.INFINITY, oppositeColor, 1, s.move);
       board.undoMove();
       s.exact = true;
       verified++;
       this.stats.rootVerified++;
     }
+
     if (verified > 0) scores.sort((a, b) => b.score - a.score);
   }
 
   _chooseRootMove(board) {
     const scores = this._rootScores;
     if (scores.length === 0) return null;
-    return this._avoidRepetition(board, scores, scores[0]);
+    const rep = this._avoidRepetition(board, scores, scores[0]);
+    if (rep !== null) return rep;
+    return this._preferTension(scores, scores[0]);
   }
 
   _avoidRepetition(board, scores, best) {
     if (Math.abs(best.score) > SCORE.MATE_THRESHOLD) return null;
     if (best.score <= -this.config.drawContemptMax) return null;
     if (this._repetitionsAfter(board, best.move) < 3) return null;
+
     const margin = this.config.repetitionMargin;
     for (let i = 1; i < scores.length; i++) {
       const s = scores[i];
       if (!s.exact) continue;
       if (s.score < best.score - margin) break;
       if (this._repetitionsAfter(board, s.move) >= 3) continue;
+
       this.stats.repetitionAvoided++;
       if (__LOG__ && LOG.search) {
         logger.event(CAT.SEARCH, 'repetition-avoided', {
@@ -460,27 +594,43 @@ export class SearchEngine {
     return null;
   }
 
+  _preferTension(scores, best) {
+    if (!best.exact || best.move === null) return null;
+    let pick = best;
+    for (let i = 1; i < scores.length; i++) {
+      const s = scores[i];
+      if (!s.exact || s.score !== best.score) continue;
+      if (tensionRank(s.move) > tensionRank(pick.move)) pick = s;
+    }
+    if (pick === best) return null;
+    if (__LOG__ && LOG.search) {
+      logger.event(CAT.SEARCH, 'tie-break', {
+        best: best.move.algebraic, played: pick.move.algebraic, cp: best.score,
+      });
+    }
+    return pick;
+  }
+
   // ═══════════════════════════════════════════════════════════════════════
   // TT helpers — ZERO ALLOCATION. Writes into this._ttProbe.
   // ═══════════════════════════════════════════════════════════════════════
-
-  /**
-   * Probe TT. Writes into this._ttProbe and returns it — caller must read
-   * .move / .cutoff / .score IMMEDIATELY; next call overwrites them.
-   */
   _probeTT(key, depth, alpha, beta, ply, isRoot) {
     const r = this._ttProbe;
     if (this.tt === null) { r.move = 0; r.cutoff = false; r.score = 0; return r; }
+
     const tt = this.tt.probe(key, depth, alpha, beta);
     if (!tt.hit) { r.move = 0; r.cutoff = false; r.score = 0; return r; }
+
     this.stats.ttHits++;
     r.move = tt.move;
+
     if (!isRoot && tt.usable) {
       this.stats.ttCutoffs++;
       r.cutoff = true;
       r.score = scoreFromTT(tt.score, ply);
       return r;
     }
+
     r.cutoff = false;
     r.score = 0;
     return r;
@@ -496,7 +646,6 @@ export class SearchEngine {
   // ═══════════════════════════════════════════════════════════════════════
   // Node search
   // ═══════════════════════════════════════════════════════════════════════
-
   alphaBeta(board, depth, alpha, beta, color, ply, lastMove) {
     this.nodes++;
     if (ply > this.maxDepthReached) this.maxDepthReached = ply;
@@ -517,7 +666,7 @@ export class SearchEngine {
       if (board.isRepetition(2)) return this._repetitionScore(board, ply);
     }
 
-    // ── TT probe (ZERO ALLOC — writes into this._ttProbe) ─────────────
+    // ── TT probe ───────────────────────────────────────────────────────
     const ttResult = this._probeTT(board.gameState.zobristKey, depth, alpha, beta, ply, isRoot);
     const ttCutoff = ttResult.cutoff;
     const ttScore = ttResult.score;
@@ -529,7 +678,9 @@ export class SearchEngine {
       if (this.config.useQuiescence) {
         this.qNodes++;
         return quiescenceSearch(board, alpha, beta, color, this.evaluator,
-                                ply, 0, this.config.quiescenceDepth);
+                                ply, 0, this.config.quiescenceDepth,
+                                lastMove !== null && lastMove.capturedPiece !== null
+                                  ? lastMove.toSquare : -1);
       }
       return this.evaluator.evaluate(board, color).score;
     }
@@ -546,18 +697,31 @@ export class SearchEngine {
       return inCheck ? -(SCORE.MATE - ply) : this._drawContempt(board, ply);
     }
 
+    if (isRoot) {
+      this._rootN = moves.length;
+      let caps = 0;
+      for (let i = 0; i < moves.length; i++) if (moves[i].capturedPiece !== null) caps++;
+      this._rootCaps = caps;
+    }
+
+    // ── Static eval, needed by both null move and futility ─────────────
+    const canFutility = this.config.useFutilityPruning && depth <= 3 && !inCheck && !isPvNode &&
+                        Math.abs(alpha) < SCORE.MATE_THRESHOLD;
+    const canNull = this.config.useNullMovePruning && depth >= 3 && !isRoot &&
+                    !inCheck && !isPvNode && hasNonPawnMaterial(board, color);
+    const staticEval = (canFutility || canNull) ? this.evaluator.evaluate(board, color).score : 0;
+
     // ── Null move ──────────────────────────────────────────────────────
-    if (this._tryNullMove(board, depth, beta, color, oppositeColor, ply, isRoot, inCheck, isPvNode)) {
+    // `staticEval >= beta` precondition: without it, null move fires in
+    // positions we are already losing, over-pruning exactly the lines where a
+    // non-trade continuation would have been found.
+    if (canNull && staticEval >= beta &&
+        this._tryNullMove(board, depth, beta, color, oppositeColor, ply)) {
       if (c !== null) c.onCutoff(ply, null, 'null');
       return beta;
     }
 
-    // ── Pre-search setup ───────────────────────────────────────────────
-    const canFutility = this.config.useFutilityPruning && depth <= 3 && !inCheck && !isPvNode &&
-                        Math.abs(alpha) < SCORE.MATE_THRESHOLD;
-    const staticEval = canFutility ? this.evaluator.evaluate(board, color).score : 0;
-
-    // Score moves (all nodes); sort only at root
+    // ── Order ──────────────────────────────────────────────────────────
     this.moveOrderer.scoreMoves(moves, ply, board, color, ttMove, lastMove,
                                 isRoot ? this._bookHints : null,
                                 isRoot ? this._bookPick : null);
@@ -568,22 +732,30 @@ export class SearchEngine {
     const wantTrueRootScores = isRoot && c !== null;
     let bestMove = null, bestScore = -SCORE.INFINITY;
     let searched = 0;
+
     if (isRoot) this._rootMoveScores.length = 0;
 
     for (let i = 0; i < moves.length; i++) {
       const move = isRoot ? moves[i] : pickMove(moves, i);
       const isCapture = move.capturedPiece !== null;
-      const losingCapture = isCapture && move.seeScore < 0;
+      const badCapture  = isCapture && move.seeScore < -SEE_EQUAL_BAND;
+      const evenCapture = isCapture && move.seeScore <= SEE_EQUAL_BAND;
 
       // ── Pruning ──
       if (searched > 0) {
-        if (canFutility && move.capturedPiece === null && !move.isPromotion &&
-            staticEval + FUTILITY_MARGIN[depth] <= alpha) {
+        // Futility covers NON-WINNING captures too (victim folded into the
+        // margin). Restricting it to quiets meant every quiet alternative to a
+        // trade was prunable while the trade never was.
+        if (canFutility && !move.isPromotion && (!isCapture || evenCapture) &&
+            staticEval + FUTILITY_MARGIN[depth] +
+              (isCapture ? PIECE_VALUES[move.capturedPiece] : 0) <= alpha) {
           this.stats.futilityCutoffs++;
           continue;
         }
-        if (this.config.useSEEPruning && losingCapture && !isPvNode && !inCheck &&
-            depth <= 4 && move.seeScore < -50 * depth) {
+        // Loosened from -50*depth at depth<=4: the old gate pruned real
+        // sacrifices and left the PV dominated by material-neutral lines.
+        if (this.config.useSEEPruning && badCapture && !isPvNode && !inCheck &&
+            depth <= 3 && move.seeScore < -90 * depth) {
           this.stats.seePrunes++;
           continue;
         }
@@ -594,12 +766,16 @@ export class SearchEngine {
       const givesCheck = isInCheck(board, oppositeColor);
 
       // ── Reduction ──
+      // Materially EVEN captures are reducible. Exempting them was the largest
+      // structural bias toward trades: the trade kept full depth while every
+      // quiet alternative was reduced, failed low, and lost the tie by default.
       let reduction = 0;
-      const reducible = !move.isPromotion && (!isCapture || losingCapture);
-      if (this.config.useLateMovereduction && searched >= 4 && depth >= 3 &&
+      const reducible = !move.isPromotion && (!isCapture || evenCapture);
+      const lmrFloor = isCapture ? 6 : 4;
+      if (this.config.useLateMovereduction && searched >= lmrFloor && depth >= 3 &&
           reducible && !inCheck && !givesCheck && !move.isKiller) {
         reduction = Math.floor(Math.log2(depth) * Math.log2(searched + 1) * 0.5);
-        if (losingCapture) reduction++;
+        if (badCapture) reduction++;
         reduction = Math.max(1, Math.min(reduction, depth - 2));
         this.stats.lmrSearches++;
       }
@@ -635,8 +811,11 @@ export class SearchEngine {
 
       if (score > bestScore) { bestScore = score; bestMove = move; }
       if (bestScore > alpha) alpha = bestScore;
+
       if (bestScore >= beta) {
-        // Beta cutoff heuristic updates
+        this.stats.cutoffs++;
+        if (searched === 1) this.stats.firstMoveCutoffs++;
+
         this.moveOrderer.addKiller(move, ply);
         if (!isCapture) {
           this.moveOrderer.updateHistory(move, depth, true);
@@ -653,12 +832,14 @@ export class SearchEngine {
     if (bestMove === null) bestMove = moves[0];
     this._storeTT(board.gameState.zobristKey, depth, bestScore, alphaOrig, beta, ply, bestMove);
     if (isRoot) this._rootBestMove = bestMove;
+
     return bestScore;
   }
 
   /** Root ordering: tiers → opening principles → SMP bias → sort. */
   _orderRoot(board, color, moves, collector) {
     this.moveOrderer.sortMoves(moves);
+
     if (this._stageInfo !== null && this._stageInfo.stage === GAME_STAGE.OPENING &&
         this.config.useOpeningPrinciples) {
       for (let i = 0; i < moves.length; i++) {
@@ -667,10 +848,12 @@ export class SearchEngine {
       }
       moves.sort((a, b) => b.orderScore - a.orderScore);
     }
+
     if (this._rootBias !== null) {
       applyRootBias(moves, this._rootBias);
       moves.sort((a, b) => b.orderScore - a.orderScore);
     }
+
     if (collector !== null) collector.onMoveOrdering(0, moves);
     if (__LOG__ && LOG.moveOrder) {
       logger.event(CAT.MOVE_ORDER, 'root', {
@@ -679,20 +862,23 @@ export class SearchEngine {
     }
   }
 
-  _tryNullMove(board, depth, beta, color, oppositeColor, ply, isRoot, inCheck, isPvNode) {
-    if (!this.config.useNullMovePruning || depth < 3 || isRoot || inCheck || isPvNode) return false;
-    if (!hasNonPawnMaterial(board, color)) return false;
+  /** Preconditions are checked by the caller (it needs staticEval anyway). */
+  _tryNullMove(board, depth, beta, color, oppositeColor, ply) {
     const R = depth > 6 ? 3 : 2;
     const gs = board.gameState;
     const savedEp = gs.enPassantSquare, savedColor = gs.activeColor, savedKey = gs.zobristKey;
+
     gs.enPassantSquare = -1;
     gs.activeColor = oppositeColor;
     gs.zobristKey ^= SIDE_FLIP_KEY;
     if (savedEp !== -1) gs.zobristKey ^= EN_PASSANT_KEYS[getEnPassantZobristIndex(savedEp)] ^ EP_NONE_KEY;
+
     const nullScore = -this.alphaBeta(board, depth - R - 1, -beta, -beta + 1, oppositeColor, ply + 1, null);
+
     gs.enPassantSquare = savedEp;
     gs.activeColor = savedColor;
     gs.zobristKey = savedKey;
+
     if (nullScore >= beta) { this.stats.nullMoveCutoffs++; return true; }
     return false;
   }
@@ -743,13 +929,14 @@ export class SearchEngine {
   // ═══════════════════════════════════════════════════════════════════════
   // PV extraction
   // ═══════════════════════════════════════════════════════════════════════
-
   extractPV(board, maxLen) {
     this.pv = [];
     if (this.tt === null) return;
+
     const seen = this._pvKeys;
     seen.length = 0;
     let made = 0;
+
     for (let i = 0; i < maxLen; i++) {
       const key = board.gameState.zobristKey;
       let found = false;
@@ -758,14 +945,17 @@ export class SearchEngine {
       }
       if (found) break;
       seen.push(key);
+
       const enc = this.tt.getBestMove(key);
       if (enc === 0) break;
+
       const from = decodeFrom(enc), to = decodeTo(enc), promo = decodePromo(enc) || null;
       this.pv.push({ fromSquare: from, toSquare: to, promotionPiece: promo,
-                      algebraic: encodedToAlgebraic(enc) });
+                     algebraic: encodedToAlgebraic(enc) });
       board.makeMove(from, to, promo);
       made++;
     }
+
     for (let i = 0; i < made; i++) board.undoMove();
   }
 }

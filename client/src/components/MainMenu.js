@@ -1,22 +1,24 @@
 import { useState } from "react";
 import { useEngine } from "../hooks/useEngine";
-
-const DIFFICULTY_NAMES = {
-  1: 'Rookie',
-  2: 'Casual', 
-  3: 'Strategic',
-  4: 'Master'
-};
+import { DIFFICULTY_NAMES, DEFAULT_ENGINE_PROFILES } from "../constants/gameConstants";
 
 const MainMenu = ({ onGameStart }) => {
+  // The default-session engine: used here only for connection status and for
+  // the profile list the engine advertises in its `uci` option block.
   const engine = useEngine();
-  
+  const profiles = engine.profiles && engine.profiles.length > 0
+    ? engine.profiles
+    : DEFAULT_ENGINE_PROFILES;
+
   const [playerColor, setPlayerColor] = useState('white');
   const [difficulty, setDifficulty] = useState(2);
-  
-  // Colosseum config
-  const [whiteBot, setWhiteBot] = useState(3);
-  const [blackBot, setBlackBot] = useState(3);
+
+  // Colosseum config: each contestant is an independent engine instance with
+  // its own config set (profile) and its own transposition table.
+  const [botA, setBotA] = useState(3);
+  const [botB, setBotB] = useState(3);
+  const [profileA, setProfileA] = useState('baseline');
+  const [profileB, setProfileB] = useState('baseline');
   const [maxRounds, setMaxRounds] = useState(5);
 
   const handleVsComputer = () => {
@@ -24,11 +26,13 @@ const MainMenu = ({ onGameStart }) => {
   };
 
   const handleColosseum = () => {
-    onGameStart('colosseum', { whiteBot, blackBot, maxRounds });
+    onGameStart('colosseum', { botA, botB, profileA, profileB, maxRounds });
   };
 
+  const selectClass = "w-full mt-1 p-2 bg-gray-600 text-white rounded text-sm";
+
   return (
-    <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-gray-800 to-gray-900">
+    <div className="flex flex-col items-center justify-center min-h-screen bg-gradient-to-br from-gray-800 to-gray-900 py-10">
       <h1 className="text-6xl font-bold text-white mb-8 drop-shadow-lg">
         ♔ Chess Master ♚
       </h1>
@@ -55,14 +59,14 @@ const MainMenu = ({ onGameStart }) => {
         </div>
       )}
 
-      <div className="space-y-4 w-80">
+      <div className="space-y-4 w-96">
         {/* Local Play */}
         <button
           onClick={() => onGameStart('local')}
           disabled={!engine.connected}
           className={`w-full py-4 text-xl font-bold rounded-lg transition-all duration-200 shadow-lg
-            ${engine.connected 
-              ? 'bg-green-600 hover:bg-green-700 text-white hover:shadow-xl' 
+            ${engine.connected
+              ? 'bg-green-600 hover:bg-green-700 text-white hover:shadow-xl'
               : 'bg-gray-600 text-gray-400 cursor-not-allowed'}`}
         >
           👥 Local Play
@@ -74,20 +78,20 @@ const MainMenu = ({ onGameStart }) => {
             onClick={handleVsComputer}
             disabled={!engine.connected}
             className={`w-full py-4 text-xl font-bold rounded-lg transition-all duration-200 shadow-lg mb-4
-              ${engine.connected 
-                ? 'bg-blue-600 hover:bg-blue-700 text-white hover:shadow-xl' 
+              ${engine.connected
+                ? 'bg-blue-600 hover:bg-blue-700 text-white hover:shadow-xl'
                 : 'bg-gray-600 text-gray-400 cursor-not-allowed'}`}
           >
             🤖 VS Computer
           </button>
-          
+
           <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="text-gray-300 text-sm">Play as</label>
               <select
                 value={playerColor}
                 onChange={(e) => setPlayerColor(e.target.value)}
-                className="w-full mt-1 p-2 bg-gray-600 text-white rounded"
+                className={selectClass}
               >
                 <option value="white">White</option>
                 <option value="black">Black</option>
@@ -97,8 +101,8 @@ const MainMenu = ({ onGameStart }) => {
               <label className="text-gray-300 text-sm">Difficulty</label>
               <select
                 value={difficulty}
-                onChange={(e) => setDifficulty(parseInt(e.target.value))}
-                className="w-full mt-1 p-2 bg-gray-600 text-white rounded"
+                onChange={(e) => setDifficulty(parseInt(e.target.value, 10))}
+                className={selectClass}
               >
                 {Object.entries(DIFFICULTY_NAMES).map(([val, name]) => (
                   <option key={val} value={val}>{name}</option>
@@ -114,51 +118,82 @@ const MainMenu = ({ onGameStart }) => {
             onClick={handleColosseum}
             disabled={!engine.connected}
             className={`w-full py-4 text-xl font-bold rounded-lg transition-all duration-200 shadow-lg mb-4
-              ${engine.connected 
-                ? 'bg-purple-600 hover:bg-purple-700 text-white hover:shadow-xl' 
+              ${engine.connected
+                ? 'bg-purple-600 hover:bg-purple-700 text-white hover:shadow-xl'
                 : 'bg-gray-600 text-gray-400 cursor-not-allowed'}`}
           >
             ⚔️ Colosseum
           </button>
-          
-          <div className="grid grid-cols-3 gap-2">
-            <div>
-              <label className="text-gray-300 text-xs">White Bot</label>
+
+          <div className="grid grid-cols-2 gap-3">
+            {/* Engine A */}
+            <div className="bg-gray-800 rounded p-2">
+              <div className="text-cyan-300 text-xs font-bold mb-1">Engine A</div>
+              <label className="text-gray-400 text-xs">Depth</label>
               <select
-                value={whiteBot}
-                onChange={(e) => setWhiteBot(parseInt(e.target.value))}
-                className="w-full mt-1 p-2 bg-gray-600 text-white rounded text-sm"
+                value={botA}
+                onChange={(e) => setBotA(parseInt(e.target.value, 10))}
+                className={selectClass}
               >
                 {Object.entries(DIFFICULTY_NAMES).map(([val, name]) => (
                   <option key={val} value={val}>{name}</option>
                 ))}
               </select>
-            </div>
-            <div>
-              <label className="text-gray-300 text-xs">Black Bot</label>
+              <label className="text-gray-400 text-xs mt-2 block">Config profile</label>
               <select
-                value={blackBot}
-                onChange={(e) => setBlackBot(parseInt(e.target.value))}
-                className="w-full mt-1 p-2 bg-gray-600 text-white rounded text-sm"
+                value={profileA}
+                onChange={(e) => setProfileA(e.target.value)}
+                className={selectClass}
+              >
+                {profiles.map(p => (
+                  <option key={p.name} value={p.name}>{p.label}</option>
+                ))}
+              </select>
+            </div>
+
+            {/* Engine B */}
+            <div className="bg-gray-800 rounded p-2">
+              <div className="text-pink-300 text-xs font-bold mb-1">Engine B</div>
+              <label className="text-gray-400 text-xs">Depth</label>
+              <select
+                value={botB}
+                onChange={(e) => setBotB(parseInt(e.target.value, 10))}
+                className={selectClass}
               >
                 {Object.entries(DIFFICULTY_NAMES).map(([val, name]) => (
                   <option key={val} value={val}>{name}</option>
                 ))}
               </select>
-            </div>
-            <div>
-              <label className="text-gray-300 text-xs">Rounds</label>
+              <label className="text-gray-400 text-xs mt-2 block">Config profile</label>
               <select
-                value={maxRounds}
-                onChange={(e) => setMaxRounds(parseInt(e.target.value))}
-                className="w-full mt-1 p-2 bg-gray-600 text-white rounded text-sm"
+                value={profileB}
+                onChange={(e) => setProfileB(e.target.value)}
+                className={selectClass}
               >
-                {[1, 3, 5, 10, 20].map(n => (
-                  <option key={n} value={n}>{n}</option>
+                {profiles.map(p => (
+                  <option key={p.name} value={p.name}>{p.label}</option>
                 ))}
               </select>
             </div>
           </div>
+
+          <div className="mt-3">
+            <label className="text-gray-300 text-xs">Rounds (colours swap each round)</label>
+            <select
+              value={maxRounds}
+              onChange={(e) => setMaxRounds(parseInt(e.target.value, 10))}
+              className={selectClass}
+            >
+              {[1, 3, 5, 10, 20].map(n => (
+                <option key={n} value={n}>{n}</option>
+              ))}
+            </select>
+          </div>
+
+          <p className="mt-3 text-gray-500 text-xs">
+            Each contestant runs as its own engine instance on its own connection,
+            with a private transposition table — neither can read the other's search.
+          </p>
         </div>
       </div>
 

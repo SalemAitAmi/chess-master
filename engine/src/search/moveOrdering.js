@@ -27,7 +27,7 @@ import { PIECE_VALUES, PIECES, WHITE_IDX, BLACK_IDX } from '../core/constants.js
 import { evaluatePawnPush } from '../evaluation/pawnPush.js';
 import { getPSTValue } from '../evaluation/pieceSquareTables.js';
 import { encodedMatches } from '../tables/transposition.js';
-import { seeFast } from './see.js';
+import { seeFast, SEE_EQUAL_BAND } from './see.js';
 import { hasBit, colorToIndex } from '../core/bitboard.js';
 import {
   ANALYSIS, softPinPartner, softPinStaysOnLine, softPinIsDiagonal,
@@ -156,6 +156,20 @@ export function pickMove(moves, i) {
   }
   if (best !== i) { const t = moves[i]; moves[i] = moves[best]; moves[best] = t; }
   return moves[i];
+}
+
+/**
++ * Demotion WITHIN the EQUAL tier for a pure heavy-piece swap (QxQ, RxR).
++ * Bounded well below the 50_000 inter-tier gap, so it reorders equal captures
++ * among themselves and can never cross a tier. Its only job is to stop a pure
++ * liquidation from being the first equal capture tried — the *valuation* of the
++ * liquidation is the evaluation's job (see evaluation/initiative.js).
++ */
+const HEAVY_SWAP_DEMOTION = { [PIECES.QUEEN]: 20_000, [PIECES.ROOK]: 8_000 };
+
+function heavySwapDemotion(move) {
+  if (move.piece !== move.capturedPiece) return 0;
+  return HEAVY_SWAP_DEMOTION[move.piece] ?? 0;
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -303,9 +317,13 @@ export class MoveOrderer {
   _captureScore(move, board) {
     const s = seeFast(board, move);
     move.seeScore = s;
-    if (s > 0)  return MOVE_PRIORITY.WINNING_CAPTURE + mvvLvaKey(move);
-    if (s === 0) return MOVE_PRIORITY.EQUAL_CAPTURE + mvvLvaKey(move);
-    return MOVE_PRIORITY.LOSING_CAPTURE + s;           // worst losses last
+    // Band, not `=== 0`. A +10cp swing must not buy a 300_000-point tier jump;
+    // that is what made every BxN / NxB look like a winning capture.
+    if (s > SEE_EQUAL_BAND) return MOVE_PRIORITY.WINNING_CAPTURE + mvvLvaKey(move);
+    if (s >= -SEE_EQUAL_BAND) {
+      return MOVE_PRIORITY.EQUAL_CAPTURE + mvvLvaKey(move) - heavySwapDemotion(move);
+    }
+    return MOVE_PRIORITY.LOSING_CAPTURE + s; 
   }
 
   _quietScore(move, ctx, board) {

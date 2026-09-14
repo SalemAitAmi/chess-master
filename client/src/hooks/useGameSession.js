@@ -3,8 +3,15 @@
  * the client-side SAN history (the engine only sends a 20-move window), the
  * init/restart lifecycle, and a busy flag.
  *
+ * MULTI-ENGINE. Accepts either one engine or an array of engines. With an
+ * array, engines[0] is the ARBITER: its gamestate block is the one rendered.
+ * Every engine receives `ucinewgame` (and, from the page, every `makemove`),
+ * so each keeps its own independent board and can detect threefold / 50-move
+ * on its own. The engines are read through a ref so this hook's callbacks stay
+ * stable even though `useEngine` returns a new object on every status change.
+ *
  * Failure paths:
- *   - ucinewgame/gamestate rejects       → sessionError, stack dumped
+ *   - ucinewgame/gamestate rejects        → sessionError, stack dumped
  *   - gamestate block without a fen       → sessionError
  *   - no gamestate within INIT_WATCHDOG   → sessionError ("engine did not respond")
  * A page never sits on "Initializing" without a reason and a retry button.
@@ -13,7 +20,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { INITIAL_GAME_STATE, TIMEOUTS } from '../constants/gameConstants';
 import { reportFailure } from '../utils/failure';
 
-export function useGameSession(engine) {
+export function useGameSession(engineOrEngines) {
   // ── Hooks: state ──
   const [gameState, setGameState] = useState(INITIAL_GAME_STATE);
   const [moveHistory, setMoveHistory] = useState([]);
@@ -24,9 +31,14 @@ export function useGameSession(engine) {
   // ── Hooks: refs ──
   const mountedRef = useRef(true);
   const initStartedRef = useRef(false);
+  const enginesRef = useRef([]);
 
-  // ── Hooks: stable engine functions (identity does not change with status) ──
-  const { connected, newGame, getGameState } = engine;
+  // Updated on every render; read (never closed over) by the callbacks below.
+  enginesRef.current = Array.isArray(engineOrEngines) ? engineOrEngines : [engineOrEngines];
+
+  // Primitive, so effects depending on it are stable.
+  const allConnected = enginesRef.current.length > 0 &&
+                       enginesRef.current.every(e => e && e.connected);
 
   // ── Callbacks: state mutation ──
   /**
@@ -63,12 +75,19 @@ export function useGameSession(engine) {
     setSessionError(null);
     setBusy(true);
     try {
-      await newGame();
-      const state = await getGameState();
+      const engines = enginesRef.current;
+      if (engines.length === 0) throw new Error('no engines bound to session');
+
+      // Reset every instance. The server rotates the log game directory only
+      // once all of them have reset.
+      for (const e of engines) await e.newGame();
+
+      const state = await engines[0].getGameState();
       if (!state || typeof state.fen !== 'string') {
         throw new Error(`gamestate response missing fen: ${JSON.stringify(state)}`);
       }
       if (!mountedRef.current) return false;
+
       setGameState({ ...INITIAL_GAME_STATE, ...state });
       setMoveHistory([]);
       setInitialized(true);
@@ -80,7 +99,7 @@ export function useGameSession(engine) {
     } finally {
       if (mountedRef.current) setBusy(false);
     }
-  }, [newGame, getGameState]);
+  }, []);
 
   const retryInit = useCallback(async () => {
     initStartedRef.current = true;
@@ -94,16 +113,16 @@ export function useGameSession(engine) {
     return () => { mountedRef.current = false; };
   }, []);
 
-  // Auto-init once the engine is up. Runs once per successful init.
+  // Auto-init once EVERY engine is up. Runs once per successful init.
   useEffect(() => {
-    if (!connected || initStartedRef.current) return;
+    if (!allConnected || initStartedRef.current) return;
     initStartedRef.current = true;
     startNewGame().then(ok => { if (!ok) initStartedRef.current = false; });
-  }, [connected, startNewGame]);
+  }, [allConnected, startNewGame]);
 
   // Watchdog: connected but no state after INIT_WATCHDOG → fail loud.
   useEffect(() => {
-    if (!connected || initialized || sessionError !== null) return;
+    if (!allConnected || initialized || sessionError !== null) return;
     const timer = setTimeout(() => {
       if (!mountedRef.current) return;
       const err = new Error(`No gamestate within ${TIMEOUTS.INIT_WATCHDOG}ms of connecting`);
@@ -111,7 +130,7 @@ export function useGameSession(engine) {
       setSessionError(err.message);
     }, TIMEOUTS.INIT_WATCHDOG);
     return () => clearTimeout(timer);
-  }, [connected, initialized, sessionError]);
+  }, [allConnected, initialized, sessionError]);
 
   // ── Return ──
   return {

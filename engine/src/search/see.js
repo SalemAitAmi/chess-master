@@ -33,11 +33,21 @@ const SEE_VALUES = new Int32Array(7);
 SEE_VALUES[PIECES.KING]   = 10000;
 SEE_VALUES[PIECES.QUEEN]  = 900;
 SEE_VALUES[PIECES.ROOK]   = 500;
+// Knight and bishop are equal for exchange purposes. The 10cp bishop premium
+// belongs in the evaluation (bishop pair, open diagonals), NOT in SEE, where it
+// promoted every BxN / NxB from the EQUAL tier into WINNING_CAPTURE — a 300k
+// ordering jump bought with a 10cp artefact.
 SEE_VALUES[PIECES.BISHOP] = 330;
-SEE_VALUES[PIECES.KNIGHT] = 320;
+SEE_VALUES[PIECES.KNIGHT] = 330;
 SEE_VALUES[PIECES.PAWN]   = 100;
 SEE_VALUES[PIECES.NONE]   = 0;
 
+/**
+ * Band inside which an exchange is "materially even". Ordering tiers and
+ * pruning gates must use this, not `=== 0`: a 10–25cp swing is noise relative
+ * to a single PST square and must not buy a tier promotion.
+ */
+export const SEE_EQUAL_BAND = 25;
 export function seeValue(piece) { return SEE_VALUES[piece]; }
 
 let remLo = 0, remHi = 0;
@@ -100,7 +110,8 @@ function playOutCaptures(board, target, startingSide, initialOccupant, victimVal
   let side = startingSide;
   let d = 0;
   GAIN[0] = victimValue;
-
+  const targetRank = target >> 3;
+  const promoDelta = SEE_VALUES[PIECES.QUEEN] - SEE_VALUES[PIECES.PAWN];
   for (;;) {
     const atkSq = leastValuableAttacker(board, target, side);
     if (atkSq < 0) break;
@@ -109,11 +120,16 @@ function playOutCaptures(board, target, startingSide, initialOccupant, victimVal
     if (isIllegalKingCapture(board, target, side, atkPiece)) break;
 
     if (d + 1 >= GAIN.length) break;
+    // A pawn recapturing onto the last rank promotes: the material it gains is
+    // the captured piece PLUS the promotion delta, and the piece now standing
+    // on the square is a queen, not a pawn. Omitting this under-valued every
+    // exchange on rank 1/8 by 800cp.
+    const promotes = atkPiece === PIECES.PAWN && (targetRank === 0 || targetRank === 7);
     d++;
-    GAIN[d] = occupant - GAIN[d - 1];
+    GAIN[d] = occupant - GAIN[d - 1] + (promotes ? promoDelta : 0);
 
     markRemoved(atkSq);
-    occupant = SEE_VALUES[atkPiece];
+    occupant = promotes ? SEE_VALUES[PIECES.QUEEN] : SEE_VALUES[atkPiece];
     side ^= 1;
   }
   return d;
@@ -205,7 +221,15 @@ export function seeFast(board, move) {
     const victim = move.isEnPassant ? SEE_VALUES[PIECES.PAWN]
                                     : SEE_VALUES[board.pieceList[move.toSquare]];
     const attacker = SEE_VALUES[move.piece];
-    if (victim >= attacker) return victim - attacker;   // ≥ 0 by construction
+    // STRICTLY greater only. The old `>=` short-circuited every EQUAL exchange
+    // (QxQ, RxR, NxB) to exactly `victim - attacker`, i.e. 0 — even when the
+    // victim was undefended and the true value was +900. Ordering and the
+    // quiescence gate then could not tell "win a queen" from "trade queens".
+    // For `victim > attacker` the bound is still sound (worst case is losing
+    // the attacker) AND it is already in the correct tier, so the shortcut is
+    // kept where it pays. Equal exchanges — the expensive-to-get-wrong case —
+    // now always get the exact swap.
+    if (victim > attacker) return victim - attacker;
   }
   return see(board, move);
 }

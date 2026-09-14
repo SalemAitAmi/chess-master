@@ -25,7 +25,7 @@ export function evaluateDevelopment(board, color, moveCount, weight = 1.0) {
               - evaluateSideDevelopment(board, oppositeColor, colorToIndex(oppositeColor), moveCount);
   const weighted = Math.round(score * weight);
   if (__LOG__ && LOG.heuristics) {
-    logger.trace(CAT.HEURISTIC, 'dev', { c: color, s: weighted, moveCount });
+    logger.trace(CAT.HEURISTIC, 'development', { c: color, s: weighted, ply: moveCount });
   }
   return weighted;
 }

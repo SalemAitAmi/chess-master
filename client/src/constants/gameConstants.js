@@ -1,7 +1,7 @@
 /**
  * Game constants for the Chess UI
  * Chess logic constants live in the engine. Everything here is presentational
- * or a shared literal (initial state, difficulty labels).
+ * or a shared literal (initial state, difficulty labels, profile fallbacks).
  */
 
 // ── Piece rendering ──
@@ -58,6 +58,21 @@ export const INITIAL_GAME_STATE = {
 // ── Difficulty ──
 export const DIFFICULTY_NAMES = { 1: 'Rookie', 2: 'Casual', 3: 'Strategic', 4: 'Master' };
 export const DIFFICULTY_DEPTHS = { 1: 4, 2: 6, 3: 8, 4: 12 };
+
+// ── Engine profiles ──
+/**
+ * Fallback list, used only until the engine's `option name Profile type combo
+ * ... var <name>` line has been parsed (EngineClient captures it during the
+ * `uci` handshake and exposes it as `engine.profiles`). Mirrors
+ * engine/config/profiles.json; if they drift, the engine wins.
+ */
+export const DEFAULT_ENGINE_PROFILES = [
+  { name: 'baseline',   label: 'Baseline' },
+  { name: 'tactical',   label: 'Tactical' },
+  { name: 'positional', label: 'Positional' },
+  { name: 'liquidator', label: 'Liquidator' },
+  { name: 'greedy',     label: 'Greedy' },
+];
 
 // ── Failure-path timeouts (ms) ──
 export const TIMEOUTS = {

@@ -14,6 +14,9 @@
  */
 import { PIECES } from '../core/constants.js';
 import { colorToIndex, BitBoardIterator } from '../core/bitboard.js';
+import logger, { LOG, CAT } from '../logging/logger.js';
+
+const __LOG__ = globalThis.__LOG__ ?? true;
 
 const PASSED_PAWN_BONUS = [0, 10, 15, 25, 40, 60, 90, 0];
 const ISOLATED_PAWN_PENALTY = 15;
@@ -35,7 +38,11 @@ export function evaluatePawnStructure(board, color, weight = 1.0) {
   let score = 0;
   score += analyzePawnStructure(board, color, colorIdx, oppositeColorIdx);
   score -= analyzePawnStructure(board, oppositeColor, oppositeColorIdx, colorIdx);
-  return Math.round(score * weight);
+  const weighted = Math.round(score * weight);
+  if (__LOG__ && LOG.heuristics) {
+    logger.trace(CAT.HEURISTIC, 'pawn-structure', { c: color, s: weighted });
+  }   
+  return weighted;
 }
 
 function analyzePawnStructure(board, color, colorIdx, oppositeColorIdx) {

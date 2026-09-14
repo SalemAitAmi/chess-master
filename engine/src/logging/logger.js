@@ -1,28 +1,44 @@
 /**
  * Unified engine logger.
  *
- * Output structure (one run folder, one file per active category):
+ *   logs/<session-ISO>/
+ *     session.log            plain text: server lifecycle, UCI echo (all engines)
+ *     instances.ndjson       one record per engine instance: profile + resolved config
+ *     boot/                  records emitted before ANY game starts
+ *       book.ndjson  tt.ndjson  uci.ndjson
+ *     game-1/                one directory per GAME, shared by all engine instances
+ *       search.ndjson  eval.ndjson  heuristics.ndjson  order.ndjson
+ *       tt.ndjson      uci.ndjson   moves.ndjson       pv.ndjson
+ *       time.ndjson    stage.ndjson book.ndjson
+ *     game-2/ ...
  *
- *   logs/<ISO-timestamp>/
- *     system.log          plain text — server lifecycle, UCI echo
- *     search.ndjson       iteration summaries, turn results
- *     eval.ndjson         sampled leaf evaluations
- *     ...
+ * Line shape — no `cat` (the filename is the category), no `msg` in uci.ndjson:
  *
- * Line format:
- *   {"t":42,"cat":"search","msg":"iteration","d":6,"cp":25,...}
+ *   {"seq":<n>,"t":<halfmove>,"eng":"<instance>","msg":"<event>", ...}
+ *   {"seq":<n>,"t":<halfmove>,"eng":"<instance>","cmd":"<command>", ...}
  *
- *   t   = half-move turn counter (the primary analysis key)
- *   cat = category tag (matches the filename)
- *   msg = event name
- *   ... = category-specific fields
+ *   seq  monotonic within a game, across ALL files and ALL engine instances.
+ *        This is the operation sequence: sorting by it reconstructs the exact
+ *        interleaving of UCI traffic, ordering, search and evaluation.
+ *   t    real half-move index of the position: (fullMove-1)*2 + (black to move).
+ *   eng  engine instance id. Lines from two instances share one game directory.
  *
- * Session ID and game ID are logged ONCE at init / game-start, not per line.
- * Timestamps are encoded in the folder name, not repeated in every record.
+ * CONTEXT. `t` and `eng` come from a bound LogContext, not from call sites.
+ * The server binds the context of whichever instance it is dispatching to,
+ * before dispatch. Command handling is synchronous (the search is synchronous),
+ * so one active context at a time is sufficient — see EngineSession.dispatch,
+ * which re-binds after every await.
  *
- * INVARIANT: nothing touches the filesystem until _stream() is first called,
- * and _stream() is unreachable while the category bit is clear. A default mask
- * of 0 (tests, production) creates no files and no timers.
+ * TURN LOCK. makeMove/undoMove mutate the board during search, so `t` is frozen
+ * at the root position for the duration of a search (SearchEngine._prepare /
+ * _finish). Every line emitted anywhere in the tree is attributed to the turn
+ * the search is deciding.
+ *
+ * GAME ROTATION is owned by EngineSession, not by UCIHandler: with two engine
+ * instances, `ucinewgame` arrives twice per game.
+ *
+ * INVARIANT: no filesystem access until a line is actually emitted, and no line
+ * is reachable while the category bit is clear.
  */
 import fs from 'fs';
 import path from 'path';
@@ -31,13 +47,9 @@ import { LOG_CATEGORY, CAT, CAT_BIT, GAME_STAGE } from './categories.js';
 
 const __DEV__ = globalThis.__DEV__ ?? true;
 const LOG_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '../../logs');
+const BOOT_DIR = 'boot';
+const NO_POSITION = -1;
 
-/** Per-turn frequency: cheap categories only. Hot ones stay off by default. */
-const DEV_DEFAULT =
-  LOG_CATEGORY.SYSTEM | LOG_CATEGORY.UCI | LOG_CATEGORY.SEARCH |
-  LOG_CATEGORY.PV | LOG_CATEGORY.BOOK | LOG_CATEGORY.TIME | LOG_CATEGORY.STAGE;
-
-/** Hot-path guard flags. Read these; never call isEnabled() in a loop. */
 export const LOG = {
   any: false, search: false, eval: false, moveOrder: false, tt: false, uci: false,
   book: false, heuristics: false, moves: false, pv: false, time: false, stage: false,
@@ -66,14 +78,37 @@ function field(v) {
   return JSON.stringify(v);
 }
 
+/** uci.ndjson labels its event `cmd`; everything else uses `msg`. */
+const LABEL_KEY = Object.create(null);
+LABEL_KEY[CAT.UCI] = 'cmd';
+const labelKeyFor = (cat) => LABEL_KEY[cat] ?? 'msg';
+
+/** Per-engine-instance logging context. One per UCIHandler. */
+export class LogContext {
+  constructor(eng) {
+    this.eng = eng;
+    this.board = null;
+    this.turnLock = NO_POSITION;
+  }
+}
+const ORPHAN = new LogContext('-');
+
 // ─────────────────────────────────────────────────────────────────────────────
 class FileLogger {
   constructor() {
-    this.mask = 0;                      // nothing enabled until setMask()
+    this.mask = 0;
     this.sampleRate = 256;
-    this.turn = 0;
-    this.dir = null;
-    this.streams = Object.create(null);
+
+    this.ctx = ORPHAN;
+
+    this.sessionDir = null;
+    this.gameIndex = 0;
+    this.gameDir = null;
+    this.gameRecords = 0;
+    this.seq = 0;
+    this.bootSeq = 0;
+
+    this.streams = Object.create(null);   // relPath -> WriteStream
     this.counters = Object.create(null);
     this.timer = null;
     this.stats = { written: 0, dropped: 0 };
@@ -82,85 +117,143 @@ class FileLogger {
   setMask(mask) {
     this.mask = mask | 0;
     refreshFlags(this.mask);
-    if (this.mask === 0) this._closeStreams();
+    if (this.mask === 0) this._closeAll();
   }
   getMask() { return this.mask; }
   setSampleRate(n) { this.sampleRate = Math.max(1, n | 0); }
 
-  // ── Lazy filesystem. Nothing above this line ever creates a file. ──────
-  _dir() {
-    if (this.dir) return this.dir;
-    this.dir = path.join(LOG_ROOT, stamp());
-    fs.mkdirSync(this.dir, { recursive: true });
+  // ── Context ───────────────────────────────────────────────────────────
+  bind(ctx) { this.ctx = ctx || ORPHAN; return this.ctx; }
+  bindBoard(board) { this.ctx.board = board; this.ctx.turnLock = NO_POSITION; }
+
+  _boardTurn() {
+    const b = this.ctx.board;
+    if (b === null || b === undefined) return NO_POSITION;
+    const gs = b.gameState;
+    return (gs.fullMoveCount - 1) * 2 + (gs.activeColor === 'black' ? 1 : 0);
+  }
+  get turn() { return this.ctx.turnLock !== NO_POSITION ? this.ctx.turnLock : this._boardTurn(); }
+  lockTurn(board) {
+    if (board !== undefined && board !== null) this.ctx.board = board;
+    this.ctx.turnLock = this._boardTurn();
+    return this.ctx.turnLock;
+  }
+  unlockTurn() { this.ctx.turnLock = NO_POSITION; }
+
+  // ── Filesystem ────────────────────────────────────────────────────────
+  _session() {
+    if (this.sessionDir !== null) return this.sessionDir;
+    this.sessionDir = path.join(LOG_ROOT, stamp());
+    fs.mkdirSync(this.sessionDir, { recursive: true });
     this.timer = setInterval(() => this._flushAll(), 5000);
     if (this.timer && this.timer.unref) this.timer.unref();
-    return this.dir;
+    return this.sessionDir;
   }
 
-  _stream(file) {
-    let s = this.streams[file];
+  /** Relative directory for category records right now: boot or the game. */
+  _recordDir() {
+    if (this.gameDir !== null) return this.gameDir;
+    const d = path.join(this._session(), BOOT_DIR);
+    fs.mkdirSync(d, { recursive: true });
+    return d;
+  }
+
+  _stream(dir, file) {
+    const rel = path.join(dir, file);
+    let s = this.streams[rel];
     if (s) return s;
-    s = fs.createWriteStream(path.join(this._dir(), file), { flags: 'a', highWaterMark: 1 << 16 });
-    this.streams[file] = s;
+    s = fs.createWriteStream(rel, { flags: 'a', highWaterMark: 1 << 16 });
+    this.streams[rel] = s;
     return s;
   }
 
-  _closeStreams() {
+  _closeGameStreams() {
+    if (this.gameDir === null) return;
+    for (const rel of Object.keys(this.streams)) {
+      if (rel.startsWith(this.gameDir)) { this.streams[rel].end(); delete this.streams[rel]; }
+    }
+    this.gameDir = null;
+  }
+
+  _closeAll() {
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
     for (const k in this.streams) this.streams[k].end();
     this.streams = Object.create(null);
-    this.dir = null;
+    this.sessionDir = null;
+    this.gameDir = null;
+    this.gameIndex = 0;
+    this.gameRecords = 0;
   }
 
-  // ── Core write. One JSON object per line, keyed by half-move turn. ─────
-  _emit(cat, msg, fields) {
-    let line = `{"t":${this.turn},"cat":"${cat}","msg":${JSON.stringify(msg)}`;
+  // ── Core write ────────────────────────────────────────────────────────
+  _emit(cat, label, fields) {
+    const inGame = this.gameDir !== null;
+    const seq = inGame ? ++this.seq : ++this.bootSeq;
+    let line = `{"seq":${seq},"t":${this.turn},"eng":${JSON.stringify(this.ctx.eng)},` +
+               `${JSON.stringify(labelKeyFor(cat))}:${JSON.stringify(label)}`;
     if (fields) for (const k in fields) line += `,${JSON.stringify(k)}:${field(fields[k])}`;
     line += '}\n';
-    this._stream(`${cat}.ndjson`).write(line);
+    this._stream(this._recordDir(), `${cat}.ndjson`).write(line);
+    if (inGame) this.gameRecords++;
     this.stats.written++;
   }
 
-  /** Always written when the category is on. Per-turn frequency. */
-  event(cat, msg, fields) {
+  event(cat, label, fields) {
     if ((this.mask & CAT_BIT[cat]) === 0) return;
-    this._emit(cat, msg, fields);
+    this._emit(cat, label, fields);
   }
 
-  /** Sampled. The ONLY call permitted at per-node frequency. */
-  trace(cat, msg, fields) {
+  trace(cat, label, fields) {
     if ((this.mask & CAT_BIT[cat]) === 0) return;
     const n = (this.counters[cat] = (this.counters[cat] ?? 0) + 1);
     if (n % this.sampleRate !== 0) { this.stats.dropped++; return; }
-    this._emit(cat, msg, fields);
+    this._emit(cat, label, fields);
+  }
+
+  /** Plain text → <session>/session.log. Spans games and engine instances. */
+  write(text) {
+    if ((this.mask & LOG_CATEGORY.SYSTEM) === 0) return;
+    const tag = this.ctx.eng !== '-' ? `[${this.ctx.eng}] ` : '';
+    this._stream(this._session(), 'session.log').write(
+      `[${new Date().toISOString()}] ${tag}${text}\n`);
+  }
+
+  /** One-shot session-scoped record (engine instance registration). */
+  sessionRecord(file, obj) {
+    if (this.mask === 0) return;
+    this._stream(this._session(), file).write(JSON.stringify(obj) + '\n');
+  }
+
+  startSession() {
+    if (this.mask === 0) return;
+    this._session();
+    this.write(`[SESSION] start`);
   }
 
   /**
-   * Human-readable system line. Goes to system.log — the format you quoted in
-   * the bug report (`[ISO] < go depth 12`).
+   * Rotate into a fresh game directory. Called ONLY by EngineSession, which
+   * waits until every registered instance has issued `ucinewgame`. A rotation
+   * into an already-empty game directory is a no-op, so a late-joining or
+   * double-resetting instance cannot split one game across two directories.
    */
-  write(text) {
-    if ((this.mask & LOG_CATEGORY.SYSTEM) === 0) return;
-    this._stream('system.log').write(`[${new Date().toISOString()}] ${text}\n`);
+  startGame() {
+    if (this.mask === 0) return 0;
+    if (this.gameDir !== null && this.gameRecords === 0) return this.gameIndex;
+    this._closeGameStreams();
+    this.gameIndex++;
+    this.gameDir = path.join(this._session(), `game-${this.gameIndex}`);
+    fs.mkdirSync(this.gameDir, { recursive: true });
+    this.gameRecords = 0;
+    this.seq = 0;
+    this.counters = Object.create(null);
+    this.write(`[GAME] game-${this.gameIndex}`);
+    return this.gameIndex;
   }
 
-  /** Session init — logged once. */
-  startSession() {
-    this.event(CAT.SYSTEM, 'session-start', { id: `s${Date.now().toString(36)}` });
+  getStats() {
+    return { ...this.stats, session: this.sessionDir, game: this.gameDir,
+             gameIndex: this.gameIndex, seq: this.seq, mask: this.mask };
   }
-
-  /** Game init — logged once per game. Resets the turn counter. */
-  startGame(id = null) {
-    const gid = id ?? `g${Date.now().toString(36)}`;
-    this.turn = 0;
-    this.event(CAT.SYSTEM, 'game-start', { gameId: gid });
-    this.write(`[GAME] new game ${gid}`);
-  }
-
-  /** Increment the half-move turn counter. Called by the search per turn. */
-  startTurn() { return ++this.turn; }
-
-  getStats() { return { ...this.stats, dir: this.dir, mask: this.mask }; }
 
   _flushAll() { for (const k in this.streams) { const s = this.streams[k]; if (!s.destroyed) s.write(''); } }
   async flush() { this._flushAll(); await new Promise(r => setTimeout(r, 100)); }
@@ -169,10 +262,9 @@ class FileLogger {
       try { const s = this.streams[k]; if (!s.destroyed) fs.fdatasyncSync(s.fd); } catch { /* best effort */ }
     }
   }
-  close() { this._closeStreams(); }
-
+  close() { this._closeAll(); }
   clear() {
-    this._closeStreams();
+    this._closeAll();
     if (fs.existsSync(LOG_ROOT)) fs.rmSync(LOG_ROOT, { recursive: true, force: true });
     this.counters = Object.create(null);
     this.stats = { written: 0, dropped: 0 };
@@ -182,20 +274,17 @@ class FileLogger {
 // ─────────────────────────────────────────────────────────────────────────────
 class NoopLogger {
   setMask() {} getMask() { return 0; } setSampleRate() {}
-  event() {} trace() {} write() {}
-  startSession() {} startGame() {} startTurn() { return 0; }
+  bind(c) { return c; } bindBoard() {} lockTurn() { return -1; } unlockTurn() {}
+  get turn() { return -1; }
+  event() {} trace() {} write() {} sessionRecord() {}
+  startSession() {} startGame() { return 0; }
   getStats() { return { written: 0, dropped: 0, mask: 0 }; }
   async flush() {} flushSync() {} close() {} clear() {}
 }
 
-// ── Singleton ────────────────────────────────────────────────────────────────
-// In dev: FileLogger, mask 0 until setMask is called. Server calls setMask at
-// startup. Tests call installNoopLogger(). In prod (__DEV__=false): NoopLogger
-// from the start — the FileLogger constructor never runs.
 let _instance = __DEV__ ? new FileLogger() : new NoopLogger();
-
 export function installNoopLogger() { _instance.close(); _instance = new NoopLogger(); refreshFlags(0); }
-export function installRealLogger(opts) { _instance.close(); _instance = new FileLogger(opts); }
+export function installRealLogger() { _instance.close(); _instance = new FileLogger(); }
 
 const logger = new Proxy({}, {
   get(_, prop) { const v = _instance[prop]; return typeof v === 'function' ? v.bind(_instance) : v; },

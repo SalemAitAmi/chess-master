@@ -11,7 +11,6 @@ import { getPSTValue } from './pieceSquareTables.js';
 import logger, { LOG, CAT } from '../logging/logger.js';
 
 const __LOG__ = globalThis.__LOG__ ?? true;
-const PIECE_KEYS = ['king', 'queen', 'rook', 'bishop', 'knight', 'pawn'];
 
 const IT = new BitBoardIterator();
 
@@ -22,9 +21,6 @@ export function evaluateMaterial(board, color, weight = 1.0, gamePhase = 1) {
 
   let materialScore = 0;
   let pstScore = 0;
-
-  const wantDetails = __LOG__ && LOG.heuristics;
-  const details = wantDetails ? {} : null;
 
   for (let piece = PIECES.KING; piece <= PIECES.PAWN; piece++) {
     const ourBB = board.bbPieces[colorIdx][piece];
@@ -43,16 +39,12 @@ export function evaluateMaterial(board, color, weight = 1.0, gamePhase = 1) {
       theirPST += getPSTValue(piece, s, !isWhite, gamePhase);
     }
     pstScore += ourPST - theirPST;
-
-    if (details) {
-      details[PIECE_KEYS[piece]] = { ours: ourCount, theirs: theirCount, pst: ourPST - theirPST };
-    }
   }
 
   const weighted = Math.round((materialScore + pstScore) * weight);
 
   if (__LOG__ && LOG.heuristics) {
-    logger.trace(CAT.HEURISTIC, 'center', { c: color, s: weighted });
+    logger.trace(CAT.HEURISTIC, 'material', { c: color, s: weighted, mat: materialScore, pst: pstScore });
   }
   
   return weighted;

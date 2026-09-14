@@ -3,78 +3,126 @@ import EngineClient from '../engine/EngineClient';
 import { reportFailure } from '../utils/failure';
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Module state — singleton engine client shared across all components
+// Module state — a POOL of engine clients keyed by (url, session, instance).
+//
+// One client = one WebSocket = one engine instance on the server, with its own
+// config and transposition table. Single-engine pages call useEngine() and get
+// the default key; the Colosseum calls it twice with two instance names under
+// one session id. Connections are kept open across page navigation and closed
+// only by explicit reconnect() or by the browser on unload.
+//
+// Each slot owns a SET of listeners. The EngineClient callbacks are installed
+// once, at slot creation, and fan out. Chaining onto the previous callback (the
+// old pattern) grew without bound under StrictMode's double-invoke and left
+// stale hooks wired to disposed clients.
 // ═══════════════════════════════════════════════════════════════════════════
+
 const DEFAULT_SERVER_URL = 'ws://localhost:8080';
+const DEFAULT_IDENTITY = { session: 'default', instance: 'e0', profile: 'baseline' };
 
-let sharedEngine = null;
-let connectionPromise = null;
-let listenerCount = 0;
+/** key -> { key, engine, promise, listeners } */
+const pool = new Map();
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Module helpers
-// ═══════════════════════════════════════════════════════════════════════════
-
-function getSharedEngine(serverUrl) {
-  if (sharedEngine === null) sharedEngine = new EngineClient(serverUrl);
-  return sharedEngine;
+function keyOf(url, identity) {
+  return `${url}|${identity.session}|${identity.instance}`;
 }
 
-async function connectSharedEngine(engine) {
-  if (engine.isConnected()) return true;
-  if (connectionPromise !== null) return connectionPromise;
+function slotFor(url, identity) {
+  const key = keyOf(url, identity);
+  const existing = pool.get(key);
+  if (existing !== undefined) return existing;
 
-  connectionPromise = (async () => {
+  const slot = { key, engine: new EngineClient(url, identity), promise: null, listeners: new Set() };
+  const fan = (name) => (...args) => {
+    for (const l of slot.listeners) {
+      const h = l[name];
+      if (h) h(...args);
+    }
+  };
+  slot.engine.onInfo = fan('onInfo');
+  slot.engine.onError = fan('onError');
+  slot.engine.onConnectionChange = fan('onConnectionChange');
+  pool.set(key, slot);
+  return slot;
+}
+
+async function connectSlot(slot) {
+  if (slot.engine.isConnected()) return true;
+  if (slot.promise !== null) return slot.promise;
+  slot.promise = (async () => {
     try {
-      await engine.connect();
-      await engine.initialize();
-      return true;
+      await slot.engine.connect();
+      await slot.engine.initialize();
+      // isConnected() is the only authority: `connect()` resolves on socket
+      // open, but the engine is not usable until `uciok` has set `ready`.
+      return slot.engine.isConnected();
     } catch (err) {
-      reportFailure('useEngine.connectSharedEngine', err);
+      reportFailure('useEngine.connectSlot', err);
       return false;
     } finally {
-      connectionPromise = null;
+      slot.promise = null;
     }
   })();
+  return slot.promise;
+}
 
-  return connectionPromise;
+function disposeSlot(url, identity) {
+  const key = keyOf(url, identity);
+  const slot = pool.get(key);
+  if (slot === undefined) return;
+  try { slot.engine.disconnect(); }
+  catch (e) { reportFailure('useEngine.disposeSlot', e); }
+  slot.listeners.clear();
+  pool.delete(key);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Hook
 //
-// Every method REJECTS when the engine is not connected. Callers are expected
-// to catch and surface the failure — nothing here returns a silent null.
+// @param {string} serverUrl
+// @param {{session?:string, instance?:string, profile?:string}|null} identity
+//
+// `connected` is TRUE ONLY when the engine is UCI-ready (uciok received). It is
+// never derived from socket-open, because every method guard below uses
+// isConnected(); reporting socket-open as connected opened a window in which
+// callers saw `connected === true` and were then rejected with
+// "Engine not connected".
 // ═══════════════════════════════════════════════════════════════════════════
-export function useEngine(serverUrl = DEFAULT_SERVER_URL) {
+
+export function useEngine(serverUrl = DEFAULT_SERVER_URL, identity = null) {
+  const session  = identity && identity.session  ? identity.session  : DEFAULT_IDENTITY.session;
+  const instance = identity && identity.instance ? identity.instance : DEFAULT_IDENTITY.instance;
+  const profile  = identity && identity.profile  ? identity.profile  : DEFAULT_IDENTITY.profile;
+  const ident = useMemo(() => ({ session, instance, profile }), [session, instance, profile]);
+
   // ── State ──
   const [connected, setConnected] = useState(false);
   const [thinking, setThinking] = useState(false);
   const [searchInfo, setSearchInfo] = useState(null);
   const [error, setError] = useState(null);
+  // Bumped by reconnect() to force the effect to re-bind to the new slot.
+  const [generation, setGeneration] = useState(0);
 
   // ── Refs ──
   const mountedRef = useRef(true);
   const engineRef = useRef(null);
 
-  // ── Callbacks: guard ──
+  // ── Guard ──
   const requireEngine = useCallback(() => {
     const engine = engineRef.current;
     if (engine === null || !engine.isConnected()) {
-      throw reportFailure('useEngine', new Error('Engine not connected'));
+      throw reportFailure(`useEngine[${instance}]`, new Error('Engine not connected'));
     }
     return engine;
-  }, []);
+  }, [instance]);
 
-  // ── Callbacks: standard UCI ──
+  // ── Standard UCI ──
   const newGame = useCallback(async () => {
-    const engine = requireEngine();
-    await engine.newGame();
+    await requireEngine().newGame();
   }, [requireEngine]);
 
   const setPosition = useCallback(async (fen, moves = []) => {
-    const engine = requireEngine();
-    await engine.setPosition(fen, moves);
+    await requireEngine().setPosition(fen, moves);
   }, [requireEngine]);
 
   const go = useCallback(async (options = {}) => {
@@ -102,127 +150,87 @@ export function useEngine(serverUrl = DEFAULT_SERVER_URL) {
   }, []);
 
   const setOption = useCallback((name, value) => {
-    const engine = requireEngine();
-    engine.setOption(name, value);
+    requireEngine().setOption(name, value);
   }, [requireEngine]);
 
-  // ── Callbacks: interactive extensions ──
-  const validateMove = useCallback(async (move) => {
-    const engine = requireEngine();
-    return engine.validateMove(move);
-  }, [requireEngine]);
+  // ── Interactive extensions ──
+  const validateMove  = useCallback(async (move) => requireEngine().validateMove(move), [requireEngine]);
+  const getLegalMoves = useCallback(async (square = null) => requireEngine().getLegalMoves(square), [requireEngine]);
+  const makeMove      = useCallback(async (move) => requireEngine().makeMove(move), [requireEngine]);
+  const undoMove      = useCallback(async () => requireEngine().undoMove(), [requireEngine]);
+  const getGameState  = useCallback(async () => requireEngine().getGameState(), [requireEngine]);
+  const getProfiles   = useCallback(async () => requireEngine().getProfiles(), [requireEngine]);
 
-  const getLegalMoves = useCallback(async (square = null) => {
-    const engine = requireEngine();
-    return engine.getLegalMoves(square);
-  }, [requireEngine]);
-
-  const makeMove = useCallback(async (move) => {
-    const engine = requireEngine();
-    return engine.makeMove(move);
-  }, [requireEngine]);
-
-  const undoMove = useCallback(async () => {
-    const engine = requireEngine();
-    return engine.undoMove();
-  }, [requireEngine]);
-
-  const getGameState = useCallback(async () => {
-    const engine = requireEngine();
-    return engine.getGameState();
-  }, [requireEngine]);
-
-  // ── Callbacks: connection ──
+  // ── Connection ──
   const reconnect = useCallback(async () => {
-    if (sharedEngine !== null) {
-      try { sharedEngine.disconnect(); }
-      catch (e) { reportFailure('useEngine.reconnect.disconnect', e); }
-      sharedEngine = null;
+    disposeSlot(serverUrl, ident);
+    if (mountedRef.current) {
+      setConnected(false);
+      setThinking(false);
+      setError(null);
+      setGeneration(g => g + 1);   // re-runs the effect against a fresh slot
     }
-    connectionPromise = null;
-
-    const engine = getSharedEngine(serverUrl);
-    engineRef.current = engine;
-    engine.onConnectionChange = (isConnected) => {
-      if (!mountedRef.current) return;
-      setConnected(isConnected);
-      if (!isConnected) setThinking(false);
-    };
-
-    setError(null);
-    let success = false;
-    try {
-      success = await connectSharedEngine(engine);
-    } catch (err) {
-      reportFailure('useEngine.reconnect', err);
-    }
-    if (!mountedRef.current) return;
-    setConnected(success);
-    if (!success) setError('Failed to reconnect to engine server');
-  }, [serverUrl]);
+  }, [serverUrl, ident]);
 
   // ── Effects ──
   useEffect(() => {
     mountedRef.current = true;
-    listenerCount++;
+    const slot = slotFor(serverUrl, ident);
+    engineRef.current = slot.engine;
 
-    const engine = getSharedEngine(serverUrl);
-    engineRef.current = engine;
-
-    const prevOnInfo = engine.onInfo;
-    const prevOnConnectionChange = engine.onConnectionChange;
-    const prevOnError = engine.onError;
-
-    engine.onInfo = (info) => {
-      if (mountedRef.current) setSearchInfo(info);
-      if (prevOnInfo) prevOnInfo(info);
+    /** Single source of truth for `connected`. */
+    const sync = () => {
+      if (!mountedRef.current) return false;
+      const live = slot.engine.isConnected();
+      setConnected(live);
+      if (!live) setThinking(false);
+      return live;
     };
 
-    engine.onConnectionChange = (isConnected) => {
-      if (mountedRef.current) {
-        setConnected(isConnected);
-        if (!isConnected) {
-          setThinking(false);
+    const listener = {
+      onInfo: (info) => { if (mountedRef.current) setSearchInfo(info); },
+      onError: (err) => {
+        if (mountedRef.current) setError(err && err.message ? err.message : 'Engine error');
+      },
+      onConnectionChange: () => {
+        const live = sync();
+        if (!mountedRef.current) return;
+        // The socket closing is an error; the socket merely not being ready yet
+        // is not, so only report a loss once `ready` has been seen and dropped.
+        if (live) setError(null);
+        else if (slot.engine.ws === null || slot.engine.connected === false) {
           setError('Connection to engine lost');
-        } else {
-          setError(null);
         }
-      }
-      if (prevOnConnectionChange) prevOnConnectionChange(isConnected);
+      },
     };
+    slot.listeners.add(listener);
+    sync();
 
-    engine.onError = (err) => {
-      if (mountedRef.current) setError(err && err.message ? err.message : 'Engine error');
-      if (prevOnError) prevOnError(err);
-    };
-
-    connectSharedEngine(engine).then(success => {
+    connectSlot(slot).then(success => {
       if (!mountedRef.current) return;
-      setConnected(success);
+      sync();
       if (!success) setError('Failed to connect to engine server');
     });
 
-    if (engine.isConnected()) setConnected(true);
-
     return () => {
       mountedRef.current = false;
-      listenerCount--;
-      // The WebSocket is intentionally kept open across page navigation —
-      // reconnecting on every route change costs ~1s and drops engine state.
-      // It is closed only by explicit reconnect() or by the browser on unload.
+      slot.listeners.delete(listener);
+      // The WebSocket is intentionally left open across navigation.
     };
-  }, [serverUrl]);
+  }, [serverUrl, ident, generation]);
 
   // ── Return ──
   return useMemo(() => ({
     connected, thinking, searchInfo, error,
+    session, instance, profile,
     newGame, setPosition, go, stop, setOption,
-    validateMove, getLegalMoves, makeMove, undoMove, getGameState,
+    validateMove, getLegalMoves, makeMove, undoMove, getGameState, getProfiles,
     reconnect,
   }), [
     connected, thinking, searchInfo, error,
+    session, instance, profile,
     newGame, setPosition, go, stop, setOption,
-    validateMove, getLegalMoves, makeMove, undoMove, getGameState,
+    validateMove, getLegalMoves, makeMove, undoMove, getGameState, getProfiles,
     reconnect,
   ]);
 }

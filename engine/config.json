@@ -12,12 +12,14 @@
     "useDevelopment": true,
     "usePawnStructure": true,
     "useKingSafety": true,
+    "useInitiative" : true,
     "weights": {
       "material": 1.0,
       "centerControl": 1.0,
       "development": 1.0,
       "pawnStructure": 1.0,
       "kingSafety": 1.0,
+      "initiative": 1.0,
       "pawnPush": 1.0
     }
   },

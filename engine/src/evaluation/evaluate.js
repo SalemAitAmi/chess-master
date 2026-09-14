@@ -15,6 +15,7 @@ import { evaluateCenterControl } from './centerControl.js';
 import { evaluateDevelopment } from './development.js';
 import { evaluatePawnStructure } from './pawnStructure.js';
 import { evaluateKingSafety } from './kingSafety.js';
+import { evaluateInitiative } from './initiative.js';
 import { getPSTValue } from './pieceSquareTables.js';
 import logger, { LOG, CAT } from '../logging/logger.js';
 
@@ -73,14 +74,20 @@ export function evaluateMopUp(board, color, endgameWeight, usePST = true) {
   const ourPawns = us[PIECES.PAWN].popCount();
   const oppPawns = opp[PIECES.PAWN].popCount();
 
-  const ourMat = us[PIECES.QUEEN].popCount()  + us[PIECES.ROOK].popCount()
-               + us[PIECES.BISHOP].popCount() + us[PIECES.KNIGHT].popCount() + ourPawns;
-  const oppMat = opp[PIECES.QUEEN].popCount()  + opp[PIECES.ROOK].popCount()
-               + opp[PIECES.BISHOP].popCount() + opp[PIECES.KNIGHT].popCount() + oppPawns;
+  // Piece material only — PAWNS MUST NOT GATE THIS. The old test required the
+  // defender to have literally nothing, so K+Q vs K+P got no edge-push and no
+  // king proximity at all: the attacking king sat in the centre (endgame PST)
+  // while the queen shuffled, and the 50-move clock did the rest.
+  const pieceMat = (bb) => bb[PIECES.QUEEN].popCount()  * 900
+                         + bb[PIECES.ROOK].popCount()   * 500
+                         + bb[PIECES.BISHOP].popCount() * 330
+                         + bb[PIECES.KNIGHT].popCount() * 320;
+  const ourPieceMat = pieceMat(us);
+  const oppPieceMat = pieceMat(opp);
 
   let sign;
-  if (oppMat === 0 && ourMat > 0)      sign = 1;
-  else if (ourMat === 0 && oppMat > 0) sign = -1;
+  if (oppPieceMat === 0 && ourPieceMat >= 500)      sign = 1;
+  else if (ourPieceMat === 0 && oppPieceMat >= 500) sign = -1;
   else return 0;
 
   const ourKingSq = us[PIECES.KING].getLSB();
@@ -91,7 +98,13 @@ export function evaluateMopUp(board, color, endgameWeight, usePST = true) {
   const atkKingSq = sign === 1 ? ourKingSq : oppKingSq;
 
   // Is this a piece mate, or a promotion race?
-  const pureMate = (sign === 1 ? ourPawns : oppPawns) === 0;
+  // "Pure mate" = the DEFENDER has nothing at all, so corralling is the whole
+  // plan and cancelling the attacker's PST is safe. With defender pawns on the
+  // board there is a promotion race to respect, so run at half strength and
+  // leave the PST alone.
+  const defPawns = sign === 1 ? oppPawns : ourPawns;
+  const pureMate = defPawns === 0;
+  const strength = pureMate ? 1 : 0.5;
 
   // ── Edge push ── CMD 0..6, squared ×8 → 0..288cp. Quadratic so the gradient
   // steepens near the rim.
@@ -111,7 +124,7 @@ export function evaluateMopUp(board, color, endgameWeight, usePST = true) {
   const kingDist = Math.max(Math.abs(atkF - defF), Math.abs(atkR - defR));
   const proximity = Math.max(0, 14 - 2 * kingDist) * (pureMate ? 20 : 6);
 
-  let score = sign * Math.round((edgePush + proximity) * endgameWeight);
+  let score = sign * Math.round((edgePush + proximity) * endgameWeight * strength);
 
   if (pureMate && usePST) {
     // material.js added `sign * PST(atkKing)` to this evaluation (ourPST when
@@ -132,12 +145,14 @@ export class Evaluator {
       useDevelopment:   config.useDevelopment   !== false,
       usePawnStructure: config.usePawnStructure !== false,
       useKingSafety:    config.useKingSafety    !== false,
+      useInitiative:    config.useInitiative    !== false,
       weights: {
         material:      w.material ?? 1.0,
         centerControl: w.centerControl ?? 1.0,
         development:   w.development ?? 1.0,
         pawnStructure: w.pawnStructure ?? 1.0,
         kingSafety:    w.kingSafety ?? 1.0,
+        initiative:    w.initiative ?? 1.0,
       },
     };
 
@@ -146,7 +161,8 @@ export class Evaluator {
     // because eval is synchronous and callers read .score immediately
     // (search.js does `evaluator.evaluate(...).score` inline).
     this._result    = { score: 0, breakdown: null, context: null };
-    this._breakdown = { material: 0, centerControl: 0, development: 0, pawnStructure: 0, kingSafety: 0, mopUp: 0 };
+    this._breakdown = { material: 0, centerControl: 0, development: 0,
+                        pawnStructure: 0, kingSafety: 0, initiative: 0, mopUp: 0 };
     this._context   = { phase: 0, gamePhase: 0, endgameWeight: 0, moveCount: 0 };
   }
 
@@ -185,6 +201,7 @@ export class Evaluator {
     score += this._evalDevelopment(board, color, w, moveCount, bd);
     score += this._evalPawnStructure(board, color, w, bd);
     score += this._evalKingSafety(board, color, w, endgameWeight, bd);
+    score += this._evalInitiative(board, color, w, gamePhase, bd);
     score += this._evalMopUp(board, color, endgameWeight, bd);
 
     if (wantBreakdown) {
@@ -226,6 +243,13 @@ export class Evaluator {
     if (!this.config.useKingSafety) return 0;
     const s = evaluateKingSafety(board, color, endgameWeight, w.kingSafety);
     if (bd) bd.kingSafety = s;
+    return s;
+  }
+
+  _evalInitiative(board, color, w, gamePhase, bd) {
+    if (!this.config.useInitiative) return 0;
+    const s = evaluateInitiative(board, color, gamePhase, w.initiative);
+    if (bd) bd.initiative = s;
     return s;
   }
 
