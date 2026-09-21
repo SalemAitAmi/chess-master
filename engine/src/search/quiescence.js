@@ -24,10 +24,20 @@ const DELTA_PER_MOVE = 100;
 /** Plies of forced-continuation extension allowed past maxQDepth. */
 const FRONTIER_EXTRA = 6;
 
+/**
+ * @param {{stopSearch:boolean}|null} abort  Stop flag owned by the caller
+ *        (SearchEngine). Checked on entry so an aborted search unwinds through
+ *        quiescence instead of finishing a deep capture tree first. Null in
+ *        direct/test invocations.
+ */
 export function quiescenceSearch(
-  board, alpha, beta, color, evaluator, ply = 0, qDepth = 0, maxQDepth = 8, lastTo = -1
+  board, alpha, beta, color, evaluator, ply = 0, qDepth = 0, maxQDepth = 8,
+  lastTo = -1, abort = null
 ) {
   const standPat = evaluator.evaluate(board, color).score;
+  // Unwind immediately: the returned value is discarded by the aborting
+  // caller, so stand-pat is the cheapest sound thing to hand back.
+  if (abort !== null && abort.stopSearch) return standPat;
   const inCheck = isInCheck(board, color);
 
   // Past the nominal horizon: only forced business, and only to a hard wall.
@@ -84,7 +94,7 @@ export function quiescenceSearch(
     board.makeMove(move.fromSquare, move.toSquare, move.promotionPiece);
     const nextLastTo = move.capturedPiece !== null ? move.toSquare : -1;
     const score = -quiescenceSearch(board, -beta, -alpha, oppositeColor, evaluator,
-                                    ply + 1, qDepth + 1, maxQDepth, nextLastTo);
+                                    ply + 1, qDepth + 1, maxQDepth, nextLastTo, abort);
     board.undoMove();
 
     if (score >= beta) return beta;

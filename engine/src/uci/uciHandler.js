@@ -36,6 +36,9 @@ import { listProfiles, resolveProfile } from '../config/profiles.js';
 import logger, { LOG, CAT, LogContext } from '../logging/logger.js';
 import { parseUCICommand } from './uciParser.js';
 import { moveToSan } from './san.js';
+import {
+  OPTIONS, PROFILE_OPTION, findOption, formatOptionLines, readOptionValues,
+} from '../config/optionSchema.js';
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Module constants
@@ -45,35 +48,6 @@ const __LOG__ = globalThis.__LOG__ ?? true;
 const PROMO_MAP = { q: PIECES.QUEEN, r: PIECES.ROOK, b: PIECES.BISHOP, n: PIECES.KNIGHT };
 const HISTORY_WINDOW = 20;
 const BLUNDER_CP = 200;
-
-function uciOptions() {
-  return [
-    'option name Hash type spin default 64 min 1 max 1024',
-    'option name Threads type spin default 1 min 1 max 64',
-    'option name OwnBook type check default true',
-    'option name MoveTime type spin default 30000 min 10 max 600000',
-    'option name Contempt type spin default 50 min 0 max 200',
-    'option name NeutralContempt type spin default 25 min 0 max 200',
-    'option name RepetitionMargin type spin default 90 min 0 max 500',
-    `option name Profile type combo default baseline ${
-      listProfiles().map(p => `var ${p.name}`).join(' ')}`,
-    'option name UseMaterial type check default true',
-    'option name UseCenterControl type check default true',
-    'option name UseDevelopment type check default true',
-    'option name UsePawnStructure type check default true',
-    'option name UseKingSafety type check default true',
-    'option name UseInitiative type check default true',
-    'option name UsePawnPush type check default true',
-    'option name UseQuiescence type check default true',
-    'option name UseKillerMoves type check default true',
-    'option name UseHistoryHeuristic type check default true',
-    'option name UseTranspositionTable type check default true',
-    'option name UseNullMovePruning type check default true',
-    'option name UseLateMovereduction type check default true',
-    'option name UseSoftPinOrdering type check default true',
-    'option name LogMask type spin default 0 min 0 max 4095',
-  ];
-}
 
 // ═══════════════════════════════════════════════════════════════════════════
 export class UCIHandler {
@@ -90,7 +64,7 @@ export class UCIHandler {
     this.instanceId = opts.instanceId ?? 'e0';
     this.profile = opts.profile ?? null;
     this.session = opts.session ?? {
-      noteNewGame: () => (__LOG__ ? logger.startGame() : 0),
+      noteNewGame: () => (__LOG__ ? logger.armGame() : 0),
       describe: () => 'standalone',
     };
     this.logCtx = opts.logCtx ?? new LogContext(this.instanceId);
@@ -132,6 +106,10 @@ export class UCIHandler {
     if (__LOG__) logger.bind(this.logCtx);
 
     const cmd = parseUCICommand(line);
+    // `go` is the first decision of a game: materialise the armed game
+    // directory here, so this very command lands inside it rather than in the
+    // out-of-game area.
+    if (__LOG__ && cmd.type === 'go') logger.beginGameIfArmed();
     if (__LOG__ && LOG.uci) logger.event(CAT.UCI, cmd.type, { raw: line });
 
     switch (cmd.type) {
@@ -155,6 +133,7 @@ export class UCIHandler {
       case 'showstage':  return this.showStage();
       case 'profiles':   return this.showProfiles();
       case 'whoami':     return this.whoami();
+      case 'options':    return this.showOptions();
       default:
         if (__LOG__ && LOG.uci) {
           logger.event(CAT.UCI, 'unknown', { raw: line, command: cmd.command ?? '' });
@@ -171,7 +150,7 @@ export class UCIHandler {
       'id name ChessMaster Engine 1.0',
       'id author Chess Master',
       '',
-      ...uciOptions(),
+      ...formatOptionLines(listProfiles().map(p => p.name)),
       '',
       'uciok',
     ].join('\n');
@@ -180,47 +159,76 @@ export class UCIHandler {
   setDebug(on) { this.debug = on; return null; }
   isReady()    { return 'readyok'; }
 
+  /**
+   * Registry-driven. Every advertised option is handled, and every handled
+   * option is advertised, because both come from optionSchema.OPTIONS.
+   *
+   * Unknown names are reported, never silently swallowed: a typo in an
+   * experiment spec must not quietly produce a control run.
+   */
   setOption(name, value) {
-    const boolValue = value === 'true';
-    const intValue = parseInt(value, 10);
+    const opt = findOption(name);
+    if (opt === null) {
+      if (__LOG__ && LOG.uci) logger.event(CAT.UCI, 'unknown-option', { name, value });
+      return `info string unknown option ${name}`;
+    }
+    const asBool = () => value === 'true' || value === '1' || value === true;
+    const asInt  = () => {
+      const n = parseInt(value, 10);
+      return Number.isFinite(n) ? n : null;
+    };
+    const clamp = (n) => {
+      if (opt.min !== undefined && n < opt.min) return opt.min;
+      if (opt.max !== undefined && n > opt.max) return opt.max;
+      return n;
+    };
 
-    switch (name.toLowerCase()) {
-      case 'hash':
-        this._set('hashSizeMB', intValue);
-        break;
-      case 'threads':
-        this._setThreads(intValue);
-        break;
+    let changed = true;
+    switch (opt.apply) {
       case 'profile':
-        this._applyProfile(value);
+        changed = this._applyProfile(value);
         break;
-      case 'ownbook':
-        this.config.useOpeningBook = boolValue;
-        if (boolValue && this.bookReadyPromise === null) this._beginBookLoad();
+      case 'threads': {
+        const n = asInt();
+        changed = n !== null ? this._setThreads(clamp(n)) : false;
         break;
-      case 'movetime':
-        this._set('maxSearchTime', intValue);
+      }
+      case 'weight': {
+        const n = asInt();
+        changed = n !== null ? this._setWeight(opt.key, clamp(n) / (opt.scale ?? 1)) : false;
         break;
-      case 'contempt':
-        this._set('drawContemptMax', intValue);
+      }
+      case 'logmask': {
+        const n = asInt();
+        changed = false;
+        if (n !== null && n >= 0 && logger.getMask() !== n) { logger.setMask(n); changed = true; }
         break;
-      case 'neutralcontempt':
-        this._set('neutralContempt', intValue);
+      }
+      case 'logsample': {
+        const n = asInt();
+        changed = false;
+        if (n !== null && n >= 1) { logger.setSampleRate(n); changed = true; }
         break;
-      case 'repetitionmargin':
-        this._set('repetitionMargin', intValue);
-        break;
-      case 'logmask':
-        if (Number.isFinite(intValue)) logger.setMask(intValue);
-        break;
+      }
       default: {
-        // Map `UseFooBar` → config key `useFooBar` generically.
-        const key = name.charAt(0).toLowerCase() + name.slice(1);
-        if (key in this.config) this._set(key, boolValue);
-        else if (__LOG__ && LOG.uci) logger.event(CAT.UCI, 'unknown-option', { name, value });
+        if (opt.type === 'check') changed = this._set(opt.key, asBool());
+        else {
+          const n = asInt();
+          changed = n !== null ? this._set(opt.key, clamp(n)) : false;
+        }
       }
     }
+    if (changed && __LOG__ && LOG.uci) {
+      logger.event(CAT.UCI, 'option', { name: opt.uci, value, key: opt.key ?? opt.apply });
+    }
     return null;
+  }
+
+  /** Current value of every option — lets a client resync after reconnect. */
+  showOptions() {
+    return readOptionValues(this.config, logger.getMask())
+      .map(o => `info string option ${o.uci} ${o.value}`)
+      .join('\n');
   }
 
   newGame() {
@@ -454,16 +462,34 @@ export class UCIHandler {
   // ═══════════════════════════════════════════════════════════════════════
   // Configuration internals
   // ═══════════════════════════════════════════════════════════════════════
+  /**
+   * Flat config key. A no-op set is NOT an event: the client pushes its whole
+   * settings blob on every connect, and logging + rebuilding for ~43 unchanged
+   * options per socket is what made boot/ start at seq 85 and rebuilt the
+   * Evaluator dozens of times during a handshake.
+   */
   _set(key, value) {
+    if (this.config[key] === value) return false;
     this.config[key] = value;
     this.engine.setOption(key, value);
     this.evaluator = new Evaluator(this.config);
+    return true;
+  }
+
+  _setWeight(name, value) {
+    if (this.config.weights?.[name] === value) return false;
+    this.config.weights = { ...this.config.weights, [name]: value };
+    this.engine.setOption('weights', this.config.weights);
+    this.evaluator = new Evaluator(this.config);
+    return true;
   }
 
   _setThreads(n) {
+    if (this.config.threads === n) return false;
     const applied = this.smp.setThreadCount(n);
     this.config.threads = applied;
     this.engine.setOption('threads', applied);
+    return true;
   }
 
   /**
@@ -477,28 +503,31 @@ export class UCIHandler {
       resolved = resolveProfile(name);
     } catch (err) {
       if (__LOG__ && LOG.uci) logger.event(CAT.UCI, 'profile-error', { raw: name, error: err.message });
-      return;
+      return false;
     }
-
+    // Already in force: a rebuild would throw away a warm TT and warm
+    // killer/history tables for nothing. The client re-pushes its whole
+    // settings blob on every connect, so this fires constantly.
+    if (this.profile !== null && this.profile.hash === resolved.hash &&
+        this.profile.name === resolved.name) {
+      return false;
+    }
     this.profile = resolved;
     this.config = { ...resolved.config };
     this.engine = new SearchEngine(this.config);
     this.evaluator = new Evaluator(this.config);
     this.smp = new SmpCoordinator(this.config);
-
     if (__LOG__) {
       logger.sessionRecord('instances.ndjson', {
-        session: this.session.describe(),
-        eng: this.instanceId,
-        profile: resolved.name,
-        label: resolved.label,
-        description: resolved.description,
+        session: this.session.describe(), eng: this.instanceId,
+        profile: resolved.name, label: resolved.label, description: resolved.description,
         configHash: resolved.hash,
         tt: this.engine.tt === null ? 'none' : `${this.engine.tt.size}@${resolved.hash}`,
         config: resolved.config,
       });
       logger.write(`[INSTANCE] ${this.instanceId} profile→${resolved.name} cfg=${resolved.hash}`);
     }
+    return true;
   }
 
   _beginBookLoad() {
@@ -535,13 +564,26 @@ export class UCIHandler {
   }
 
   _formatSearchResult(result, bookHints, responses) {
-    const bestAlg = result.bestMove !== null ? result.bestMove.algebraic : '(none)';
-
-    if (bookHints !== null && result.bestMove !== null) {
+    let best = result.bestMove;
+    if (best === null) {
+      // A deadline abort during the very first iteration can leave no root
+      // move. Answering `(none)` claims the position is terminal, which the
+      // client reads as a desync. Fall back to the first legal move and say so.
+      const legal = generateAllLegalMoves(this.board, this.board.gameState.activeColor);
+      if (legal.length > 0) {
+        best = legal[0];
+        responses.push(`info string search produced no move (aborted after ` +
+                       `${result.time}ms); playing first legal move`);
+        logger.event(CAT.UCI, 'no-root-move', {
+          ms: result.time, depth: result.depth, fen: this.board.toFen(),
+        });
+      }
+    }
+    const bestAlg = best !== null ? best.algebraic : '(none)';
+    if (bookHints !== null && best !== null) {
       const verdict = bookHints.has(bestAlg) ? 'confirmed' : 'OVERRIDDEN';
       responses.push(`info string Book ${verdict} (${bestAlg} cp=${result.score})`);
     }
-
     const pvStr = result.pv.length > 0 ? result.pv.map(m => m.algebraic).join(' ') : '';
     responses.push(
       `info depth ${result.depth} seldepth ${result.seldepth} nodes ${result.nodes} ` +

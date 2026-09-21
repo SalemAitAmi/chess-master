@@ -1,0 +1,17 @@
+{
+  "label": "eval-ablation",
+  "rounds": 6,
+  "depth": 6,
+  "arms": [
+    { "name": "control",   "a": { "profile": "baseline" }, "b": { "profile": "baseline" } },
+    { "name": "no-center", "a": { "profile": "baseline", "options": { "UseCenterControl": false } },
+                           "b": { "profile": "baseline" } },
+    { "name": "no-devel",  "a": { "profile": "baseline", "options": { "UseDevelopment": false } },
+                           "b": { "profile": "baseline" } },
+    { "name": "no-pawns",  "a": { "profile": "baseline", "options": { "UsePawnStructure": false } },
+                           "b": { "profile": "baseline" } },
+    { "name": "no-ks",     "a": { "profile": "baseline", "options": { "UseKingSafety": false } },
+                           "b": { "profile": "baseline" } },
+    { "name": "material",  "a": { "profile": "greedy" },   "b": { "profile": "baseline" } }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "label": "horizon",
+  "rounds": 6,
+  "depth": 6,
+  "arms": [
+    { "name": "control",  "a": { "profile": "baseline" }, "b": { "profile": "baseline" } },
+    { "name": "q-0",      "a": { "profile": "baseline", "options": { "UseQuiescence": false } },
+                          "b": { "profile": "baseline" } },
+    { "name": "q-4",      "a": { "profile": "baseline", "options": { "QuiescenceDepth": 4 } },
+                          "b": { "profile": "baseline" } },
+    { "name": "q-16",     "a": { "profile": "baseline", "options": { "QuiescenceDepth": 16 } },
+                          "b": { "profile": "baseline" } }
+  ]
+}

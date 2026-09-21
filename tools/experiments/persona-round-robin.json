@@ -1,0 +1,15 @@
+{
+  "label": "persona-round-robin",
+  "rounds": 8,
+  "depth": 6,
+  "arms": [
+    { "name": "base-base",  "a": { "profile": "baseline" },   "b": { "profile": "baseline" } },
+    { "name": "tact-base",  "a": { "profile": "tactical" },   "b": { "profile": "baseline" } },
+    { "name": "posi-base",  "a": { "profile": "positional" }, "b": { "profile": "baseline" } },
+    { "name": "liqu-base",  "a": { "profile": "liquidator" }, "b": { "profile": "baseline" } },
+    { "name": "gree-base",  "a": { "profile": "greedy" },     "b": { "profile": "baseline" } },
+    { "name": "tact-posi",  "a": { "profile": "tactical" },   "b": { "profile": "positional" } },
+    { "name": "tact-liqu",  "a": { "profile": "tactical" },   "b": { "profile": "liquidator" } },
+    { "name": "posi-liqu",  "a": { "profile": "positional" }, "b": { "profile": "liquidator" } }
+  ]
+}

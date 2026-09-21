@@ -3,27 +3,11 @@ import MainMenu from "./components/MainMenu";
 import LocalPlayPage from "./pages/LocalPlayPage";
 import VsComputerPage from "./pages/VsComputerPage";
 import ColosseumPage from "./pages/ColosseumPage";
-import SettingsModal, { SETTING_TO_UCI, loadSettings } from "./components/SettingsModal";
+import SettingsModal, { loadSettings } from "./components/SettingsModal";
+import { pushSettings } from "./utils/engineConfig";
 import { useEngine } from "./hooks/useEngine";
 import { reportFailure } from "./utils/failure";
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Module helpers
-// ═══════════════════════════════════════════════════════════════════════════
-function pushSettings(engine, settings) {
-  for (const [key, uciName] of Object.entries(SETTING_TO_UCI)) {
-    if (settings[key] === undefined) continue;
-    try {
-      engine.setOption(uciName, String(settings[key]));
-    } catch (err) {
-      reportFailure(`App.pushSettings(${uciName})`, err);
-      return false;
-    }
-  }
-  return true;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
 const App = () => {
   // ── Hooks ──
   const engine = useEngine();
@@ -47,14 +31,15 @@ const App = () => {
 
   const handleSettingsSave = useCallback((settings) => {
     if (!engine.connected) {
-      reportFailure('App.handleSettingsSave', new Error('engine not connected; settings saved locally only'));
+      reportFailure('App.handleSettingsSave',
+        new Error('engine not connected; settings saved locally only'));
       return;
     }
     pushSettings(engine, settings);
   }, [engine]);
 
   // ── Effects ──
-  // Push persisted settings once the engine is up, so a reload does not
+  // Push persisted settings once the engine is UCI-ready, so a reload does not
   // silently revert to engine defaults.
   useEffect(() => {
     if (!engine.connected) return;
@@ -80,6 +65,8 @@ const App = () => {
       onClose={() => setSettingsOpen(false)}
       onSave={handleSettingsSave}
       disabled={gameActive}
+      profiles={engine.profiles}
+      engineOptions={engine.options}
     />
   );
 

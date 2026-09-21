@@ -34,6 +34,7 @@ export function parseUCICommand(line) {
     case 'clearlogs':  return { type: 'clearlogs' };
     case 'showstage':  return { type: 'showstage' };
     case 'profiles':   return { type: 'profiles' };
+    case 'options':    return { type: 'options' };
     case 'whoami':     return { type: 'whoami' };
 
     default:

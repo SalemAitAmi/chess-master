@@ -1,0 +1,20 @@
+{
+  "label": "pruning-mix",
+  "rounds": 6,
+  "depth": 7,
+  "arms": [
+    { "name": "control",    "a": { "profile": "baseline" }, "b": { "profile": "baseline" } },
+    { "name": "no-futility","a": { "profile": "baseline", "options": { "UseFutilityPruning": false } },
+                            "b": { "profile": "baseline" } },
+    { "name": "no-see",     "a": { "profile": "baseline", "options": { "UseSEEPruning": false } },
+                            "b": { "profile": "baseline" } },
+    { "name": "no-lmr",     "a": { "profile": "baseline", "options": { "UseLateMovereduction": false } },
+                            "b": { "profile": "baseline" } },
+    { "name": "no-null",    "a": { "profile": "baseline", "options": { "UseNullMovePruning": false } },
+                            "b": { "profile": "baseline" } },
+    { "name": "no-prune",   "a": { "profile": "baseline", "options": {
+                                     "UseFutilityPruning": false, "UseSEEPruning": false,
+                                     "UseLateMovereduction": false, "UseNullMovePruning": false } },
+                            "b": { "profile": "baseline" } }
+  ]
+}

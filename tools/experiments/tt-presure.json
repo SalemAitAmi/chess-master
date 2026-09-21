@@ -1,0 +1,14 @@
+{
+  "label": "tt-pressure",
+  "rounds": 6,
+  "depth": 7,
+  "arms": [
+    { "name": "control",  "a": { "profile": "baseline" }, "b": { "profile": "baseline" } },
+    { "name": "tt-off",   "a": { "profile": "baseline", "options": { "UseTranspositionTable": false } },
+                          "b": { "profile": "baseline" } },
+    { "name": "tt-1mb",   "a": { "profile": "baseline", "options": { "Hash": 1 } },
+                          "b": { "profile": "baseline" } },
+    { "name": "tt-256mb", "a": { "profile": "baseline", "options": { "Hash": 256 } },
+                          "b": { "profile": "baseline" } }
+  ]
+}

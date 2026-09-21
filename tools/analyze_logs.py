@@ -223,6 +223,206 @@ NOTES = {
   "subset of the game and should be read with that in mind.",
 }
 
+# ══════════════════════════════════════════════════════════════════════════
+# Glossary — rendered as the last section of report.md and as glossary.md.
+#
+# Two kinds of entry:
+#   LOG KEY      a field the engine writes (engine/src/search/search.py's
+#                `turn` / `iteration` records, eval leaves, TT stats)
+#   DERIVED      computed by this script in build_turns / aggregate
+# Every derived entry states its FORMULA, because the number is meaningless
+# without it (wp_loss in particular is self-reported, not ground truth).
+# ══════════════════════════════════════════════════════════════════════════
+GLOSSARY = {
+ # ── record identity ──
+ "seq":      ("LOG KEY", "Monotonic operation counter within a game, shared by every "
+                         "file and every engine instance. Sorting a game by `seq` "
+                         "replays the exact interleaving of UCI, ordering, search and eval."),
+ "t":        ("LOG KEY", "Half-move (ply) index of the POSITION: (fullmove-1)*2 + (black to move). "
+                         "Frozen at the root for the duration of a search, so every line "
+                         "emitted anywhere in the tree is attributed to the turn being decided."),
+ "eng":      ("LOG KEY", "Engine instance id. One instance = one socket = one config set = "
+                         "one transposition table. Resolve it via instances.ndjson."),
+ "game":     ("DERIVED", "Index parsed from the game-N directory name."),
+ "label":    ("DERIVED", "Event name: the `msg` field, or `cmd` in uci.ndjson."),
+
+ # ── turn record: choice ──
+ "best":     ("LOG KEY", "Move actually played, UCI."),
+ "cp":       ("LOG KEY", "Score of the played move, centipawns, MOVER's point of view."),
+ "mate":     ("LOG KEY", "Distance to mate in moves when |cp| > 49000, else null."),
+ "bestCp":   ("LOG KEY", "Score of the highest-scoring root move after verification."),
+ "secondCp": ("LOG KEY", "Score of the runner-up root move."),
+ "margin":   ("LOG KEY", "bestCp - secondCp. Small = the decision was close; a close "
+                         "decision is a decision that can flip under SMP or a different time control."),
+ "qual":     ("LOG KEY", "cp - bestCp. Non-zero only when a root-policy override fired "
+                         "(repetition avoidance or the EXACT-tie tension tie-break)."),
+ "bestRank": ("LOG KEY", "0-based rank of the played move in the final root score ordering."),
+ "rootN":    ("LOG KEY", "Legal root moves."),
+ "rootCaps": ("LOG KEY", "Captures among the root moves."),
+ "fen":      ("LOG KEY", "Root FEN. Paste into a board to review the decision."),
+ "stage":    ("LOG KEY", "Game stage from utils/gameStage.js (opening … endgame)."),
+ "bal":      ("LOG KEY", "Material balance in cp, WHITE's point of view, pieces only."),
+ "phase":    ("LOG KEY", "Material phase 0-100. 100 = full middlegame material."),
+ "cap":      ("LOG KEY", "Piece captured by the played move (K/Q/R/B/N/P), else null."),
+ "capSee":   ("LOG KEY", "SEE of the played move. >0 wins material, ~0 even, <0 loses."),
+ "promo":    ("LOG KEY", "1 when the played move promotes."),
+
+ # ── turn record: effort ──
+ "depth":    ("LOG KEY", "Last COMPLETED iterative-deepening depth."),
+ "seldepth": ("LOG KEY", "Deepest ply reached anywhere, including quiescence."),
+ "nodes":    ("LOG KEY", "Total nodes searched this turn."),
+ "qnodes":   ("LOG KEY", "Quiescence entry nodes."),
+ "ms":       ("LOG KEY", "Wall-clock ms for the whole turn."),
+ "staticCp": ("LOG KEY", "Static evaluation of the root, before any search."),
+
+ # ── turn record: stability ──
+ "firstSeenMs":    ("LOG KEY", "ms elapsed when the FINAL move last became root-best."),
+ "firstSeenDepth": ("LOG KEY", "Depth at which the final move last became root-best."),
+ "rootChanges":    ("LOG KEY", "Times the root best move changed across iterations."),
+ "pv":             ("LOG KEY", "Principal variation, space-separated UCI."),
+ "pvLen":          ("LOG KEY", "PV length in plies."),
+ "aspLow":         ("LOG KEY", "Aspiration-window fail-lows (re-searches with a lower alpha)."),
+ "aspHigh":        ("LOG KEY", "Aspiration-window fail-highs."),
+ "rootVerified":   ("LOG KEY", "Root moves re-searched with an open window to get an EXACT score."),
+ "repetitionAvoided": ("LOG KEY", "Times the best move was rejected because it walked into a threefold."),
+
+ # ── turn record: ordering / pruning / TT ──
+ "cutoffs":         ("LOG KEY", "Beta cutoffs this turn."),
+ "firstMoveCutoffs":("LOG KEY", "Cutoffs achieved by the FIRST move tried at a node."),
+ "ttHit":           ("LOG KEY", "Transposition table hits (entry found AND deep enough)."),
+ "ttCut":           ("LOG KEY", "TT hits whose stored bound allowed an immediate return."),
+ "ttAgeAvg":        ("LOG KEY", "Mean age, in search generations, of the entries that hit."),
+ "ttDepthAvg":      ("LOG KEY", "Mean stored depth of the entries that hit."),
+ "ttFill":          ("LOG KEY", "Table occupancy in permille, sampled."),
+ "nullMoveCutoffs": ("LOG KEY", "Null-move pruning cutoffs."),
+ "futilityCutoffs": ("LOG KEY", "Moves skipped by futility pruning."),
+ "seePrunes":       ("LOG KEY", "Captures skipped by SEE pruning."),
+ "lmrSearches":     ("LOG KEY", "Moves searched at reduced depth (late move reduction)."),
+ "lmrResearches":   ("LOG KEY", "Reduced searches that beat alpha and had to be redone at full depth."),
+ "pvsResearches":   ("LOG KEY", "Null-window PVS probes that had to be re-searched."),
+
+ # ── iteration record ──
+ "d":        ("LOG KEY", "Iteration depth (search.ndjson label=iteration)."),
+ "changed":  ("LOG KEY", "1 when this iteration changed the root best move."),
+
+ # ── eval leaf record ──
+ "s":        ("LOG KEY", "Total leaf evaluation, cp, mover's point of view."),
+ "ph":       ("LOG KEY", "Game phase at the leaf, 0 (endgame) … 1 (middlegame)."),
+ "material": ("LOG KEY", "Material + piece-square-table term."),
+ "centerControl": ("LOG KEY", "Center-control term."),
+ "development":   ("LOG KEY", "Development term (opening only)."),
+ "pawnStructure": ("LOG KEY", "Doubled / isolated / backward / connected / passed / islands."),
+ "kingSafety":    ("LOG KEY", "Pawn shield and open files near the king, scaled by enemy heavy pressure."),
+ "initiative":    ("LOG KEY", "King-zone attack potential, queen asymmetry, tempo."),
+ "mopUp":         ("LOG KEY", "Corral term; non-zero only with a lone enemy king."),
+
+ # ── derived metrics ──
+ "wp_mover":  ("DERIVED", "Win probability of the mover: 1/(1+10^(-cp/400))."),
+ "cp_eff":    ("DERIVED", "cp with mate scores (|cp| > 49000) set to NaN, so they are "
+                          "excluded from every statistic rather than dominating it."),
+ "cp_white":  ("DERIVED", "cp_eff re-signed to WHITE's point of view."),
+ "cp_next_own": ("DERIVED", "This engine's own cp two of ITS plies later (shift(-2) within game+eng)."),
+ "eval_drop": ("DERIVED", "cp_eff - cp_next_own. Centipawn version of self-reported loss."),
+ "wp_loss":   ("DERIVED", "max(0, wp_mover - wp(cp_next_own)). SELF-REPORTED quality: how far "
+                          "the engine's own assessment fell two of its own plies later. "
+                          "Bounded, so one tactical spike cannot dominate a mean. NOT strength "
+                          "against an oracle — it measures internal consistency."),
+ "blunder_wp":("DERIVED", "wp_loss >= --blunder-wp. A CONVENTION, not a discovered breakpoint."),
+ "blunder_cp":("DERIVED", "eval_drop >= --blunder-cp. Same caveat."),
+ "nps":       ("DERIVED", "nodes / ms * 1000."),
+ "qnode_share": ("DERIVED", "qnodes / nodes. High = the position is tactically unresolved at the horizon."),
+ "ebf":       ("DERIVED", "Effective branching factor: nodes ** (1/depth). Lower is better ordering."),
+ "fmc_rate":  ("DERIVED", "firstMoveCutoffs / cutoffs. The single best move-ordering health metric."),
+ "rank0":     ("DERIVED", "1 when bestRank == 0, i.e. root ordering already knew the answer."),
+ "latency":   ("DERIVED", "firstSeenMs / ms, clipped to [0,1]. Discovery latency: ~0 means the move "
+                          "was found immediately and the rest of the search was confirmation; ~1 means "
+                          "it was found at the buzzer and a shorter search would have played something else."),
+ "search_minus_static": ("DERIVED", "cp_eff - staticCp. How much the search disagreed with the static eval."),
+ "capture_gap": ("DERIVED", "Plies since the previous capture in the same game."),
+ "cap_group":   ("DERIVED", "Captured piece grouped as heavy (Q,R) / minor (B,N) / pawn / king."),
+ "shuffle":     ("DERIVED", "True when a move exactly reverses the SAME engine's move two of its own "
+                            "turns earlier. Dense runs = no plan, burning the 50-move clock."),
+ "anomaly_score": ("DERIVED", "Sum of MAD-scaled robust z-scores over quality, effort, time, instability, "
+                              "latency, closeness, misordering, override and divergence, +3 for a shuffle. "
+                              "Distance from THIS RUN's typical behaviour — not absolute severity."),
+ "_pk suffix":  ("DERIVED", "Event rate per 1000 nodes, e.g. futilityCutoffs_pk. Normalises a raw "
+                            "count so two engines with different node budgets are comparable."),
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+# Replay export
+#
+# Per-game, per-turn records in the order they were DECIDED, shaped for a
+# navigable client. Deliberately one file per game plus an index: a replay UI
+# loads one game at a time, and the per-turn `iterations` array is what a
+# debugger-style stepper needs (score and best move after each depth, so the
+# user can scrub the search as well as the game).
+#
+# `seq` is carried on every record so a future UI can cross-reference the raw
+# NDJSON (ordering snapshots, eval leaves) for the same decision without
+# re-deriving anything.
+# ══════════════════════════════════════════════════════════════════════════
+REPLAY_TURN_FIELDS = [
+    "t", "seq", "eng", "color", "stage", "fen", "best", "cp", "mate", "bestCp",
+    "secondCp", "margin", "qual", "bestRank", "rootN", "rootCaps", "depth",
+    "seldepth", "nodes", "qnodes", "ms", "firstSeenMs", "firstSeenDepth",
+    "rootChanges", "latency", "pv", "pvLen", "staticCp", "search_minus_static",
+    "ttHit", "ttCut", "ttAgeAvg", "ttDepthAvg", "ttFill", "fmc_rate",
+    "cap", "capSee", "promo", "bal", "phase", "wp_mover", "wp_loss",
+    "eval_drop", "is_mate", "shuffle",
+]
+
+
+def export_replay(turns, iters, instances, out):
+    """Write out/replay/index.json + out/replay/game-N.json."""
+    if turns.empty:
+        return []
+    rdir = out / "replay"
+    rdir.mkdir(parents=True, exist_ok=True)
+
+    engines = {}
+    if not instances.empty and "eng" in instances.columns:
+        for _, r in instances.drop_duplicates("eng").iterrows():
+            engines[r["eng"]] = {
+                k: (None if pd.isna(r.get(k)) else r.get(k))
+                for k in ("profile", "label", "configHash", "description", "tt")
+                if k in instances.columns
+            }
+
+    index = []
+    for game, sub in turns.groupby("game"):
+        sub = sub.sort_values("seq")
+        cols = [c for c in REPLAY_TURN_FIELDS if c in sub.columns]
+        records = json.loads(sub[cols].to_json(orient="records"))
+
+        # Attach the iteration trace so a replay UI can scrub the SEARCH too,
+        # not just the game.
+        if not iters.empty:
+            itg = iters[iters["game"] == game]
+            by_turn = {}
+            for (eng, t), isub in itg.groupby(["eng", "t"]):
+                by_turn[(eng, t)] = json.loads(
+                    isub.sort_values("d")[[c for c in ("d", "cp", "changed", "nodes",
+                                                       "qnodes", "ms", "seldepth")
+                                           if c in isub.columns]].to_json(orient="records"))
+            for rec in records:
+                rec["iterations"] = by_turn.get((rec.get("eng"), rec.get("t")), [])
+
+        payload = {
+            "game": int(game),
+            "engines": engines,
+            "turns": records,
+            "turnCount": len(records),
+        }
+        name = f"game-{int(game)}.json"
+        (rdir / name).write_text(json.dumps(payload), encoding="utf-8")
+        index.append({"game": int(game), "file": f"replay/{name}",
+                      "turns": len(records),
+                      "engines": sorted(sub["eng"].dropna().unique().tolist())})
+
+    (rdir / "index.json").write_text(
+        json.dumps({"games": index, "engines": engines}, indent=2), encoding="utf-8")
+    return index
 
 # ══════════════════════════════════════════════════════════════════════════
 # Loading
@@ -938,7 +1138,53 @@ def write_outputs(session, out, tidy, agg, figures, args):
             nt = note_for(name)
             if nt:
                 L += [f"*How to read:* {nt}", ""]
+    
+    L += ["## Glossary", "",
+        "Log keys are fields the engine writes; derived metrics are computed by "
+        "this script. Every derived entry states its formula — the numbers are "
+        "not interpretable without it.", "",
+        "| Key | Kind | Meaning |", "|---|---|---|"]
+    for k in sorted(GLOSSARY):
+        kind, text = GLOSSARY[k]
+        L.append(f"| `{k}` | {kind} | {text.replace('|', '/')} |")
+    L += ["",
+          "Mate scores (|cp| > %d) are excluded from every statistic and figure; see "
+          "`mate_summary`." % MATE_THRESHOLD, ""]
+
     (out / "report.md").write_text("\n".join(L), encoding="utf-8")
+    (out / "glossary.md").write_text(
+        "# Glossary\n\n| Key | Kind | Meaning |\n|---|---|---|\n" +
+        "\n".join(f"| `{k}` | {GLOSSARY[k][0]} | {GLOSSARY[k][1]}" for k in sorted(GLOSSARY)),
+        encoding="utf-8")
+
+def write_summary(session, out, turns, agg, args, replay_index):
+    """
+    Machine-readable run summary. tools/aggregate_runs.py consumes ONLY this,
+    so a cross-run comparison never has to re-parse report.md.
+    """
+    summary = {
+        "session": session.name,
+        "label": args.label or session.name,
+        "blunder_cp": args.blunder_cp,
+        "blunder_wp": args.blunder_wp,
+        "turns": int(len(turns)),
+        "games": int(turns["game"].nunique()) if not turns.empty else 0,
+        "engines": {},
+        "replay_games": len(replay_index),
+    }
+    prof = agg.get("engine_profiles")
+    mq = agg.get("move_quality_by_engine")
+    order = agg.get("ordering_by_engine")
+    stab = agg.get("search_stability")
+    engines = sorted(turns["eng"].dropna().unique()) if not turns.empty else []
+    for eng in engines:
+        rec = {}
+        for name, df in (("profile", prof), ("quality", mq),
+                         ("ordering", order), ("stability", stab)):
+            if isinstance(df, pd.DataFrame) and eng in df.index:
+                rec[name] = json.loads(df.loc[[eng]].to_json(orient="records"))[0]
+        summary["engines"][eng] = rec
+    (out / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -952,7 +1198,25 @@ def main():
     ap.add_argument("--min-bin", type=int, default=8)
     ap.add_argument("--top-anomalies", type=int, default=25)
     ap.add_argument("--max-games-plot", type=int, default=8)
+    ap.add_argument("--label", type=str, default=None,
+                    help="run label recorded in summary.json (used by aggregate_runs.py)")
+    ap.add_argument("--export-replay", action="store_true",
+                    help="write out/replay/{index,game-N}.json for client replay")
+    ap.add_argument("--no-figures", action="store_true",
+                    help="tables + report only; skips matplotlib entirely")
+    ap.add_argument("--glossary-only", action="store_true",
+                    help="write glossary.md and exit (no log parsing)")
     args = ap.parse_args()
+    
+    if args.glossary_only:
+        out = args.out or Path(".")
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "glossary.md").write_text(
+            "# Glossary\n\n| Key | Kind | Meaning |\n|---|---|---|\n" +
+            "\n".join(f"| `{k}` | {GLOSSARY[k][0]} | {GLOSSARY[k][1]}" for k in sorted(GLOSSARY)),
+            encoding="utf-8")
+        print(f"glossary: {out / 'glossary.md'}")
+        return 0
 
     session = args.path
     if not any(session.glob("game-*")):
@@ -969,8 +1233,11 @@ def main():
     heur  = logs.get("heuristics", pd.DataFrame())
 
     agg = aggregate(turns, iters, leaf, instances, args)
-    figs = make_figures(turns, iters, leaf, out / "figures", args)
-    figs += anomaly_figure(turns, agg.get("anomalies", pd.DataFrame()), out / "figures")
+
+    figs = []
+    if not args.no_figures:
+        figs = make_figures(turns, iters, leaf, out / "figures", args)
+        figs += anomaly_figure(turns, agg.get("anomalies", pd.DataFrame()), out / "figures")
 
     tidy = {"turns": turns, "iterations": iters, "eval_leaves": leaf,
             "heuristics": heur, "instances": instances,
@@ -979,8 +1246,13 @@ def main():
             "timing": logs.get("time", pd.DataFrame())}
 
     write_outputs(session, out, tidy, agg, figs, args)
+
+    replay_index = export_replay(turns, iters, instances, out) if args.export_replay else []
+    write_summary(session, out, turns, agg, args, replay_index)
+
     print(f"output  : {out}  ({len(figs)} figures, "
-          f"{sum(1 for v in agg.values() if isinstance(v, pd.DataFrame) and not v.empty)} tables)")
+          f"{sum(1 for v in agg.values() if isinstance(v, pd.DataFrame) and not v.empty)} tables"
+          f"{f', {len(replay_index)} replay games' if replay_index else ''})")
     return 0
 
 

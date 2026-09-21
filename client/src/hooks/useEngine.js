@@ -8,15 +8,13 @@ import { reportFailure } from '../utils/failure';
 // One client = one WebSocket = one engine instance on the server, with its own
 // config and transposition table. Single-engine pages call useEngine() and get
 // the default key; the Colosseum calls it twice with two instance names under
-// one session id. Connections are kept open across page navigation and closed
-// only by explicit reconnect() or by the browser on unload.
+// one session id.
 //
-// Each slot owns a SET of listeners. The EngineClient callbacks are installed
-// once, at slot creation, and fan out. Chaining onto the previous callback (the
-// old pattern) grew without bound under StrictMode's double-invoke and left
-// stale hooks wired to disposed clients.
+// `connected` is TRUE ONLY when the engine's UCI handshake has COMPLETED (see
+// EngineClient.handshakeComplete). Reporting socket-open — or even `uciok` —
+// as connected is what allowed a second client's render to interleave a
+// `ucinewgame` into the first client's handshake.
 // ═══════════════════════════════════════════════════════════════════════════
-
 const DEFAULT_SERVER_URL = 'ws://localhost:8080';
 const DEFAULT_IDENTITY = { session: 'default', instance: 'e0', profile: 'baseline' };
 
@@ -53,8 +51,6 @@ async function connectSlot(slot) {
     try {
       await slot.engine.connect();
       await slot.engine.initialize();
-      // isConnected() is the only authority: `connect()` resolves on socket
-      // open, but the engine is not usable until `uciok` has set `ready`.
       return slot.engine.isConnected();
     } catch (err) {
       reportFailure('useEngine.connectSlot', err);
@@ -76,19 +72,6 @@ function disposeSlot(url, identity) {
   pool.delete(key);
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Hook
-//
-// @param {string} serverUrl
-// @param {{session?:string, instance?:string, profile?:string}|null} identity
-//
-// `connected` is TRUE ONLY when the engine is UCI-ready (uciok received). It is
-// never derived from socket-open, because every method guard below uses
-// isConnected(); reporting socket-open as connected opened a window in which
-// callers saw `connected === true` and were then rejected with
-// "Engine not connected".
-// ═══════════════════════════════════════════════════════════════════════════
-
 export function useEngine(serverUrl = DEFAULT_SERVER_URL, identity = null) {
   const session  = identity && identity.session  ? identity.session  : DEFAULT_IDENTITY.session;
   const instance = identity && identity.instance ? identity.instance : DEFAULT_IDENTITY.instance;
@@ -100,7 +83,8 @@ export function useEngine(serverUrl = DEFAULT_SERVER_URL, identity = null) {
   const [thinking, setThinking] = useState(false);
   const [searchInfo, setSearchInfo] = useState(null);
   const [error, setError] = useState(null);
-  // Bumped by reconnect() to force the effect to re-bind to the new slot.
+  const [profiles, setProfiles] = useState([]);
+  const [options, setOptions] = useState(null);
   const [generation, setGeneration] = useState(0);
 
   // ── Refs ──
@@ -117,20 +101,18 @@ export function useEngine(serverUrl = DEFAULT_SERVER_URL, identity = null) {
   }, [instance]);
 
   // ── Standard UCI ──
-  const newGame = useCallback(async () => {
-    await requireEngine().newGame();
-  }, [requireEngine]);
+  const newGame = useCallback(async () => { await requireEngine().newGame(); }, [requireEngine]);
 
   const setPosition = useCallback(async (fen, moves = []) => {
     await requireEngine().setPosition(fen, moves);
   }, [requireEngine]);
 
-  const go = useCallback(async (options = {}) => {
+  const go = useCallback(async (opts = {}) => {
     const engine = requireEngine();
     setThinking(true);
     setSearchInfo(null);
     try {
-      const result = await engine.go(options);
+      const result = await engine.go(opts);
       if (!result || typeof result.move !== 'string') {
         throw new Error(`go returned no bestmove: ${JSON.stringify(result)}`);
       }
@@ -143,23 +125,19 @@ export function useEngine(serverUrl = DEFAULT_SERVER_URL, identity = null) {
   const stop = useCallback(() => {
     const engine = engineRef.current;
     if (engine !== null && engine.isConnected()) {
-      try { engine.stop(); }
-      catch (e) { reportFailure('useEngine.stop', e); }
+      try { engine.stop(); } catch (e) { reportFailure('useEngine.stop', e); }
     }
     setThinking(false);
   }, []);
 
-  const setOption = useCallback((name, value) => {
-    requireEngine().setOption(name, value);
-  }, [requireEngine]);
+  const setOption = useCallback((name, value) => { requireEngine().setOption(name, value); }, [requireEngine]);
 
   // ── Interactive extensions ──
-  const validateMove  = useCallback(async (move) => requireEngine().validateMove(move), [requireEngine]);
-  const getLegalMoves = useCallback(async (square = null) => requireEngine().getLegalMoves(square), [requireEngine]);
-  const makeMove      = useCallback(async (move) => requireEngine().makeMove(move), [requireEngine]);
+  const validateMove  = useCallback(async (m) => requireEngine().validateMove(m), [requireEngine]);
+  const getLegalMoves = useCallback(async (sq = null) => requireEngine().getLegalMoves(sq), [requireEngine]);
+  const makeMove      = useCallback(async (m) => requireEngine().makeMove(m), [requireEngine]);
   const undoMove      = useCallback(async () => requireEngine().undoMove(), [requireEngine]);
   const getGameState  = useCallback(async () => requireEngine().getGameState(), [requireEngine]);
-  const getProfiles   = useCallback(async () => requireEngine().getProfiles(), [requireEngine]);
 
   // ── Connection ──
   const reconnect = useCallback(async () => {
@@ -168,7 +146,7 @@ export function useEngine(serverUrl = DEFAULT_SERVER_URL, identity = null) {
       setConnected(false);
       setThinking(false);
       setError(null);
-      setGeneration(g => g + 1);   // re-runs the effect against a fresh slot
+      setGeneration(g => g + 1);
     }
   }, [serverUrl, ident]);
 
@@ -184,6 +162,10 @@ export function useEngine(serverUrl = DEFAULT_SERVER_URL, identity = null) {
       const live = slot.engine.isConnected();
       setConnected(live);
       if (!live) setThinking(false);
+      if (live) {
+        setProfiles(slot.engine.availableProfiles);
+        setOptions(slot.engine.availableOptions);
+      }
       return live;
     };
 
@@ -195,14 +177,13 @@ export function useEngine(serverUrl = DEFAULT_SERVER_URL, identity = null) {
       onConnectionChange: () => {
         const live = sync();
         if (!mountedRef.current) return;
-        // The socket closing is an error; the socket merely not being ready yet
-        // is not, so only report a loss once `ready` has been seen and dropped.
         if (live) setError(null);
         else if (slot.engine.ws === null || slot.engine.connected === false) {
           setError('Connection to engine lost');
         }
       },
     };
+
     slot.listeners.add(listener);
     sync();
 
@@ -221,18 +202,48 @@ export function useEngine(serverUrl = DEFAULT_SERVER_URL, identity = null) {
 
   // ── Return ──
   return useMemo(() => ({
-    connected, thinking, searchInfo, error,
+    connected, thinking, searchInfo, error, profiles, options,
     session, instance, profile,
     newGame, setPosition, go, stop, setOption,
-    validateMove, getLegalMoves, makeMove, undoMove, getGameState, getProfiles,
+    validateMove, getLegalMoves, makeMove, undoMove, getGameState,
     reconnect,
   }), [
-    connected, thinking, searchInfo, error,
+    connected, thinking, searchInfo, error, profiles, options,
     session, instance, profile,
     newGame, setPosition, go, stop, setOption,
-    validateMove, getLegalMoves, makeMove, undoMove, getGameState, getProfiles,
+    validateMove, getLegalMoves, makeMove, undoMove, getGameState,
     reconnect,
   ]);
+}
+
+/**
+ * Tear down EVERY pooled connection. The pool deliberately outlives page
+ * navigation, so it needs an explicit end-of-life hook: `pagehide` (the only
+ * event that fires reliably on mobile/back-forward cache) and `beforeunload`.
+ *
+ * Each disconnect rejects that client's pending slots, which unwinds any
+ * awaiting move loop instead of leaving it parked until the server notices.
+ */
+export function disposeAllEngines(reason = 'page teardown') {
+  for (const [key, slot] of pool) {
+    try { slot.engine.disconnect(); }
+    catch (e) { reportFailure(`useEngine.disposeAllEngines(${key})`, e); }
+    slot.listeners.clear();
+    pool.delete(key);
+  }
+  if (typeof console !== 'undefined') console.log(`[useEngine] pool disposed: ${reason}`);
+}
+
+if (typeof window !== 'undefined') {
+  const teardown = () => disposeAllEngines('pagehide/beforeunload');
+  window.addEventListener('pagehide', teardown);
+  window.addEventListener('beforeunload', teardown);
+  // CRA hot-reload replaces this module without reloading the page; without
+  // this, every edit leaked a socket and the engine accumulated orphan
+  // instances in instances.ndjson.
+  if (typeof module !== 'undefined' && module.hot) {
+    module.hot.dispose(() => disposeAllEngines('hot reload'));
+  }
 }
 
 export default useEngine;

@@ -36,6 +36,25 @@ const FUTILITY_MARGIN = [0, 150, 300, 450];
 const ASPIRATION_WINDOW = 50;
 const ASPIRATION_MIN_DEPTH = 5;
 const ASPIRATION_MAX_ATTEMPTS = 5;
+/**
+ * Nodes between wall-clock polls. Date.now() is ~20-40ns, so polling every
+ * node would be measurable; every 2048 nodes bounds overshoot to well under a
+ * millisecond of search at any realistic nps while costing nothing.
+ */
+const NODE_CHECK_INTERVAL = 2048;
+/**
+ * Hard cap on check-extension plies beyond the nominal iteration depth.
+ *
+ * A check extension keeps `full = depth - 1 + 1 = depth`, i.e. the depth does
+ * NOT decrease. Without a cap, a perpetual-checking endgame turns a nominal
+ * depth-1 iteration into a full-width search of the entire checking graph,
+ * bounded only by the 50-move clock. Past the cap we refuse to extend, the
+ * child drops to depth 0, and quiescence — which already generates every
+ * evasion when in check, under its own bounded horizon — resolves the line.
+ */
+const MAX_CHECK_EXTENSION_PLIES = 16;
+/** Nodes between `search-heartbeat` records. Makes a stall visible in logs. */
+const HEARTBEAT_NODES = 1 << 21;
 const PROMO_SUFFIX = ['', 'q', 'r', 'b', 'n'];
 const SIDE_FLIP_KEY = SIDE_KEYS[0] ^ SIDE_KEYS[1];
 const EP_NONE_KEY = EN_PASSANT_KEYS[16];
@@ -175,6 +194,17 @@ export class SearchEngine {
     this._rootBias = null;
     this._collector = null; this._bookHints = null; this._bookPick = null; this._stageInfo = null;
     this._pvKeys = [];
+    // ── Deadline enforcement ──
+    // `maxSearchTime` is a HARD ceiling, polled inside the tree. The old
+    // inter-iteration prediction (`_outOfTime`) is kept as the cheap first
+    // line of defence, but it cannot bound an iteration already in progress.
+    this._deadline = 0;
+    this._nextClockCheck = 0;
+    this._nextHeartbeat = 0;
+    this._currentDepth = 0;
+    this._maxExtPly = 0;
+    this._abortedMs = 0;
+    this._abortReason = null;
 
     // ── Instrumentation ──
     this._completedDepth = 0;
@@ -207,6 +237,13 @@ export class SearchEngine {
     this._rootScores.length = 0;
     this._rootMoveExact = false;
     this._bookPick = null;
+    this._deadline = 0;
+    this._nextClockCheck = NODE_CHECK_INTERVAL;
+    this._nextHeartbeat = HEARTBEAT_NODES;
+    this._currentDepth = 0;
+    this._maxExtPly = MAX_CHECK_EXTENSION_PLIES;
+    this._abortedMs = 0;
+    this._abortReason = null;
 
     this._completedDepth = 0;
     this._iterBest = null;
@@ -294,6 +331,9 @@ export class SearchEngine {
   _prepare(board, maxDepth, collector, bookHints, rootBias) {
     this.resetSearchState();
     this.searchStartTime = Date.now();
+    this._deadline = this.searchStartTime + this.config.maxSearchTime;
+    this._nextClockCheck = NODE_CHECK_INTERVAL;
+    this._nextHeartbeat = HEARTBEAT_NODES;
     this.searchColor = board.gameState.activeColor;
     this._collector = collector;
     this._bookHints = bookHints;
@@ -325,12 +365,15 @@ export class SearchEngine {
 
   _iterativeDeepening(board, depth, collector) {
     let score = 0, lastIterMs = 0;
-
     for (let d = 1; d <= depth; d++) {
       if (this.stopSearch) break;
       if (d > 1 && this._outOfTime(lastIterMs)) break;
-
+      this._currentDepth = d;
+      // Extensions are budgeted RELATIVE to the nominal depth, so a depth-1
+      // iteration cannot quietly become a 60-ply check hunt.
+      this._maxExtPly = d + MAX_CHECK_EXTENSION_PLIES;
       const t0 = Date.now();
+
       if (collector !== null) collector.onIterationStart(d);
 
       const iterScore = this._searchIteration(board, d, score);
@@ -432,6 +475,14 @@ export class SearchEngine {
     }
 
     const totalTime = Date.now() - this.searchStartTime;
+    if (this._abortReason !== null && __LOG__ && LOG.time) {
+      logger.event(CAT.TIME, 'search-aborted', {
+        reason: this._abortReason, ms: totalTime,
+        budgetMs: this.config.maxSearchTime,
+        completedDepth: this._completedDepth,
+        haveMove: bestMove !== null ? 1 : 0,
+      });
+    }
     this._logTurnSummary(board, bestMove, bestScore, totalTime);
 
     const stageInfo = this._stageInfo;
@@ -473,6 +524,8 @@ export class SearchEngine {
       depth: this._completedDepth, seldepth: this.maxDepthReached,
       nodes: this.nodes, qnodes: this.qNodes, ms,
       firstSeenMs: this._firstSeenMs, firstSeenDepth: this._firstSeenDepth,
+      aborted: this._abortReason,
+      abortMs: this._abortReason !== null ? this._abortedMs : null,
       rootChanges: this._rootChanges,
       pv: this.pv.map(m => m.algebraic).join(' '), pvLen: this.pv.length,
       staticCp: this._staticRoot,
@@ -513,6 +566,45 @@ export class SearchEngine {
     }
   }
 
+    // ═══════════════════════════════════════════════════════════════════════
+  // Deadline
+  // ═══════════════════════════════════════════════════════════════════════
+  /**
+   * Polled from alphaBeta every NODE_CHECK_INTERVAL nodes. This is the ONLY
+   * thing that makes `maxSearchTime` a ceiling rather than a hint: the search
+   * is synchronous, so until it returns, nothing else in the process runs —
+   * not the next iteration's prediction, not the WebSocket, not SIGINT.
+   */
+  _pollClock() {
+    this._nextClockCheck = this.nodes + NODE_CHECK_INTERVAL;
+    const now = Date.now();
+
+    if (__LOG__ && LOG.time && this.nodes >= this._nextHeartbeat) {
+      this._nextHeartbeat = this.nodes + HEARTBEAT_NODES;
+      // A turn that stalls now leaves a trail: heartbeats with a climbing
+      // node count and a static depth identify the runaway iteration, and
+      // `seldepth` identifies an extension runaway specifically.
+      logger.event(CAT.TIME, 'search-heartbeat', {
+        d: this._currentDepth, nodes: this.nodes, qnodes: this.qNodes,
+        seldepth: this.maxDepthReached, ms: now - this.searchStartTime,
+        budgetMs: this.config.maxSearchTime, maxExtPly: this._maxExtPly,
+      });
+    }
+
+    if (now >= this._deadline) {
+      this.stopSearch = true;
+      this._abortedMs = now - this.searchStartTime;
+      this._abortReason = 'deadline';
+      if (__LOG__ && LOG.time) {
+        logger.event(CAT.TIME, 'deadline-abort', {
+          d: this._currentDepth, ms: this._abortedMs,
+          budgetMs: this.config.maxSearchTime,
+          nodes: this.nodes, qnodes: this.qNodes, seldepth: this.maxDepthReached,
+        });
+      }
+    }
+  }
+
   // ═══════════════════════════════════════════════════════════════════════
   // Root move policy
   // ═══════════════════════════════════════════════════════════════════════
@@ -529,6 +621,10 @@ export class SearchEngine {
    * scores are exact and comparable.
    */
   _verifyRootCandidates(board) {
+    // An aborted search must not re-score anything: alphaBeta returns 0
+    // immediately while stopped, which would silently rewrite a good root
+    // score as "draw".
+    if (this.stopSearch) return;
     const scores = this._rootScores;
     if (scores.length === 0) return;
 
@@ -649,6 +745,7 @@ export class SearchEngine {
   alphaBeta(board, depth, alpha, beta, color, ply, lastMove) {
     this.nodes++;
     if (ply > this.maxDepthReached) this.maxDepthReached = ply;
+    if (this.nodes >= this._nextClockCheck) this._pollClock();
     if (this.stopSearch) return 0;
 
     const c = this._collector;
@@ -680,7 +777,8 @@ export class SearchEngine {
         return quiescenceSearch(board, alpha, beta, color, this.evaluator,
                                 ply, 0, this.config.quiescenceDepth,
                                 lastMove !== null && lastMove.capturedPiece !== null
-                                  ? lastMove.toSquare : -1);
+                                  ? lastMove.toSquare : -1,
+                                this);
       }
       return this.evaluator.evaluate(board, color).score;
     }
@@ -728,7 +826,12 @@ export class SearchEngine {
     if (isRoot) this._orderRoot(board, color, moves, c);
 
     // ── Move loop ──────────────────────────────────────────────────────
-    const extension = inCheck ? 1 : 0;
+    // Check extension, BUDGETED. `full = depth - 1 + 1 = depth` when we
+    // extend, i.e. the depth does not decrease — so this must be bounded or a
+    // perpetual-checking position searches forever at a constant depth. Past
+    // the budget the child drops to depth 0 and quiescence resolves the
+    // checks under its own bounded horizon.
+    const extension = (inCheck && ply < this._maxExtPly) ? 1 : 0;
     const wantTrueRootScores = isRoot && c !== null;
     let bestMove = null, bestScore = -SCORE.INFINITY;
     let searched = 0;
@@ -793,7 +896,16 @@ export class SearchEngine {
 
       board.undoMove();
       searched++;
-      if (this.stopSearch) return 0;
+      if (this.stopSearch) {
+        // Salvage: if this is the FIRST iteration (no completed snapshot yet)
+        // we must still hand `go` something legal, or an aborted depth-1
+        // search answers `bestmove (none)`.
+        if (isRoot && bestMove !== null && this._rootScores.length === 0) {
+          this._rootBestMove = bestMove;
+          this._snapshotRootScores();
+        }
+        return 0;
+      }
 
       // ── Root bookkeeping ──
       if (isRoot) {

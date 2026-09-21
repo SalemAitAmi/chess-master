@@ -1,0 +1,16 @@
+{
+  "label": "draw-policy",
+  "rounds": 8,
+  "depth": 6,
+  "arms": [
+    { "name": "control",     "a": { "profile": "baseline" }, "b": { "profile": "baseline" } },
+    { "name": "contempt-0",  "a": { "profile": "baseline", "options": {
+                                      "Contempt": 0, "NeutralContempt": 0,
+                                      "RepetitionContempt": 0, "RepetitionMargin": 0 } },
+                             "b": { "profile": "baseline" } },
+    { "name": "contempt-hi", "a": { "profile": "baseline", "options": {
+                                      "Contempt": 120, "NeutralContempt": 60,
+                                      "RepetitionContempt": 80, "RepetitionMargin": 200 } },
+                             "b": { "profile": "baseline" } }
+  ]
+}

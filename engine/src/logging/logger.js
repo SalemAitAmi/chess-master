@@ -34,8 +34,30 @@
  * _finish). Every line emitted anywhere in the tree is attributed to the turn
  * the search is deciding.
  *
- * GAME ROTATION is owned by EngineSession, not by UCIHandler: with two engine
- * instances, `ucinewgame` arrives twice per game.
+ *
+ * ── GAME BOUNDARIES ──────────────────────────────────────────────────────
+ * A game directory is created LAZILY, on the first search of the game.
+ *
+ *   EngineSession.noteNewGame()  → logger.armGame()
+ *       every registered instance has issued `ucinewgame`; the NEXT game is
+ *       armed. Current game streams are closed, so everything emitted from
+ *       here on goes to boot/ (= "out of game").
+ *
+ *   UCIHandler.handleCommand('go') → logger.beginGameIfArmed()
+ *       the armed game becomes real: game-N/ is created, `seq` restarts at 1.
+ *
+ * Rotating ON the barrier (the previous design) split it: the instance whose
+ * `ucinewgame` completed the barrier had its `isready` — and the client's
+ * follow-up `gamestate` — land as seq 1-2 of the new game, and a barrier whose
+ * game was never played left behind a directory containing nothing but that
+ * tail. Arming is idempotent and costs nothing when the game never starts.
+ *
+ * Every record carries `g`: the game index, or 0 when out of game. boot/ holds
+ * g=0 records only; game-N/ holds g=N records only. `seq` is per-game and
+ * restarts at 1; out-of-game records use a separate session-wide counter
+ * (`bootSeq`), which therefore keeps climbing across the whole session — that
+ * is intentional, and `g` is what separates the phases.
+ *
  *
  * INVARIANT: no filesystem access until a line is actually emitted, and no line
  * is reachable while the category bit is clear.
@@ -107,6 +129,7 @@ class FileLogger {
     this.gameRecords = 0;
     this.seq = 0;
     this.bootSeq = 0;
+    this.pendingGame = 0;     // armed-but-not-started game index (0 = none)
 
     this.streams = Object.create(null);   // relPath -> WriteStream
     this.counters = Object.create(null);
@@ -182,6 +205,7 @@ class FileLogger {
     this.sessionDir = null;
     this.gameDir = null;
     this.gameIndex = 0;
+    this.pendingGame = 0;
     this.gameRecords = 0;
   }
 
@@ -189,7 +213,8 @@ class FileLogger {
   _emit(cat, label, fields) {
     const inGame = this.gameDir !== null;
     const seq = inGame ? ++this.seq : ++this.bootSeq;
-    let line = `{"seq":${seq},"t":${this.turn},"eng":${JSON.stringify(this.ctx.eng)},` +
+    let line = `{"seq":${seq},"g":${inGame ? this.gameIndex : 0},"t":${this.turn},` +
+               `"eng":${JSON.stringify(this.ctx.eng)},` +
                `${JSON.stringify(labelKeyFor(cat))}:${JSON.stringify(label)}`;
     if (fields) for (const k in fields) line += `,${JSON.stringify(k)}:${field(fields[k])}`;
     line += '}\n';
@@ -197,6 +222,46 @@ class FileLogger {
     if (inGame) this.gameRecords++;
     this.stats.written++;
   }
+
+  /**
+   * Arm the next game. Called ONLY by EngineSession, once every registered
+   * instance has issued `ucinewgame`. Closes the current game's streams, so
+   * the remainder of the reset barrier is attributed to boot/ (out of game)
+   * rather than to either the old or the new game.
+   *
+   * Idempotent: re-arming an already-armed game is a no-op.
+   */
+  armGame() {
+    if (this.mask === 0) return this.gameIndex + 1;
+    if (this.pendingGame !== 0) return this.pendingGame;
+    this._closeGameStreams();
+    this.pendingGame = this.gameIndex + 1;
+    this.event(CAT.SYSTEM, 'game-armed', { game: this.pendingGame });
+    this.write(`[GAME] game-${this.pendingGame} armed`);
+    return this.pendingGame;
+  }
+
+  /**
+   * Materialise the armed game. Called by UCIHandler on `go`, i.e. at the
+   * first decision of the game — so an armed game that is never played leaves
+   * no directory behind.
+   */
+  beginGameIfArmed() {
+    if (this.mask === 0 || this.pendingGame === 0) return this.gameIndex;
+    this.gameIndex = this.pendingGame;
+    this.pendingGame = 0;
+    this.gameDir = path.join(this._session(), `game-${this.gameIndex}`);
+    fs.mkdirSync(this.gameDir, { recursive: true });
+    this.gameRecords = 0;
+    this.seq = 0;
+    this.counters = Object.create(null);
+    this.write(`[GAME] game-${this.gameIndex} begin`);
+    this.event(CAT.SYSTEM, 'game-begin', { game: this.gameIndex });
+    return this.gameIndex;
+  }
+
+  /** Back-compat alias. Arming is the only externally meaningful operation. */
+  startGame() { return this.armGame(); }
 
   event(cat, label, fields) {
     if ((this.mask & CAT_BIT[cat]) === 0) return;
@@ -230,29 +295,12 @@ class FileLogger {
     this.write(`[SESSION] start`);
   }
 
-  /**
-   * Rotate into a fresh game directory. Called ONLY by EngineSession, which
-   * waits until every registered instance has issued `ucinewgame`. A rotation
-   * into an already-empty game directory is a no-op, so a late-joining or
-   * double-resetting instance cannot split one game across two directories.
-   */
-  startGame() {
-    if (this.mask === 0) return 0;
-    if (this.gameDir !== null && this.gameRecords === 0) return this.gameIndex;
-    this._closeGameStreams();
-    this.gameIndex++;
-    this.gameDir = path.join(this._session(), `game-${this.gameIndex}`);
-    fs.mkdirSync(this.gameDir, { recursive: true });
-    this.gameRecords = 0;
-    this.seq = 0;
-    this.counters = Object.create(null);
-    this.write(`[GAME] game-${this.gameIndex}`);
-    return this.gameIndex;
-  }
+  
 
   getStats() {
     return { ...this.stats, session: this.sessionDir, game: this.gameDir,
-             gameIndex: this.gameIndex, seq: this.seq, mask: this.mask };
+             gameIndex: this.gameIndex, pendingGame: this.pendingGame,
+             seq: this.seq, bootSeq: this.bootSeq, mask: this.mask };
   }
 
   _flushAll() { for (const k in this.streams) { const s = this.streams[k]; if (!s.destroyed) s.write(''); } }
@@ -278,6 +326,7 @@ class NoopLogger {
   get turn() { return -1; }
   event() {} trace() {} write() {} sessionRecord() {}
   startSession() {} startGame() { return 0; }
+  armGame() { return 0; } beginGameIfArmed() { return 0; }
   getStats() { return { written: 0, dropped: 0, mask: 0 }; }
   async flush() {} flushSync() {} close() {} clear() {}
 }

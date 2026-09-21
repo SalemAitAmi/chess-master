@@ -1,0 +1,20 @@
+{
+  "label": "weight-sweep",
+  "rounds": 4,
+  "depth": 6,
+  "arms": [
+    { "name": "control",  "a": { "profile": "baseline" }, "b": { "profile": "baseline" } },
+    { "name": "pawns-140","a": { "profile": "baseline", "options": { "WeightPawnStructure": 140 } },
+                          "b": { "profile": "baseline" } },
+    { "name": "center-140","a": { "profile": "baseline", "options": { "WeightCenterControl": 140 } },
+                          "b": { "profile": "baseline" } },
+    { "name": "devel-150","a": { "profile": "baseline", "options": { "WeightDevelopment": 150 } },
+                          "b": { "profile": "baseline" } },
+    { "name": "push-200", "a": { "profile": "baseline", "options": { "WeightPawnPush": 200 } },
+                          "b": { "profile": "baseline" } },
+    { "name": "struct-mix","a": { "profile": "baseline", "options": {
+                                    "WeightPawnStructure": 140, "WeightCenterControl": 120,
+                                    "WeightInitiative": 60 } },
+                          "b": { "profile": "baseline" } }
+  ]
+}

@@ -157,7 +157,16 @@ function logOutbound(response) {
 }
 
 function installShutdownHandlers(wss) {
+  let shuttingDown = false;
   const shutdown = async (signal) => {
+    if (shuttingDown) {
+      // Second signal: the first one is blocked behind something synchronous
+      // (a search that overran its deadline). Do not wait for a clean flush.
+      _stderr(`${signal} again — forcing exit`);
+      logger.flushSync();
+      process.exit(130);
+    }
+    shuttingDown = true;
     _stdout(`\n${signal} received, shutting down...`);
     logger.bind(null);
     logger.write(`${signal} — shutting down`);

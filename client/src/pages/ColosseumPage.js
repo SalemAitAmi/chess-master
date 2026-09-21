@@ -10,6 +10,9 @@ import CapturedPieces from "../components/CapturedPieces";
 import { DIFFICULTY_NAMES, DIFFICULTY_DEPTHS, TIMEOUTS } from "../constants/gameConstants";
 import { lastMoveToCoords } from "../utils/chessUtils";
 import { reportFailure } from "../utils/failure";
+import { loadSettings } from "../components/SettingsModal";
+import { pushSettings } from "../utils/engineConfig";
+
 
 const BTN = 'px-6 py-3 rounded-lg text-lg font-semibold transition-all';
 const PANEL = 'bg-gray-800 rounded-lg p-4 shadow-lg w-64';
@@ -24,11 +27,15 @@ const NO_ROUND_RECORDED = -1;
 // a profile stays bound to one table and one log `eng` id for the whole match.
 // ═══════════════════════════════════════════════════════════════════════════
 
+// Two engine INSTANCES, "A" and "B", each on its own WebSocket with its own
+// profile, config and transposition table. Colours alternate each round by
+// deciding which instance plays white — the instances never change config, so
+// a profile stays bound to one table and one log `eng` id for the whole match.
 function aPlaysWhite(round) { return round % 2 === 0; }
 
 function botsForRound(config, round) {
-  const A = { depth: config.whiteBot, profile: config.whiteProfile || 'baseline', id: 'A' };
-  const B = { depth: config.blackBot, profile: config.blackProfile || 'baseline', id: 'B' };
+  const A = { depth: config.botA ?? 3, profile: config.profileA || 'baseline', id: 'A' };
+  const B = { depth: config.botB ?? 3, profile: config.profileB || 'baseline', id: 'B' };
   return aPlaysWhite(round) ? { white: A, black: B } : { white: B, black: A };
 }
 
@@ -52,8 +59,8 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
   const sessionIdRef = useRef(`colosseum-${Date.now().toString(36)}`);
   const sessionId = sessionIdRef.current;
 
-  const engineA = useEngine(undefined, { session: sessionId, instance: 'A', profile: config.whiteProfile || 'baseline' });
-  const engineB = useEngine(undefined, { session: sessionId, instance: 'B', profile: config.blackProfile || 'baseline' });
+  const engineA = useEngine(undefined, { session: sessionId, instance: 'A', profile: config.profileA || 'baseline' });
+  const engineB = useEngine(undefined, { session: sessionId, instance: 'B', profile: config.profileB || 'baseline' });
 
   // The session hook owns the displayed board via engine A. Engine B is the
   // shadow: every move is mirrored to it so both boards stay identical and
@@ -214,6 +221,18 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
     shadowInitRef.current = true;
     resetShadow().then(ok => { if (!ok) shadowInitRef.current = false; });
   }, [engineB.connected, resetShadow]);
+
+  // App pushes persisted settings to the DEFAULT socket only; these two are
+  // separate connections and would otherwise run pure profile defaults.
+  // Gated on a local setting so profile-vs-profile comparisons can be run
+  // without the settings modal silently overriding both profiles.
+  useEffect(() => {
+    if (!engineA.connected || !engineB.connected) return;
+    const s = loadSettings();
+    if (!s.applyOverridesToColosseum) return;
+    pushSettings(engineA, s);
+    pushSettings(engineB, s);
+  }, [engineA.connected, engineB.connected]);   // eslint-disable-line react-hooks/exhaustive-deps
 
   // Move loop. One chain per activation; loopIdRef invalidates stale chains.
   useEffect(() => {

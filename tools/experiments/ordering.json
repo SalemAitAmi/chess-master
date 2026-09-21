@@ -1,0 +1,18 @@
+{
+  "label": "ordering",
+  "rounds": 6,
+  "depth": 7,
+  "arms": [
+    { "name": "control",     "a": { "profile": "baseline" }, "b": { "profile": "baseline" } },
+    { "name": "no-killers",  "a": { "profile": "baseline", "options": { "UseKillerMoves": false } },
+                             "b": { "profile": "baseline" } },
+    { "name": "no-history",  "a": { "profile": "baseline", "options": { "UseHistoryHeuristic": false } },
+                             "b": { "profile": "baseline" } },
+    { "name": "no-softpin",  "a": { "profile": "baseline", "options": { "UseSoftPinOrdering": false } },
+                             "b": { "profile": "baseline" } },
+    { "name": "no-book",     "a": { "profile": "baseline", "options": { "OwnBook": false } },
+                             "b": { "profile": "baseline" } },
+    { "name": "no-openprin", "a": { "profile": "baseline", "options": { "UseOpeningPrinciples": false } },
+                             "b": { "profile": "baseline" } }
+  ]
+}

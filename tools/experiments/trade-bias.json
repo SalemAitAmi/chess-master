@@ -1,0 +1,16 @@
+{
+  "label": "trade-bias",
+  "rounds": 6,
+  "depth": 6,
+  "arms": [
+    { "name": "control",   "a": { "profile": "baseline" }, "b": { "profile": "baseline" } },
+    { "name": "init-off",  "a": { "profile": "baseline", "options": { "UseInitiative": false } },
+                           "b": { "profile": "baseline" } },
+    { "name": "init-140",  "a": { "profile": "baseline", "options": { "WeightInitiative": 140 } },
+                           "b": { "profile": "baseline" } },
+    { "name": "init-60",   "a": { "profile": "baseline", "options": { "WeightInitiative": 60 } },
+                           "b": { "profile": "baseline" } },
+    { "name": "ks-130",    "a": { "profile": "baseline", "options": { "WeightKingSafety": 130 } },
+                           "b": { "profile": "baseline" } }
+  ]
+}

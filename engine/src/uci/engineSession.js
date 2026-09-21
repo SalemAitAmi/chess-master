@@ -74,14 +74,19 @@ export class EngineSession {
     if (this.instances.size === 0) dropSession(this.id);
   }
 
-  /** Called by UCIHandler on `ucinewgame`. Rotates once all instances reset. */
+  /**
+   * Called by UCIHandler on `ucinewgame`. ARMS the next game once every
+   * instance has reset; the directory is created by the first `go` (see
+   * logger.armGame / beginGameIfArmed). Arming rather than rotating is what
+   * keeps the reset barrier itself out of both games.
+   */
   noteNewGame(name) {
     this.pendingReset.add(name);
     const keys = [...this.instances.keys()];
     const all = keys.length > 0 && keys.every(n => this.pendingReset.has(n));
     if (!all) return this.gameNumber;
     this.pendingReset.clear();
-    this.gameNumber = __LOG__ ? logger.startGame() : this.gameNumber + 1;
+    this.gameNumber = __LOG__ ? logger.armGame() : this.gameNumber + 1;
     return this.gameNumber;
   }
 
