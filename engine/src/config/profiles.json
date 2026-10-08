@@ -1,0 +1,30 @@
+{
+  "baseline": {
+    "label": "Baseline",
+    "description": "Option defaults (src/config/options.js)",
+    "set": {}
+  },
+  "tactical": {
+    "label": "Tactical",
+    "description": "Wide quiescence, low pruning, high initiative. Tests whether trade aversion is search-driven.",
+    "set": { "QuiescenceDepth": 10, "UseFutilityPruning": false, "UseSEEPruning": false,
+             "WeightInitiative": 125, "WeightKingSafety": 90, "NeutralContempt": 35 }
+  },
+  "positional": {
+    "label": "Positional",
+    "description": "Structure-weighted, queen-shy. Reference point for the trade experiments.",
+    "set": { "WeightPawnStructure": 140, "WeightCenterControl": 120, "WeightInitiative": 60,
+             "NeutralContempt": 15 }
+  },
+  "liquidator": {
+    "label": "Liquidator",
+    "description": "Control: initiative off, king safety high. Should reproduce the original trade-everything behaviour.",
+    "set": { "UseInitiative": false, "WeightKingSafety": 130, "NeutralContempt": 5 }
+  },
+  "greedy": {
+    "label": "Greedy",
+    "description": "Material-only ablation. Isolates how much of move choice the positional terms actually own.",
+    "set": { "UseCenterControl": false, "UseDevelopment": false, "UsePawnStructure": false,
+             "UseKingSafety": false, "UseInitiative": false }
+  }
+}

@@ -20,7 +20,7 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { INITIAL_GAME_STATE, TIMEOUTS } from '../constants/gameConstants';
 import { reportFailure } from '../utils/failure';
 
-export function useGameSession(engineOrEngines) {
+export function useGameSession(engineOrEngines, options = {}) {
   // ── Hooks: state ──
   const [gameState, setGameState] = useState(INITIAL_GAME_STATE);
   const [moveHistory, setMoveHistory] = useState([]);
@@ -32,6 +32,9 @@ export function useGameSession(engineOrEngines) {
   const mountedRef = useRef(true);
   const initStartedRef = useRef(false);
   const enginesRef = useRef([]);
+  const startFenRef = useRef('');
+
+  startFenRef.current = (options.startFen || '').trim();
 
   // Updated on every render; read (never closed over) by the callbacks below.
   enginesRef.current = Array.isArray(engineOrEngines) ? engineOrEngines : [engineOrEngines];
@@ -80,7 +83,15 @@ export function useGameSession(engineOrEngines) {
 
       // Reset every instance. The server rotates the log game directory only
       // once all of them have reset.
-      for (const e of engines) await e.newGame();
+      const fen = startFenRef.current;
+      if (fen !== '') {
+        const v = await engines[0].validateFen(fen);
+        if (!v || !v.valid) throw new Error(`invalid start FEN (${v ? v.reason : 'no response'}): ${fen}`);
+      }
+      for (const e of engines) {
+        await e.newGame();
+        if (fen !== '') await e.setPosition(fen);
+      }
 
       const state = await engines[0].getGameState();
       if (!state || typeof state.fen !== 'string') {
@@ -139,7 +150,7 @@ export function useGameSession(engineOrEngines) {
     initialized, busy, setBusy, sessionError,
     startNewGame, retryInit,
     applyEngineState, rollbackHistory, resign,
-    mountedRef,
+    mountedRef, startFen: startFenRef.current,
   };
 }
 

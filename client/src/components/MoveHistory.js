@@ -1,6 +1,6 @@
 import React, { useEffect, useRef } from 'react';
 
-const MoveHistory = ({ history }) => {
+const MoveHistory = ({ history, startFen = '' }) => {
   const scrollRef = useRef(null);
 
   useEffect(() => {
@@ -9,10 +9,13 @@ const MoveHistory = ({ history }) => {
     }
   }, [history.length]);
 
+  const parts = startFen.trim().split(/\s+/);
+  const blackFirst = parts[1] === 'b';
+  let number = parseInt(parts[5], 10) || 1;
   const movePairs = [];
-  for (let i = 0; i < history.length; i += 2) {
-    movePairs.push({ number: Math.floor(i / 2) + 1, white: history[i], black: history[i + 1] || null });
-  }
+  let i = 0;
+  if (blackFirst && history.length > 0) { movePairs.push({ number: number++, white: '…', black: history[0] }); i = 1; }
+  for (; i < history.length; i += 2) movePairs.push({ number: number++, white: history[i], black: history[i + 1] || null });
 
   return (
     <div className="bg-gray-800 rounded-lg p-4 shadow-lg w-64">

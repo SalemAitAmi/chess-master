@@ -95,8 +95,9 @@ function onConnection(wss, ws, req) {
     if (!line) return;
 
     // ── Handshake: session <sessionId> <instanceName> [profile] ──
-    // Transport-level, deliberately outside UCI: it selects WHICH engine this
-    // socket talks to, like choosing which binary a GUI launches.
+    //   → session ok <sid> <name> <profile> <cfgHash>   (name may be suffixed;
+    //     an unknown profile falls back to baseline and is reported here)
+    //   → session error <reason>
     if (line.startsWith('session ')) {
       logger.bind(null);
       logger.write(`< ${line}`);
@@ -105,13 +106,12 @@ function onConnection(wss, ws, req) {
         if (session !== null && instance !== null) session.unregister(instance.name);
         session = getOrCreateSession(sid || `solo-${++soloCounter}`);
         instance = session.register(name || 'e0', profile || 'baseline');
-        ws.send(`info string session ${session.id} instance ${instance.name} ` +
-                `profile ${instance.profile.name} cfg ${instance.profile.hash} tt ${instance.ttId()}`);
+        ws.send(`session ok ${session.id} ${instance.name} ${instance.cfg.profile} ${instance.cfg.hash}`);
       } catch (err) {
         session = null;
         instance = null;
         _stderr('Session handshake failed:', err);
-        ws.send(`info string session error ${err.message}`);
+        ws.send(`session error ${err.message}`);
       }
       return;
     }

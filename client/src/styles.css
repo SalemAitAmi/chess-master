@@ -1,35 +1,32 @@
-.App {
-  font-family: sans-serif;
-  text-align: center;
-}
-
+.App { font-family: sans-serif; text-align: center; }
 /* ── Move-history scrollbar (visible only on overflow) ── */
-.move-history-scroll {
-  scrollbar-width: thin;                       /* Firefox */
-  scrollbar-color: #4b5563 transparent;        /* thumb / track */
-}
-.move-history-scroll::-webkit-scrollbar {
-  width: 6px;
-}
-.move-history-scroll::-webkit-scrollbar-track {
-  background: transparent;
-  border-radius: 9999px;
-}
+.move-history-scroll { scrollbar-width: thin; scrollbar-color: #4b5563 transparent; }
+.move-history-scroll::-webkit-scrollbar { width: 6px; }
+.move-history-scroll::-webkit-scrollbar-track { background: transparent; border-radius: 9999px; }
 .move-history-scroll::-webkit-scrollbar-thumb {
-  background-color: #4b5563;                   /* gray-600 – matches panel borders */
-  border-radius: 9999px;
-  border: 1px solid transparent;
-  background-clip: content-box;
+  background-color: #4b5563; border-radius: 9999px;
+  border: 1px solid transparent; background-clip: content-box;
 }
-.move-history-scroll::-webkit-scrollbar-thumb:hover {
-  background-color: #6b7280;                   /* gray-500 on hover */
+.move-history-scroll::-webkit-scrollbar-thumb:hover { background-color: #6b7280; }
+/*
+ * TWO animations, because there are two positioning models:
+ *
+ *   .animate-pop-centered  for overlays centred by `left/top: 50%` + translate
+ *                          (GameOverModal, PromotionModal). The keyframes OWN
+ *                          the centring translate, so fill-mode `both` is right.
+ *
+ *   .animate-modal-in      for panels in normal flow (SettingsModal). No
+ *                          translate, and no fill-mode: a retained transform on
+ *                          an in-flow element displaces it — which is exactly
+ *                          how the settings panel lost its top half.
+ */
+@keyframes pop-centered {
+  from { opacity: 0; transform: translate(-50%, -45%); }
+  to   { opacity: 1; transform: translate(-50%, -50%); }
 }
-
-/* Fade-in for modals */
-@keyframes fade-in {
-  from { opacity: 0; transform: translate(-50%, -50%) scale(0.95); }
-  to   { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+.animate-pop-centered { animation: pop-centered 0.25s ease-out both; }
+@keyframes modal-in {
+  from { opacity: 0; transform: scale(0.97); }
+  to   { opacity: 1; transform: none; }
 }
-.animate-fade-in {
-  animation: fade-in 0.2s ease-out;
-}
+.animate-modal-in { animation: modal-in 0.18s ease-out; }

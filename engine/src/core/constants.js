@@ -1,6 +1,9 @@
 /**
  * Core constants for the chess engine
  */
+/** @deprecated import from '../config/index.js'. Kept so existing tests resolve. */
+export { DEFAULT_CONFIG } from '../config/index.js';
+
 export const PIECES = { KING: 0, QUEEN: 1, ROOK: 2, BISHOP: 3, KNIGHT: 4, PAWN: 5, NONE: 6 };
 
 export const PIECE_CHARS = ['K', 'Q', 'R', 'B', 'N', 'P'];
@@ -19,47 +22,3 @@ export const CASTLING = {
 };
 
 export const SCORE = { INFINITY: 100000, MATE: 50000, MATE_THRESHOLD: 49000, DRAW: 0 };
-
-export const DEFAULT_CONFIG = {
-  maxDepth: 64,
-  // Evaluation terms
-  useMaterial: true,
-  useCenterControl: true,
-  useDevelopment: true,
-  usePawnStructure: true,
-  useKingSafety: true,
-  useInitiative: true,
-  // Search features
-  usePawnPush: true,
-  useQuiescence: true,
-  quiescenceDepth: 8,
-  useKillerMoves: true,
-  useHistoryHeuristic: true,
-  useTranspositionTable: true,
-  useNullMovePruning: true,
-  useLateMovereduction: true,
-  useFutilityPruning: true,
-  useSEEPruning: true,
-  useSoftPinOrdering: true,
-  useAspirationWindows: true,
-  usePVS: true,
-  useIID: true,
-  useOpeningBook: true,
-  useOpeningPrinciples: true,
-  weights: {
-    material: 1.0, centerControl: 1.0, development: 1.0,
-    pawnStructure: 1.0, kingSafety: 1.0, pawnPush: 1.0,
-  },
-  // Draw policy. Contempt bottoms out at 1cp at level material.
-  drawContemptMax: 50,
-  neutralContempt: 25,             // a draw at level material costs 25cp
-  repetitionMargin: 90,            // give up this much rather than repeat
-  repetitionContempt: 30,
-  // Hard wall-clock ceiling per search (ms). The iterative-deepening loop
-  // refuses to start a depth it predicts will exceed this.
-  maxSearchTime: 30000,
-  hashSizeMB: 64,
-  // Requested search threads. 1 = current single-threaded pipeline. Values >1
-  // are recorded by SmpCoordinator but do NOT yet route the search.
-  threads: 1,
-};

@@ -10,8 +10,9 @@ import CapturedPieces from "../components/CapturedPieces";
 import { DIFFICULTY_NAMES, DIFFICULTY_DEPTHS, TIMEOUTS } from "../constants/gameConstants";
 import { lastMoveToCoords } from "../utils/chessUtils";
 import { reportFailure } from "../utils/failure";
-import { loadSettings } from "../components/SettingsModal";
-import { pushSettings } from "../utils/engineConfig";
+import { getSettings } from "../config/settings";
+
+import MatchScore, { tallyMatch, matchVerdict } from "../components/MatchScore";
 
 
 const BTN = 'px-6 py-3 rounded-lg text-lg font-semibold transition-all';
@@ -48,6 +49,15 @@ function drawLabel(status) {
 
 function botLabel(bot) { return `${DIFFICULTY_NAMES[bot.depth]}/${bot.profile}`; }
 
+const ENGINE_ACCENT = { A: 'text-cyan-300', B: 'text-pink-300' };
+
+function engineName(id) { return `Engine ${id}`; }
+
+function botById(config, id) {
+  const r0 = botsForRound(config, 0);
+  return r0.white.id === id ? r0.white : r0.black;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 
 const ColosseumPage = ({ config, onBackToMenu }) => {
@@ -59,13 +69,14 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
   const sessionIdRef = useRef(`colosseum-${Date.now().toString(36)}`);
   const sessionId = sessionIdRef.current;
 
-  const engineA = useEngine(undefined, { session: sessionId, instance: 'A', profile: config.profileA || 'baseline' });
-  const engineB = useEngine(undefined, { session: sessionId, instance: 'B', profile: config.profileB || 'baseline' });
+  const engineA = useEngine(undefined, { session: sessionId, instance: 'A', profile: config.profileA || 'baseline', role: 'contestant' });
+  const engineB = useEngine(undefined, { session: sessionId, instance: 'B', profile: config.profileB || 'baseline', role: 'contestant' });
 
   // The session hook owns the displayed board via engine A. Engine B is the
   // shadow: every move is mirrored to it so both boards stay identical and
   // each keeps full history for threefold / 50-move detection.
-  const session = useGameSession(engineA);
+  const startFen = getSettings().client.startFen
+  const session = useGameSession(engineA, { startFen });
   const { gameState, moveHistory, initialized, applyEngineState, startNewGame, mountedRef } = session;
 
   const [currentRound, setCurrentRound] = useState(0);
@@ -99,9 +110,14 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
   const gameOver = gameState.status !== 'ongoing';
   const winner = (gameState.winner === 'none' || gameState.winner === 'draw') ? null : gameState.winner;
   const lastMove = lastMoveToCoords(gameState.lastmove);
-  const whiteWins = results.filter(r => r.winner === 'white').length;
-  const blackWins = results.filter(r => r.winner === 'black').length;
-  const draws = results.filter(r => r.winner === 'draw').length;
+  const winnerBot = winner ? (winner === 'white' ? bots.white : bots.black) : null;
+  const sides = ['A', 'B'].map(id => ({
+    id, name: engineName(id), short: id, detail: botLabel(botById(config, id)),
+    accent: ENGINE_ACCENT[id],
+    playing: (bots.white.id === id) ? 'white' : 'black',
+    connected: id === 'A' ? engineA.connected : engineB.connected,
+  }));
+  const tally = tallyMatch(results, sides);
   const matchComplete = !running && results.length >= config.maxRounds;
   const loopActive = initialized && shadowReady && running && !paused && !gameOver && moveError === null;
 
@@ -166,7 +182,7 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
       if (mountedRef.current) setMoveError(err.message || 'Shadow engine reset failed');
       return false;
     }
-  }, [engineB, mountedRef]);
+  }, [engineB, mountedRef, startFen]);
 
   const resetBoardForRound = useCallback(async () => {
     moveInProgressRef.current = false;
@@ -222,18 +238,6 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
     resetShadow().then(ok => { if (!ok) shadowInitRef.current = false; });
   }, [engineB.connected, resetShadow]);
 
-  // App pushes persisted settings to the DEFAULT socket only; these two are
-  // separate connections and would otherwise run pure profile defaults.
-  // Gated on a local setting so profile-vs-profile comparisons can be run
-  // without the settings modal silently overriding both profiles.
-  useEffect(() => {
-    if (!engineA.connected || !engineB.connected) return;
-    const s = loadSettings();
-    if (!s.applyOverridesToColosseum) return;
-    pushSettings(engineA, s);
-    pushSettings(engineB, s);
-  }, [engineA.connected, engineB.connected]);   // eslint-disable-line react-hooks/exhaustive-deps
-
   // Move loop. One chain per activation; loopIdRef invalidates stale chains.
   useEffect(() => {
     if (!loopActive) return;
@@ -258,12 +262,12 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
     recordedRoundRef.current = round;
 
     const rb = latestRef.current.bots;
+    const winnerColor = gameState.winner === 'white' || gameState.winner === 'black' ? gameState.winner : null;
     setResults(prev => [...prev, {
       round: round + 1,
-      winner: gameState.winner === 'none' ? 'draw' : gameState.winner,
-      status: gameState.status,
-      moves: latestRef.current.moveCount,
-      whiteBot: rb.white, blackBot: rb.black,
+      winnerId: winnerColor === 'white' ? rb.white.id : winnerColor === 'black' ? rb.black.id : null,
+      winnerColor, status: gameState.status, moves: latestRef.current.moveCount,
+      whiteId: rb.white.id, blackId: rb.black.id,
     }]);
 
     if (round + 1 >= config.maxRounds) {
@@ -292,7 +296,9 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
     </div>
   ) : gameOver && running ? (
     <div className="px-6 py-2 bg-gray-700 rounded-lg text-center">
-      <span className="text-xl font-bold text-white">{winner ? `${winner} wins!` : drawLabel(gameState.status)}</span>
+      <span className="text-xl font-bold text-white">
+        {winnerBot ? `${engineName(winnerBot.id)} wins! (${winner})` : drawLabel(gameState.status)}
+      </span>
       <span className="ml-4 text-gray-400">Next round...</span>
     </div>
   ) : running && !paused ? (
@@ -304,40 +310,20 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
   ) : null;
 
   const scoreCard = (
-    <div className={PANEL}>
-      <h3 className="text-lg font-bold text-white mb-4 border-b border-gray-600 pb-2">Match Score</h3>
-      <div className="grid grid-cols-3 gap-4 text-center mb-4">
-        <div><div className="text-2xl font-bold text-yellow-300">{whiteWins}</div><div className="text-xs text-gray-400">White</div></div>
-        <div><div className="text-2xl font-bold text-gray-400">{draws}</div><div className="text-xs text-gray-400">Draw</div></div>
-        <div><div className="text-2xl font-bold text-gray-300">{blackWins}</div><div className="text-xs text-gray-400">Black</div></div>
-      </div>
-      <div className="flex justify-between text-sm">
-        <span className="text-gray-400">Status:</span>
-        <span className={`font-bold ${running && !paused ? 'text-green-400' : 'text-gray-400'}`}>
-          {running ? (paused ? 'Paused' : 'Running') : 'Stopped'}
-        </span>
-      </div>
-      <div className="mt-3 text-xs text-gray-400 space-y-1">
-        <div>A: {botLabel(botsForRound(config, 0).white)} {engineA.connected ? '●' : '○'}</div>
-        <div>B: {botLabel(botsForRound(config, 0).black)} {engineB.connected ? '●' : '○'}</div>
-        <div className="font-mono text-gray-500">{sessionId}</div>
-      </div>
-      {results.length > 0 && (
-        <div className="mt-4 pt-4 border-t border-gray-600">
-          <h4 className="text-sm font-bold text-gray-300 mb-2">History</h4>
-          <div className="max-h-40 overflow-y-auto space-y-1 text-xs move-history-scroll">
-            {results.map((r, i) => (
-              <div key={i} className="flex justify-between text-gray-400">
-                <span>R{r.round} {r.whiteBot.id}v{r.blackBot.id}</span>
-                <span className={r.winner === 'white' ? 'text-yellow-300' : r.winner === 'black' ? 'text-gray-300' : 'text-gray-500'}>
-                  {r.winner === 'draw' ? `Draw (${r.status})` : r.winner} ({r.moves})
-                </span>
-              </div>
-            ))}
-          </div>
+    <MatchScore
+      sides={sides}
+      results={results}
+      status={
+        <div className="flex justify-between text-sm">
+          <span className="text-gray-400">Status:</span>
+          <span className={`font-bold ${running && !paused ? 'text-green-400' : 'text-gray-400'}`}>
+            {running ? (paused ? 'Paused' : 'Running') : 'Stopped'}
+          </span>
         </div>
-      )}
-    </div>
+      }
+    >
+      <div className="mt-2 text-xs font-mono text-gray-500 truncate">{sessionId}</div>
+    </MatchScore>
   );
 
   return (
@@ -385,18 +371,20 @@ const ColosseumPage = ({ config, onBackToMenu }) => {
             )}
           </>
         }
-        rightPanels={<MoveHistory history={moveHistory} />}
+        rightPanels={<MoveHistory history={moveHistory} startFen={startFen} />}
         footer={matchComplete ? (
           <div className="px-8 py-4 bg-purple-900 rounded-lg text-center">
             <h2 className="text-2xl font-bold text-white mb-2">Match Complete!</h2>
-            <div className="text-gray-300">Final: White {whiteWins} - {draws} - {blackWins} Black</div>
-            <div className="text-lg font-bold mt-2 text-purple-300">
-              {whiteWins > blackWins ? 'White Wins!' : blackWins > whiteWins ? 'Black Wins!' : 'Draw!'}
+            <div className="text-gray-300">
+              Final: Engine A {tally.A} – {tally.draws} – {tally.B} Engine B
             </div>
+            <div className="text-lg font-bold mt-2 text-purple-300">{matchVerdict(results, sides)}</div>
           </div>
         ) : null}
         overlays={
-          <GameOverModal gameOver={gameOver && !running} winner={winner} status={gameState.status} onRestart={handleRestart} />
+          <GameOverModal gameOver={gameOver && !running} winner={winner}
+            winnerName={winnerBot ? engineName(winnerBot.id) : null}
+            status={gameState.status} onRestart={handleRestart} />
         }
       />
     </EngineGate>

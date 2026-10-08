@@ -16,15 +16,14 @@
  * │ TIME        │ 0x200  │ Search start, per-iteration timing, budget stops    │
  * │ STAGE       │ 0x400  │ Game-stage detection (opening/middle/endgame)       │
  * │ SYSTEM      │ 0x800  │ Server lifecycle, game start/end, console redirect  │
+ * │ SMP         │ 0x1000 │ Lazy SMP lifecycle, per-helper outcomes, selection  │
  * ├─────────────┼────────┼─────────────────────────────────────────────────────┤
- * │ ALL         │ 0xFFF  │ Everything — expect large files for EVAL/HEURISTICS │
+ * │ ALL         │ 0x1FFF │ Everything                                          │
  * └─────────────┴────────┴─────────────────────────────────────────────────────┘
  *
- * SEARCH, EVAL, HEURISTICS, MOVES, MOVE_ORDER fire at per-node frequency.
- * Call sites use logger.trace() (sampled 1-in-sampleRate) for those.
- * Everything else uses logger.event() (always written when the bit is set).
+ * SMP records are written ONLY by the main thread (helpers run a NoopLogger and
+ * ship their data back in their result message). See smpCoordinator.js.
  */
-
 export const LOG_CATEGORY = {
   NONE:       0,
   SEARCH:     1 << 0,
@@ -39,47 +38,23 @@ export const LOG_CATEGORY = {
   TIME:       1 << 9,
   STAGE:      1 << 10,
   SYSTEM:     1 << 11,
-  ALL:        0xFFF,
+  SMP:        1 << 12,
+  ALL:        0x1FFF,
 };
-
-/** Category tags — used as the `cat` field value AND the filename stem. */
 export const CAT = {
-  SEARCH:    'search',
-  EVAL:      'eval',
-  MOVE_ORDER:'order',
-  TT:        'tt',
-  UCI:       'uci',
-  BOOK:      'book',
-  HEURISTIC: 'heuristics',
-  MOVES:     'moves',
-  PV:        'pv',
-  TIME:      'time',
-  STAGE:     'stage',
-  SYSTEM:    'system',
+  SEARCH: 'search', EVAL: 'eval', MOVE_ORDER: 'order', TT: 'tt', UCI: 'uci',
+  BOOK: 'book', HEURISTIC: 'heuristics', MOVES: 'moves', PV: 'pv', TIME: 'time',
+  STAGE: 'stage', SYSTEM: 'system', SMP: 'smp',
 };
-
-/** Tag → bitmask, for the logger's category gate. */
 export const CAT_BIT = {
-  search:     LOG_CATEGORY.SEARCH,
-  eval:       LOG_CATEGORY.EVAL,
-  order:      LOG_CATEGORY.MOVE_ORDER,
-  tt:         LOG_CATEGORY.TT,
-  uci:        LOG_CATEGORY.UCI,
-  book:       LOG_CATEGORY.BOOK,
-  heuristics: LOG_CATEGORY.HEURISTICS,
-  moves:      LOG_CATEGORY.MOVES,
-  pv:         LOG_CATEGORY.PV,
-  time:       LOG_CATEGORY.TIME,
-  stage:      LOG_CATEGORY.STAGE,
-  system:     LOG_CATEGORY.SYSTEM,
+  search: LOG_CATEGORY.SEARCH, eval: LOG_CATEGORY.EVAL, order: LOG_CATEGORY.MOVE_ORDER,
+  tt: LOG_CATEGORY.TT, uci: LOG_CATEGORY.UCI, book: LOG_CATEGORY.BOOK,
+  heuristics: LOG_CATEGORY.HEURISTICS, moves: LOG_CATEGORY.MOVES, pv: LOG_CATEGORY.PV,
+  time: LOG_CATEGORY.TIME, stage: LOG_CATEGORY.STAGE, system: LOG_CATEGORY.SYSTEM,
+  smp: LOG_CATEGORY.SMP,
 };
-
 export const GAME_STAGE = {
-  OPENING: 'opening',
-  EARLY_MIDDLE: 'early_middle',
-  MIDDLE: 'middle',
-  LATE_MIDDLE: 'late_middle',
-  ENDGAME: 'endgame',
+  OPENING: 'opening', EARLY_MIDDLE: 'early_middle', MIDDLE: 'middle',
+  LATE_MIDDLE: 'late_middle', ENDGAME: 'endgame',
 };
-
 export default LOG_CATEGORY;

@@ -1,14 +1,14 @@
 import { useState } from "react";
 import { useEngine } from "../hooks/useEngine";
-import { DIFFICULTY_NAMES, DEFAULT_ENGINE_PROFILES } from "../constants/gameConstants";
+import { DIFFICULTY_NAMES } from "../constants/gameConstants";
+import { listProfiles } from "../config/catalog";
 
 const MainMenu = ({ onGameStart }) => {
   // The default-session engine: used here only for connection status and for
   // the profile list the engine advertises in its `uci` option block.
   const engine = useEngine();
-  const profiles = engine.profiles && engine.profiles.length > 0
-    ? engine.profiles
-    : DEFAULT_ENGINE_PROFILES;
+  const catalogProfiles = engine.connected ? listProfiles() : [];
+  const profiles = catalogProfiles.length > 0 ? catalogProfiles : [{ name: 'baseline', label: 'Baseline' }];
 
   const [playerColor, setPlayerColor] = useState('white');
   const [difficulty, setDifficulty] = useState(2);

@@ -32,6 +32,35 @@ export const TT_FLAG = {
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Table identity. `size@configHash` used to be printed as the "TT id"; two
+// instances with the same config printed the same string although they held
+// different tables. The serial is the identity; the registry enforces that a
+// table serial is held by at most ONE owner (engine instance) in this process.
+// Worker threads have their own isolate (own counter, own registry) and never
+// allocate tables — they receive the owner's serial with the shared buffer.
+// ─────────────────────────────────────────────────────────────────────────────
+let NEXT_TABLE_SERIAL = 1;
+const TABLE_OWNERS = new Map();
+
+export function allocateTableSerial() { return NEXT_TABLE_SERIAL++; }
+
+export function claimTable(serial, owner) {
+  const cur = TABLE_OWNERS.get(serial);
+  if (cur !== undefined && cur !== owner) {
+    throw new Error(`TT #${serial} is owned by ${cur}; refusing to share it with ${owner}`);
+  }
+  TABLE_OWNERS.set(serial, owner);
+}
+
+export function releaseTable(serial, owner) {
+  if (TABLE_OWNERS.get(serial) === owner) TABLE_OWNERS.delete(serial);
+}
+
+export function tableOwner(serial) { return TABLE_OWNERS.get(serial) ?? null; }
+
+export function liveTableCount() { return TABLE_OWNERS.size; }
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Move encoding: 15 bits packed into a 32-bit int.
 //   bits  0–5  : from square (0–63)
 //   bits  6–11 : to square   (0–63)
@@ -90,7 +119,13 @@ export class TranspositionTable {
         actualMB: +(this.size * BYTES_PER_ENTRY / 1024 / 1024).toFixed(1),
       });
     }
+
+    this.serial = allocateTableSerial();
+    this.kind = 'local';
+    this.owner = null;
   }
+
+  get id() { return `tt#${this.serial}:${this.kind}:${this.size}`; }
 
   /** Even slot of the bucket for `key`. The odd slot is `| 1`. */
   _bucket(key) { return Number(key & this.indexMask); }

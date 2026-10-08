@@ -75,6 +75,7 @@ const NO_POSITION = -1;
 export const LOG = {
   any: false, search: false, eval: false, moveOrder: false, tt: false, uci: false,
   book: false, heuristics: false, moves: false, pv: false, time: false, stage: false,
+  smp: false,
 };
 
 function refreshFlags(mask) {
@@ -90,6 +91,7 @@ function refreshFlags(mask) {
   LOG.pv         = (mask & LOG_CATEGORY.PV) !== 0;
   LOG.time       = (mask & LOG_CATEGORY.TIME) !== 0;
   LOG.stage      = (mask & LOG_CATEGORY.STAGE) !== 0;
+  LOG.smp        = (mask & LOG_CATEGORY.SMP) !== 0;
 }
 
 const stamp = () => new Date().toISOString().replace(/[:.]/g, '-');
@@ -143,7 +145,9 @@ class FileLogger {
     if (this.mask === 0) this._closeAll();
   }
   getMask() { return this.mask; }
+
   setSampleRate(n) { this.sampleRate = Math.max(1, n | 0); }
+  getSampleRate() { return this.sampleRate; }
 
   // ── Context ───────────────────────────────────────────────────────────
   bind(ctx) { this.ctx = ctx || ORPHAN; return this.ctx; }
@@ -321,7 +325,7 @@ class FileLogger {
 
 // ─────────────────────────────────────────────────────────────────────────────
 class NoopLogger {
-  setMask() {} getMask() { return 0; } setSampleRate() {}
+  setMask() {} getMask() { return 0; } setSampleRate() {} getSampleRate() { return 0; }
   bind(c) { return c; } bindBoard() {} lockTurn() { return -1; } unlockTurn() {}
   get turn() { return -1; }
   event() {} trace() {} write() {} sessionRecord() {}

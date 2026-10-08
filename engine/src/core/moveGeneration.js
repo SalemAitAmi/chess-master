@@ -15,8 +15,9 @@
  * Double check exits after king moves: nothing else can ever be legal.
  *
  * NOT REENTRANT. The analysis lives in module-level scalars and generateMoves
- * does not recurse (it no longer calls makeMove). Two interleaved generations
- * would clobber each other — the engine is single-threaded and synchronous.
+ * does not recurse. Lazy SMP helpers run in worker_threads, which have their
+ * OWN module instances (separate isolates), so each thread has its own copy of
+ * this state — nothing here is shared across threads.
  */
 import { PIECES, CASTLING, WHITE_IDX } from './constants.js';
 import {
@@ -78,6 +79,7 @@ const PIN_HI = new Int32Array(64);
 // (which determines whether the partner would still be mobile while pinned).
 //
 // Three or more blockers record nothing: removing one leaves two.
+const SOFT_PINNER  = new Int8Array(64);
 const SOFT_PARTNER = new Int8Array(64);
 const SOFT_LINE_LO = new Int32Array(64);
 const SOFT_LINE_HI = new Int32Array(64);
@@ -101,6 +103,7 @@ export const ANALYSIS = {
   pinnedLo: 0, pinnedHi: 0,
   softLo: 0, softHi: 0,
 };
+export function softPinPinner(sq)         { return SOFT_PINNER[sq]; }
 export function softPinPartner(sq)        { return SOFT_PARTNER[sq]; }
 export function softPinStaysOnLine(sq, to){ return hasBit(SOFT_LINE_LO[sq], SOFT_LINE_HI[sq], to); }
 export function softPinIsDiagonal(sq)     { return SOFT_DIAG[sq] !== 0; }
@@ -199,6 +202,25 @@ function analyze(board, us, them, ksq, occLo, occHi, ourLo, ourHi, theirLo, thei
   computeCheckMasks(board, ksq);
   if (checkCount >= 2) return;
   computePins(board, ksq, them, occLo, occHi, ourLo, ourHi, theirLo, theirHi);
+}
+
+/**
+ * Re-run the per-node analysis and publish it WITHOUT emitting moves.
+ *
+ * Move ordering reads ANALYSIS after generateMoves(); anything that generates
+ * in between (the null-move subtree, in practice) leaves it describing another
+ * position. Ordering used to detect the key mismatch and silently drop the
+ * soft-pin term, so the term was ON at PV/shallow nodes and OFF at every node
+ * that tried and failed a null move — the same position ordered two ways.
+ */
+export function analyzePosition(board, color) {
+  const us = colorToIndex(color);
+  const them = us ^ 1;
+  const ourLo   = board.bbSide[us].low   | 0, ourHi   = board.bbSide[us].high   | 0;
+  const theirLo = board.bbSide[them].low | 0, theirHi = board.bbSide[them].high | 0;
+  const ksq = board.bbPieces[us][PIECES.KING].getLSB();
+  analyze(board, us, them, ksq, ourLo | theirLo, ourHi | theirHi, ourLo, ourHi, theirLo, theirHi);
+  publish(board);
 }
 
 function resetAnalysisState() {
@@ -301,6 +323,7 @@ function recordSoftPin(bLo, bHi, lineLo, lineHi, ksq, pinnerSq, ourLo, ourHi, th
 
   for (let k = 0; k < 2; k++) {
     const q = SOFT_PAIR[k];
+    SOFT_PINNER[q] = pinnerSq;
     SOFT_PARTNER[q] = SOFT_PAIR[k ^ 1];
     SOFT_LINE_LO[q] = lineLo;
     SOFT_LINE_HI[q] = lineHi;

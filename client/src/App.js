@@ -1,104 +1,34 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useCallback } from "react";
 import MainMenu from "./components/MainMenu";
 import LocalPlayPage from "./pages/LocalPlayPage";
 import VsComputerPage from "./pages/VsComputerPage";
 import ColosseumPage from "./pages/ColosseumPage";
-import SettingsModal, { loadSettings } from "./components/SettingsModal";
-import { pushSettings } from "./utils/engineConfig";
+import SettingsModal from "./components/SettingsModal";
 import { useEngine } from "./hooks/useEngine";
-import { reportFailure } from "./utils/failure";
-
+/** e0 is opened here and lives for the page; it syncs its own config on connect and on commit. */
 const App = () => {
-  // ── Hooks ──
   const engine = useEngine();
   const [gameMode, setGameMode] = useState(null);
   const [gameConfig, setGameConfig] = useState({});
   const [settingsOpen, setSettingsOpen] = useState(false);
-
-  // ── Derived ──
-  const gameActive = gameMode !== null;
-
-  // ── Callbacks ──
-  const handleGameStart = useCallback((mode, config) => {
-    setGameConfig(config || {});
-    setGameMode(mode);
-  }, []);
-
-  const handleBackToMenu = useCallback(() => {
-    setGameMode(null);
-    setGameConfig({});
-  }, []);
-
-  const handleSettingsSave = useCallback((settings) => {
-    if (!engine.connected) {
-      reportFailure('App.handleSettingsSave',
-        new Error('engine not connected; settings saved locally only'));
-      return;
-    }
-    pushSettings(engine, settings);
-  }, [engine]);
-
-  // ── Effects ──
-  // Push persisted settings once the engine is UCI-ready, so a reload does not
-  // silently revert to engine defaults.
-  useEffect(() => {
-    if (!engine.connected) return;
-    pushSettings(engine, loadSettings());
-  }, [engine.connected]);   // eslint-disable-line react-hooks/exhaustive-deps
-
-  // ── Render: chrome ──
-  const settingsButton = (
-    <button
-      onClick={() => setSettingsOpen(true)}
-      className="fixed top-4 right-4 z-40 w-10 h-10 bg-gray-700 hover:bg-gray-600
-        rounded-full flex items-center justify-center text-gray-300 hover:text-white
-        transition-all duration-200 shadow-lg"
-      title="Engine Settings"
-    >
-      <i className="fas fa-cog text-lg" />
-    </button>
-  );
-
-  const settingsModal = (
-    <SettingsModal
-      isOpen={settingsOpen}
-      onClose={() => setSettingsOpen(false)}
-      onSave={handleSettingsSave}
-      disabled={gameActive}
-      profiles={engine.profiles}
-      engineOptions={engine.options}
-    />
-  );
-
-  // ── Render: page ──
+  const start = useCallback((mode, config) => { setGameConfig(config || {}); setGameMode(mode); }, []);
+  const back = useCallback(() => { setGameMode(null); setGameConfig({}); }, []);
+  const close = useCallback(() => setSettingsOpen(false), []);
   let page;
-  switch (gameMode) {
-    case 'local':
-      page = <LocalPlayPage onBackToMenu={handleBackToMenu} />;
-      break;
-    case 'vs-computer':
-      page = (
-        <VsComputerPage
-          playerColor={gameConfig.playerColor || 'white'}
-          difficulty={gameConfig.difficulty || 2}
-          onBackToMenu={handleBackToMenu}
-        />
-      );
-      break;
-    case 'colosseum':
-      page = <ColosseumPage config={gameConfig} onBackToMenu={handleBackToMenu} />;
-      break;
-    default:
-      page = <MainMenu onGameStart={handleGameStart} />;
-  }
-
+  if (gameMode === 'local') page = <LocalPlayPage onBackToMenu={back} />;
+  else if (gameMode === 'vs-computer') page = <VsComputerPage playerColor={gameConfig.playerColor || 'white'} difficulty={gameConfig.difficulty || 2} onBackToMenu={back} />;
+  else if (gameMode === 'colosseum') page = <ColosseumPage config={gameConfig} onBackToMenu={back} />;
+  else page = <MainMenu onGameStart={start} />;
   return (
     <>
-      {settingsButton}
-      {settingsModal}
+      <button onClick={() => setSettingsOpen(true)} title="Engine Settings"
+        className="fixed top-4 right-4 z-40 w-10 h-10 bg-gray-700 hover:bg-gray-600 rounded-full flex items-center justify-center text-gray-300 hover:text-white shadow-lg">
+        <i className="fas fa-cog text-lg" />
+      </button>
+      <SettingsModal isOpen={settingsOpen} onClose={close} disabled={gameMode !== null}
+        engineReady={engine.connected} validateFen={engine.connected ? engine.validateFen : null} />
       {page}
     </>
   );
 };
-
 export default App;

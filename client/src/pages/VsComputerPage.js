@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { useEngine } from "../hooks/useEngine";
 import { useGameSession } from "../hooks/useGameSession";
 import { useMoveSelection } from "../hooks/useMoveSelection";
@@ -11,7 +11,10 @@ import MoveHistory from "../components/MoveHistory";
 import CapturedPieces from "../components/CapturedPieces";
 import { DIFFICULTY_NAMES, DIFFICULTY_DEPTHS, TIMEOUTS } from "../constants/gameConstants";
 import { lastMoveToCoords, selectionToBoard } from "../utils/chessUtils";
+import { getSettings } from "../config/settings";
 import { reportFailure } from "../utils/failure";
+import { useMatchRecord } from "../hooks/useMatchRecord";
+import MatchScore from "../components/MatchScore";
 
 const BTN = 'px-6 py-3 rounded-lg text-lg font-semibold transition-all';
 
@@ -20,7 +23,8 @@ const VsComputerPage = ({ playerColor, difficulty, onBackToMenu }) => {
   // HOOKS
   // ═════════════════════════════════════════════════════════════════════════
   const engine = useEngine();
-  const session = useGameSession(engine);
+  const startFen = useMemo(() => (getSettings().client.startFen || '').trim(), []);
+  const session = useGameSession(engine, { startFen });
   const { gameState, moveHistory, initialized, busy, setBusy, applyEngineState, rollbackHistory, resign, startNewGame, mountedRef } = session;
 
   const [currentPlayerColor, setCurrentPlayerColor] = useState(playerColor);
@@ -41,6 +45,17 @@ const VsComputerPage = ({ playerColor, difficulty, onBackToMenu }) => {
     setBusy,
   });
 
+  const computerColor = currentPlayerColor === 'white' ? 'black' : 'white';
+  const match = useMatchRecord({
+    gameState,
+    whiteId: currentPlayerColor === 'white' ? 'player' : 'computer',
+    blackId: currentPlayerColor === 'white' ? 'computer' : 'player',
+    moveCount: moveHistory.length,
+  });
+  const sides = [
+    { id: 'player', name: 'Player', accent: 'text-cyan-300', playing: currentPlayerColor },
+    { id: 'computer', name: 'Computer', detail: DIFFICULTY_NAMES[difficulty], accent: 'text-pink-300', playing: computerColor },
+  ];
   // ═════════════════════════════════════════════════════════════════════════
   // DERIVED
   // ═════════════════════════════════════════════════════════════════════════
@@ -171,6 +186,7 @@ const VsComputerPage = ({ playerColor, difficulty, onBackToMenu }) => {
               capturedWhite={gameState.captured_white}
               capturedBlack={gameState.captured_black}
             />
+            <MatchScore sides={sides} results={match.results} />
           </>
         }
 
@@ -210,13 +226,16 @@ const VsComputerPage = ({ playerColor, difficulty, onBackToMenu }) => {
         ) : null}
 
         /* ── RIGHT ── */
-        rightPanels={<MoveHistory history={moveHistory} />}
+        rightPanels={<MoveHistory history={moveHistory} startFen={startFen} />}
+
 
         /* ── OVERLAYS ── */
         overlays={
           <>
             <PromotionModal promotion={selection.promotion} onPromotion={selection.handlePromotion} />
-            <GameOverModal gameOver={gameOver} winner={winner} status={gameState.status} onRestart={handleRestart} />
+            <GameOverModal gameOver={gameOver} winner={winner}
+              winnerName={match.winnerId === 'player' ? 'Player' : match.winnerId === 'computer' ? 'Computer' : null}
+              status={gameState.status} onRestart={handleRestart} />
           </>
         }
       />

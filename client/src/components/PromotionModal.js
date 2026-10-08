@@ -14,7 +14,7 @@ const PromotionModal = ({ promotion, onPromotion }) => {
     <div
       className="absolute top-1/2 left-1/2 transform -translate-x-1/2 -translate-y-1/2 
       bg-gray-900 bg-opacity-95 rounded-xl p-6 shadow-2xl border-2 border-gray-700
-      backdrop-blur-sm animate-fade-in flex flex-col items-center gap-4"
+      backdrop-blur-sm animate-pop-centered flex flex-col items-center gap-4"
     >
       <div className="text-gray-100 text-lg font-semibold mb-2">
         Promote Pawn

@@ -37,6 +37,10 @@ export function parseUCICommand(line) {
     case 'options':    return { type: 'options' };
     case 'whoami':     return { type: 'whoami' };
 
+    case 'profileoptions': return { type: 'profileoptions', name: args[0] || '' };
+    case 'validatefen':    return { type: 'validatefen', fen: args.join(' ') };
+    case 'smpbench':       return parseBench(args);
+
     default:
       return { type: 'unknown', command, args };
   }
@@ -115,4 +119,14 @@ function parseGo(args) {
   }
 
   return result;
+}
+
+/** smpbench [depth N] [strategies a,b,c] */
+function parseBench(args) {
+  const r = { type: 'smpbench', depth: 6, strategies: null };
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === 'depth') r.depth = parseInt(args[++i], 10) || 6;
+    else if (args[i] === 'strategies') r.strategies = (args[++i] || '').split(',').filter(Boolean);
+  }
+  return r;
 }

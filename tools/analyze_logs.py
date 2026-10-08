@@ -48,7 +48,7 @@ from matplotlib.lines import Line2D
 
 MATE_THRESHOLD = 49000
 CATEGORIES = ["search", "eval", "order", "tt", "uci", "book",
-              "heuristics", "moves", "pv", "time", "stage"]
+              "heuristics", "moves", "pv", "time", "stage", "smp"]
 PIECE_GROUP = {"Q": "heavy", "R": "heavy", "B": "minor", "N": "minor",
                "P": "pawn", "K": "king"}
 STAGE_ORDER = ["opening", "early_middle", "middle", "late_middle", "endgame"]
@@ -382,7 +382,7 @@ def export_replay(turns, iters, instances, out):
 
     engines = {}
     if not instances.empty and "eng" in instances.columns:
-        for _, r in instances.drop_duplicates("eng").iterrows():
+        for _, r in instances.drop_duplicates("eng", keep="last").iterrows():
             engines[r["eng"]] = {
                 k: (None if pd.isna(r.get(k)) else r.get(k))
                 for k in ("profile", "label", "configHash", "description", "tt")
@@ -631,7 +631,7 @@ def aggregate(turns, iters, leaf, instances, args):
     if not instances.empty:
         cols = [c for c in ("eng", "profile", "label", "configHash", "description")
                 if c in instances.columns]
-        out["engine_profiles"] = instances[cols].drop_duplicates("eng").set_index("eng")
+        out["engine_profiles"] = instances[cols].drop_duplicates("eng", keep="last").set_index("eng")
 
     if turns.empty:
         return out

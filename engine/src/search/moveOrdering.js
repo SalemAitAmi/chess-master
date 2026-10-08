@@ -27,10 +27,11 @@ import { PIECE_VALUES, PIECES, WHITE_IDX, BLACK_IDX } from '../core/constants.js
 import { evaluatePawnPush } from '../evaluation/pawnPush.js';
 import { getPSTValue } from '../evaluation/pieceSquareTables.js';
 import { encodedMatches } from '../tables/transposition.js';
-import { seeFast, SEE_EQUAL_BAND } from './see.js';
 import { hasBit, colorToIndex } from '../core/bitboard.js';
+import { seeFast, seeValue, SEE_EQUAL_BAND } from './see.js';
 import {
-  ANALYSIS, softPinPartner, softPinStaysOnLine, softPinIsDiagonal,
+  ANALYSIS, analyzePosition, softPinPartner, softPinPinner,
+  softPinStaysOnLine, softPinIsDiagonal,
 } from '../core/moveGeneration.js';
 import logger, { LOG, CAT } from '../logging/logger.js';
 
@@ -62,6 +63,7 @@ const PROMO_MVV_BONUS   = 8000;
 const HISTORY_MAX       = 8192;
 const HISTORY_BONUS_CAP = 400;
 const PHASE_MAX         = 24;
+const SOFT_PIN_ENDGAME_SHARE = 0.25;  /** Share of the middlegame soft-pin cost still charged with no pieces left. */
 
 // ── Soft-pin board-state tables ──
 // Per-file and long-diagonal masks, used to decide whether a frozen rook or a
@@ -112,6 +114,25 @@ function pinRisk(piece, diagonalRay, openFiles, openDiags) {
     case PIECES.QUEEN:  return 360;
     default:            return 0;   // the king is the ray endpoint
   }
+}
+
+function ridesRay(piece, diagonalRay) {
+  if (piece === PIECES.QUEEN) return true;
+  return diagonalRay ? piece === PIECES.BISHOP : piece === PIECES.ROOK;
+}
+
+/**
+ * Cost of leaving `partner` alone on the pinner's ray.
+ *
+ * After the blocker steps off, the partner is the FIRST piece on the ray, so it
+ * is attacked as well as pinned. If it rides that ray and is worth no more than
+ * the pinner, it simply trades the pinner off: the pin is illusory and costs
+ * nothing. This is the rook-behind-rook-on-a-file case that used to be charged
+ * up to 400 and made every lateral move of the rear rook look bad.
+ */
+export function softPinRisk(partner, pinner, diagonalRay, openFiles, openDiags) {
+  if (ridesRay(partner, diagonalRay) && seeValue(pinner) >= seeValue(partner)) return 0;
+  return pinRisk(partner, diagonalRay, openFiles, openDiags);
 }
 
 function phaseOf(board) {
@@ -264,6 +285,9 @@ export class MoveOrderer {
     this._ctx = { ply: 0, color: 'white', isWhite: true, phase: 1, ttMove: 0,
                   counterEnc: 0, bookHints: null, bookPick: null,
                   softActive: false, openFiles: 0, openDiags: 0 };
+
+    this.softRefreshes = 0;   // instrumentation: stale analyses repaired
+    this.pushScale = PUSH_ORDER_SCALE * (config.weights?.pawnPush ?? 1);
   }
 
   // ───────── Scoring ─────────
@@ -278,11 +302,17 @@ export class MoveOrderer {
     // ANALYSIS is published by the generator for THIS position. A key mismatch
     // means something regenerated in between; skip the term rather than score
     // against a stale board.
-    ctx.softActive = this.useSoftPin &&
-                     (ANALYSIS.softLo | ANALYSIS.softHi) !== 0 &&
-                     ANALYSIS.key === board.gameState.zobristKey;
-    ctx.openFiles = ctx.softActive ? openFileCount(board) : 0;
-    ctx.openDiags = ctx.softActive ? openDiagCount(board) : 0;
+    let softActive = false;
+    if (this.useSoftPin) {
+      if (ANALYSIS.key !== board.gameState.zobristKey) {
+        analyzePosition(board, color);
+        this.softRefreshes++;
+      }
+      softActive = (ANALYSIS.softLo | ANALYSIS.softHi) !== 0;
+    }
+    ctx.softActive = softActive;
+    ctx.openFiles = softActive ? openFileCount(board) : 0;
+    ctx.openDiags = softActive ? openDiagCount(board) : 0;
   }
 
   _scoreOne(move, ctx, board) {
@@ -338,25 +368,31 @@ export class MoveOrderer {
     // History + positional signal, ADDED (not exclusive).
     let q = this.history !== null ? this.history.getScore(move) : 0;
     q += (getPSTValue(move.piece, move.toSquare, ctx.isWhite, ctx.phase)
-        - getPSTValue(move.piece, move.fromSquare, ctx.isWhite, ctx.phase)) * PST_ORDER_SCALE;
+        - getPSTValue(move.piece, move.fromSquare, ctx.isWhite, ctx.phase)) * this.pushScale;
     if (this.usePawnPush && move.piece === PIECES.PAWN) {
-      q += evaluatePawnPush(move, board, ctx.color) * PUSH_ORDER_SCALE;
+      q += evaluatePawnPush(move, board, ctx.color) * this.pushScale;
     }
     return MOVE_PRIORITY.QUIET_BASE + q;
   }
 
   /**
-   * Leaving a two-blocker line pins our partner. How much that costs decides
-   * which of the two blockers we would rather move first. Bounded at ~400, and
-   * every tier is ≥ 50_000 apart, so this reorders within a tier and never
-   * across one.
+   * Leaving a two-blocker line pins our partner. Along-the-line moves never
+   * create the pin and cost 0. Tapered by phase: in simplified positions the
+   * heavy pieces ARE the plan, and a full-strength penalty pushed every lateral
+   * move of a soft-pinned rook past the LMR threshold while its file moves were
+   * searched at full depth, collected killers and history, and recurred every
+   * move — the up-and-down-the-file shuffle.
    */
   _softPinPenalty(move, ctx, board) {
     if (!ctx.softActive) return 0;
-    if (!hasBit(ANALYSIS.softLo, ANALYSIS.softHi, move.fromSquare)) return 0;
-    if (softPinStaysOnLine(move.fromSquare, move.toSquare)) return 0;
-    const partner = softPinPartner(move.fromSquare);
-    return pinRisk(board.pieceList[partner], softPinIsDiagonal(move.fromSquare), ctx.openFiles, ctx.openDiags);
+    const from = move.fromSquare;
+    if (!hasBit(ANALYSIS.softLo, ANALYSIS.softHi, from)) return 0;
+    if (softPinStaysOnLine(from, move.toSquare)) return 0;
+    const risk = softPinRisk(
+      board.pieceList[softPinPartner(from)], board.pieceList[softPinPinner(from)],
+      softPinIsDiagonal(from), ctx.openFiles, ctx.openDiags);
+    if (risk === 0) return 0;
+    return Math.round(risk * (SOFT_PIN_ENDGAME_SHARE + (1 - SOFT_PIN_ENDGAME_SHARE) * ctx.phase));
   }
 
   scoreMoves(moves, ply, board, color, ttMove = 0, lastMove = null, bookHints = null, bookPick = null) {

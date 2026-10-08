@@ -9,6 +9,8 @@
  */
 
 import { PIECES, WHITE_IDX, BLACK_IDX } from '../core/constants.js';
+import { KG_LO, KG_HI } from '../core/attacks.js';
+import { popCount64 } from '../core/bitboard.js';
 import { halfMoveCount } from '../utils/gameStage.js';
 import { evaluateMaterial } from './material.js';
 import { evaluateCenterControl } from './centerControl.js';
@@ -30,6 +32,14 @@ const PHASE_ROOK   = 2;
 const PHASE_QUEEN  = 4;
 // 4 minors×1 + 4 rooks×2 + 2 queens×4 = 4+4+8+8 = 24
 const MAX_PHASE    = 24;
+/**
+ * Defender cover: attacker pawns on the defending king's ring block queen
+ * lines, keep the attacking king out and create stalemate resources. Without
+ * this the defender's best-scoring plan was always "run to the centre, away
+ * from everything", which is exactly where a queen corrals a lone king.
+ */
+const MOPUP_COVER_RELIEF = 35;
+const MOPUP_MAX_COVER = 3;
 
 // Center-Manhattan-Distance: sum of file-distance-from-center and
 // rank-distance-from-center, each in [0,3]. Total range [0,6].
@@ -124,7 +134,10 @@ export function evaluateMopUp(board, color, endgameWeight, usePST = true) {
   const kingDist = Math.max(Math.abs(atkF - defF), Math.abs(atkR - defR));
   const proximity = Math.max(0, 14 - 2 * kingDist) * (pureMate ? 20 : 6);
 
-  let score = sign * Math.round((edgePush + proximity) * endgameWeight * strength);
+  const atkPawns = (sign === 1 ? us : opp)[PIECES.PAWN];
+  const cover = popCount64(atkPawns.low & KG_LO[defKingSq], atkPawns.high & KG_HI[defKingSq]);
+  const relief = Math.min(MOPUP_MAX_COVER, cover) * MOPUP_COVER_RELIEF;
+  let score = sign * Math.round(Math.max(0, edgePush + proximity - relief) * endgameWeight * strength);
 
   if (pureMate && usePST) {
     // material.js added `sign * PST(atkKing)` to this evaluation (ourPST when
