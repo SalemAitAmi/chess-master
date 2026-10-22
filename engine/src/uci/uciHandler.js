@@ -23,6 +23,7 @@ import { Evaluator } from '../evaluation/evaluate.js';
 import { detectGameStage, getStagePriorities } from '../utils/gameStage.js';
 import {
   ConfigState, APPLY, SMP_STRATEGIES, formatUciOptions, formatProfileLines, profileInfo,
+  findOption, parseValue,
 } from '../config/index.js';
 import logger, { LOG, CAT, LogContext } from '../logging/logger.js';
 import { parseUCICommand } from './uciParser.js';
@@ -102,6 +103,7 @@ export class UCIHandler {
         return r.ok ? null : `info string option error ${r.name} ${r.reason}`;
       }
       case 'setoptions': {
+        if (cmd.malformed !== null) return `optionserror ${cmd.malformed} malformed_entry`;
         const r = this.applyOptions(cmd.entries);
         return r.ok
           ? ['optionsok', r.hash, ...r.effective.map(([k, v]) => `${k}=${v}`)].join(' ')
@@ -142,6 +144,18 @@ export class UCIHandler {
     // A search is awaiting (book, SMP collect): reconfiguring under it would
     // hand helpers and the main thread different configs.
     if (this.searching) return { ok: false, name: '*', reason: 'busy' };
+    // The trace sample rate is a SESSION invariant (logger.js, SAMPLING). The
+    // logger is shared by every instance, so ask it, not this instance's
+    // possibly stale mirror of the value.
+    for (const [name, raw] of entries) {
+      const o = findOption(name);
+      if (o === null || o.apply !== APPLY.LOG_SAMPLE) continue;
+      const v = parseValue(o, raw);
+      if (v !== undefined && !logger.canSetSampleRate(v)) {
+        if (__LOG__ && LOG.uci) logger.event(CAT.UCI, 'options-error', { name: o.uci, reason: 'locked_for_session' });
+        return { ok: false, name: o.uci, reason: 'locked_for_session' };
+      }
+    }
     const res = this.cfg.apply(entries);
     if (res.ok) this._commit(res);
     if (__LOG__ && LOG.uci) {
@@ -151,6 +165,7 @@ export class UCIHandler {
     }
     return res;
   }
+  
   _commit(res) {
     const ec = this.cfg.engineConfig();
     this.config = ec;

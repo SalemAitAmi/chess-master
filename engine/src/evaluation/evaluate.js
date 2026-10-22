@@ -195,19 +195,28 @@ export class Evaluator {
   /**
    * Evaluate from `color`'s perspective.
    * Returns the shared _result — read fields immediately, don't hold.
+   *
+   * `withBreakdown` requests the per-term breakdown explicitly (root-move
+   * records, diagnostics). An explicit request is NOT a leaf of the search,
+   * so it is never sampled into eval.ndjson — otherwise the root-move dump at
+   * the end of every turn would pollute the leaf distribution.
    */
-    evaluate(board, color) {
+  evaluate(board, color, withBreakdown = false) {
     const cfg = this.config;
     const w = cfg.weights;
-
     const phase = this._computePhase(board);
     const gamePhase = phase >= MAX_PHASE ? 1 : phase / MAX_PHASE;
     const endgameWeight = 1 - gamePhase;
     const moveCount = board.plyCount;
-
-    const wantBreakdown = __LOG__ && LOG.eval;
+    const logLeaf = __LOG__ && LOG.eval && !withBreakdown;
+    const wantBreakdown = withBreakdown || logLeaf;
     const bd = wantBreakdown ? this._breakdown : null;
-
+    if (bd !== null) {
+      // Disabled terms never write their slot; zero it so a breakdown never
+      // carries a value left over from a previous evaluation.
+      bd.material = 0; bd.centerControl = 0; bd.development = 0;
+      bd.pawnStructure = 0; bd.kingSafety = 0; bd.initiative = 0; bd.mopUp = 0;
+    }
     let score = 0;
     score += this._evalMaterial(board, color, w, gamePhase, bd);
     score += this._evalCenterControl(board, color, w, gamePhase, bd);
@@ -216,11 +225,9 @@ export class Evaluator {
     score += this._evalKingSafety(board, color, w, endgameWeight, bd);
     score += this._evalInitiative(board, color, w, gamePhase, bd);
     score += this._evalMopUp(board, color, endgameWeight, bd);
-
-    if (wantBreakdown) {
+    if (logLeaf) {
       this._logLeafEval(score, gamePhase, bd);
     }
-
     return this._buildResult(score, wantBreakdown, bd, phase, gamePhase, endgameWeight, moveCount);
   }
 

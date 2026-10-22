@@ -1,22 +1,33 @@
 /**
  * UCI command parser — extended for local play and engine profiles.
+ *
+ * Configuration has two spellings that end in the same handler path
+ * (UCIHandler.applyOptions → ConfigState.apply):
+ *
+ *   setoption name <Name> value <Value>
+ *       standard UCI, one option, silent on success
+ *   setoptions <Name>=<Value> [<Name>=<Value> …]
+ *       batch; the handler applies it ATOMICALLY (nothing changes unless every
+ *       entry validates) and answers `optionsok <hash> k=v …` or
+ *       `optionserror <name> <reason>`. Used by the client's config sync and
+ *       by the experiment runner, so a profile plus its overrides is one
+ *       round trip and one config identity.
  */
 export function parseUCICommand(line) {
   const parts = line.trim().split(/\s+/);
   const command = parts[0];
   const args = parts.slice(1);
-
   switch (command) {
     case 'uci':        return { type: 'uci' };
     case 'debug':      return { type: 'debug', on: args[0] === 'on' };
     case 'isready':    return { type: 'isready' };
     case 'setoption':  return parseSetOption(args);
+    case 'setoptions': return parseSetOptions(args);
     case 'ucinewgame': return { type: 'ucinewgame' };
     case 'position':   return parsePosition(args);
     case 'go':         return parseGo(args);
     case 'stop':       return { type: 'stop' };
     case 'quit':       return { type: 'quit' };
-
     // ═══════════════════════════════════════════════════════════════════════
     // EXTENDED COMMANDS FOR LOCAL PLAY (no search required)
     // ═══════════════════════════════════════════════════════════════════════
@@ -26,21 +37,15 @@ export function parseUCICommand(line) {
     case 'undomove':   return { type: 'undomove' };
     case 'gamestate':  return { type: 'gamestate' };
     case 'eval':       return { type: 'eval' };
-
     // ═══════════════════════════════════════════════════════════════════════
     // DIAGNOSTICS / CONFIGURATION
     // ═══════════════════════════════════════════════════════════════════════
     case 'setlog':     return { type: 'setlog', mask: parseInt(args[0], 10) || 0 };
     case 'clearlogs':  return { type: 'clearlogs' };
     case 'showstage':  return { type: 'showstage' };
-    case 'profiles':   return { type: 'profiles' };
-    case 'options':    return { type: 'options' };
     case 'whoami':     return { type: 'whoami' };
-
-    case 'profileoptions': return { type: 'profileoptions', name: args[0] || '' };
     case 'validatefen':    return { type: 'validatefen', fen: args.join(' ') };
     case 'smpbench':       return parseBench(args);
-
     default:
       return { type: 'unknown', command, args };
   }
@@ -51,7 +56,6 @@ function parseSetOption(args) {
   let value = '';
   let inName = false;
   let inValue = false;
-
   for (let i = 0; i < args.length; i++) {
     if (args[i] === 'name') {
       inName = true;
@@ -65,14 +69,34 @@ function parseSetOption(args) {
       value += (value ? ' ' : '') + args[i];
     }
   }
-
   return { type: 'setoption', name, value };
+}
+
+/**
+ * `setoptions K=V K=V …`
+ *
+ * A value runs to the next token that contains '=', so a value may contain
+ * spaces (`Foo=a b Bar=1` → Foo="a b", Bar="1") even though no current option
+ * needs that. `K=` is an empty value, left for the option parser to reject.
+ * A token without '=' before any entry is malformed; the handler answers
+ * `optionserror <token> malformed_entry` and applies nothing.
+ */
+function parseSetOptions(args) {
+  const entries = [];
+  let malformed = null;
+  for (const tok of args) {
+    const eq = tok.indexOf('=');
+    if (eq > 0) { entries.push([tok.slice(0, eq), tok.slice(eq + 1)]); continue; }
+    if (entries.length === 0) { malformed = tok; break; }
+    const last = entries[entries.length - 1];
+    last[1] = last[1] === '' ? tok : `${last[1]} ${tok}`;
+  }
+  return { type: 'setoptions', entries, malformed };
 }
 
 function parsePosition(args) {
   const result = { type: 'position', fen: null, moves: [] };
   let i = 0;
-
   if (args[i] === 'startpos') {
     result.fen = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
     i++;
@@ -82,17 +106,14 @@ function parsePosition(args) {
     while (i < args.length && args[i] !== 'moves') fenParts.push(args[i++]);
     result.fen = fenParts.join(' ');
   }
-
   if (i < args.length && args[i] === 'moves') {
     for (i++; i < args.length; i++) result.moves.push(args[i]);
   }
-
   return result;
 }
 
 function parseGo(args) {
   const result = { type: 'go' };
-
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
       case 'infinite':  result.infinite = true; break;
@@ -117,7 +138,6 @@ function parseGo(args) {
       default: break;
     }
   }
-
   return result;
 }
 

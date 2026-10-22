@@ -3,6 +3,7 @@
  *
  *   logs/<session-ISO>/
  *     session.log            plain text: server lifecycle, UCI echo (all engines)
+ *     session.json           session metadata: sample rate (+lock), mask, game count
  *     instances.ndjson       one record per engine instance: profile + resolved config
  *     boot/                  records emitted before ANY game starts
  *       book.ndjson  tt.ndjson  uci.ndjson
@@ -14,14 +15,16 @@
  *
  * Line shape — no `cat` (the filename is the category), no `msg` in uci.ndjson:
  *
- *   {"seq":<n>,"t":<halfmove>,"eng":"<instance>","msg":"<event>", ...}
- *   {"seq":<n>,"t":<halfmove>,"eng":"<instance>","cmd":"<command>", ...}
+ *   {"seq":<n>,"g":<game>,"t":<halfmove>,"eng":"<instance>","msg":"<event>", ...}
+ *   {"seq":<n>,"g":<game>,"t":<halfmove>,"eng":"<instance>","ti":<k>,"msg":"<trace>", ...}
+ *   {"seq":<n>,"g":<game>,"t":<halfmove>,"eng":"<instance>","cmd":"<command>", ...}
  *
  *   seq  monotonic within a game, across ALL files and ALL engine instances.
  *        This is the operation sequence: sorting by it reconstructs the exact
  *        interleaving of UCI traffic, ordering, search and evaluation.
  *   t    real half-move index of the position: (fullMove-1)*2 + (black to move).
  *   eng  engine instance id. Lines from two instances share one game directory.
+ *   ti   SAMPLED RECORDS ONLY: the per-category trace counter at emission.
  *
  * CONTEXT. `t` and `eng` come from a bound LogContext, not from call sites.
  * The server binds the context of whichever instance it is dispatching to,
@@ -34,6 +37,27 @@
  * _finish). Every line emitted anywhere in the tree is attributed to the turn
  * the search is deciding.
  *
+ * ── SAMPLING ─────────────────────────────────────────────────────────────
+ * `event()` records are complete. `trace()` records are sampled: per category,
+ * every `sampleRate`-th call is written (the counter resets per game, like
+ * `seq`). Each sampled record carries `ti`, so a reader knows EXACTLY how many
+ * trace calls fell between two samples (ti[k] - ti[k-1] - 1) and can verify
+ * the rate (ti % rate === 0) instead of trusting it.
+ *
+ * INVARIANT: the sample rate is fixed for the whole log session. It may be
+ * changed freely until the first game of the session begins
+ * (beginGameIfArmed); from then on setSampleRate() refuses any DIFFERENT value
+ * until the session closes (setMask(0), clear(), process exit). The rate is
+ * written to <session>/session.json and onto every `game-begin` record, so no
+ * consumer has to guess it.
+ *
+ * Why the session and not the game: every pooled statistic the analyser
+ * draws (leaf component distributions, ordering rates, per-stage correlations)
+ * is pooled across the games of ONE session; two games sampled at different
+ * densities would weight one of them N× in every pool, silently. And there is
+ * exactly one logger per process, shared by every engine instance, so a
+ * per-game rule would need every instance to agree at every reset barrier for
+ * no analytical gain. A different resolution is a different session.
  *
  * ── GAME BOUNDARIES ──────────────────────────────────────────────────────
  * A game directory is created LAZILY, on the first search of the game.
@@ -58,7 +82,6 @@
  * (`bootSeq`), which therefore keeps climbing across the whole session — that
  * is intentional, and `g` is what separates the phases.
  *
- *
  * INVARIANT: no filesystem access until a line is actually emitted, and no line
  * is reachable while the category bit is clear.
  */
@@ -71,6 +94,7 @@ const __DEV__ = globalThis.__DEV__ ?? true;
 const LOG_ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '../../logs');
 const BOOT_DIR = 'boot';
 const NO_POSITION = -1;
+const DEFAULT_SAMPLE_RATE = 256;
 
 export const LOG = {
   any: false, search: false, eval: false, moveOrder: false, tt: false, uci: false,
@@ -115,24 +139,24 @@ export class LogContext {
     this.turnLock = NO_POSITION;
   }
 }
+
 const ORPHAN = new LogContext('-');
 
 // ─────────────────────────────────────────────────────────────────────────────
 class FileLogger {
   constructor() {
     this.mask = 0;
-    this.sampleRate = 256;
-
+    this.sampleRate = DEFAULT_SAMPLE_RATE;
+    this.sampleLocked = false;
     this.ctx = ORPHAN;
-
     this.sessionDir = null;
+    this.sessionStartedAt = null;
     this.gameIndex = 0;
     this.gameDir = null;
     this.gameRecords = 0;
     this.seq = 0;
     this.bootSeq = 0;
     this.pendingGame = 0;     // armed-but-not-started game index (0 = none)
-
     this.streams = Object.create(null);   // relPath -> WriteStream
     this.counters = Object.create(null);
     this.timer = null;
@@ -146,8 +170,22 @@ class FileLogger {
   }
   getMask() { return this.mask; }
 
-  setSampleRate(n) { this.sampleRate = Math.max(1, n | 0); }
+  /**
+   * Trace sample rate (1-in-N). See the SAMPLING section in the header.
+   * @returns {boolean} false when the change was refused (locked for the
+   *          session); the same value is always accepted as a no-op.
+   */
+  setSampleRate(n) {
+    const v = Math.max(1, n | 0);
+    if (v === this.sampleRate) return true;
+    if (this.sampleLocked) return false;
+    this.sampleRate = v;
+    if (this.sessionDir !== null) this._writeSessionMeta();
+    return true;
+  }
   getSampleRate() { return this.sampleRate; }
+  canSetSampleRate(n) { const v = Math.max(1, n | 0); return v === this.sampleRate || !this.sampleLocked; }
+  isSampleRateLocked() { return this.sampleLocked; }
 
   // ── Context ───────────────────────────────────────────────────────────
   bind(ctx) { this.ctx = ctx || ORPHAN; return this.ctx; }
@@ -160,6 +198,7 @@ class FileLogger {
     return (gs.fullMoveCount - 1) * 2 + (gs.activeColor === 'black' ? 1 : 0);
   }
   get turn() { return this.ctx.turnLock !== NO_POSITION ? this.ctx.turnLock : this._boardTurn(); }
+
   lockTurn(board) {
     if (board !== undefined && board !== null) this.ctx.board = board;
     this.ctx.turnLock = this._boardTurn();
@@ -172,9 +211,27 @@ class FileLogger {
     if (this.sessionDir !== null) return this.sessionDir;
     this.sessionDir = path.join(LOG_ROOT, stamp());
     fs.mkdirSync(this.sessionDir, { recursive: true });
+    this.sessionStartedAt = new Date().toISOString();
     this.timer = setInterval(() => this._flushAll(), 5000);
     if (this.timer && this.timer.unref) this.timer.unref();
+    this._writeSessionMeta();
     return this.sessionDir;
+  }
+
+  /** <session>/session.json — the one place a consumer reads the sample rate from. */
+  _writeSessionMeta() {
+    if (this.sessionDir === null) return;
+    const meta = {
+      session: path.basename(this.sessionDir),
+      startedAt: this.sessionStartedAt,
+      updatedAt: new Date().toISOString(),
+      mask: this.mask,
+      sampleRate: this.sampleRate,
+      sampleRateLocked: this.sampleLocked,
+      games: this.gameIndex,
+    };
+    try { fs.writeFileSync(path.join(this.sessionDir, 'session.json'), JSON.stringify(meta, null, 2) + '\n'); }
+    catch { /* best effort: the same values are on every game-begin record */ }
   }
 
   /** Relative directory for category records right now: boot or the game. */
@@ -207,19 +264,23 @@ class FileLogger {
     for (const k in this.streams) this.streams[k].end();
     this.streams = Object.create(null);
     this.sessionDir = null;
+    this.sessionStartedAt = null;
     this.gameDir = null;
     this.gameIndex = 0;
     this.pendingGame = 0;
     this.gameRecords = 0;
+    this.sampleLocked = false;          // session boundary: the rate is free again
   }
 
   // ── Core write ────────────────────────────────────────────────────────
-  _emit(cat, label, fields) {
+  /** @param {number} ti  trace counter for sampled records; 0 for events */
+  _emit(cat, label, fields, ti) {
     const inGame = this.gameDir !== null;
     const seq = inGame ? ++this.seq : ++this.bootSeq;
     let line = `{"seq":${seq},"g":${inGame ? this.gameIndex : 0},"t":${this.turn},` +
-               `"eng":${JSON.stringify(this.ctx.eng)},` +
-               `${JSON.stringify(labelKeyFor(cat))}:${JSON.stringify(label)}`;
+               `"eng":${JSON.stringify(this.ctx.eng)}` +
+               (ti > 0 ? `,"ti":${ti}` : '') +
+               `,${JSON.stringify(labelKeyFor(cat))}:${JSON.stringify(label)}`;
     if (fields) for (const k in fields) line += `,${JSON.stringify(k)}:${field(fields[k])}`;
     line += '}\n';
     this._stream(this._recordDir(), `${cat}.ndjson`).write(line);
@@ -248,7 +309,7 @@ class FileLogger {
   /**
    * Materialise the armed game. Called by UCIHandler on `go`, i.e. at the
    * first decision of the game — so an armed game that is never played leaves
-   * no directory behind.
+   * no directory behind. The FIRST game of a session locks the sample rate.
    */
   beginGameIfArmed() {
     if (this.mask === 0 || this.pendingGame === 0) return this.gameIndex;
@@ -259,8 +320,13 @@ class FileLogger {
     this.gameRecords = 0;
     this.seq = 0;
     this.counters = Object.create(null);
+    if (!this.sampleLocked) {
+      this.sampleLocked = true;
+      this.write(`[SESSION] trace sample rate locked at 1/${this.sampleRate} for this session`);
+    }
+    this._writeSessionMeta();
     this.write(`[GAME] game-${this.gameIndex} begin`);
-    this.event(CAT.SYSTEM, 'game-begin', { game: this.gameIndex });
+    this.event(CAT.SYSTEM, 'game-begin', { game: this.gameIndex, sampleRate: this.sampleRate, mask: this.mask });
     return this.gameIndex;
   }
 
@@ -269,14 +335,14 @@ class FileLogger {
 
   event(cat, label, fields) {
     if ((this.mask & CAT_BIT[cat]) === 0) return;
-    this._emit(cat, label, fields);
+    this._emit(cat, label, fields, 0);
   }
 
   trace(cat, label, fields) {
     if ((this.mask & CAT_BIT[cat]) === 0) return;
     const n = (this.counters[cat] = (this.counters[cat] ?? 0) + 1);
     if (n % this.sampleRate !== 0) { this.stats.dropped++; return; }
-    this._emit(cat, label, fields);
+    this._emit(cat, label, fields, n);
   }
 
   /** Plain text → <session>/session.log. Spans games and engine instances. */
@@ -299,12 +365,11 @@ class FileLogger {
     this.write(`[SESSION] start`);
   }
 
-  
-
   getStats() {
     return { ...this.stats, session: this.sessionDir, game: this.gameDir,
              gameIndex: this.gameIndex, pendingGame: this.pendingGame,
-             seq: this.seq, bootSeq: this.bootSeq, mask: this.mask };
+             seq: this.seq, bootSeq: this.bootSeq, mask: this.mask,
+             sampleRate: this.sampleRate, sampleRateLocked: this.sampleLocked };
   }
 
   _flushAll() { for (const k in this.streams) { const s = this.streams[k]; if (!s.destroyed) s.write(''); } }
@@ -325,7 +390,9 @@ class FileLogger {
 
 // ─────────────────────────────────────────────────────────────────────────────
 class NoopLogger {
-  setMask() {} getMask() { return 0; } setSampleRate() {} getSampleRate() { return 0; }
+  setMask() {} getMask() { return 0; }
+  setSampleRate() { return true; } getSampleRate() { return 0; }
+  canSetSampleRate() { return true; } isSampleRateLocked() { return false; }
   bind(c) { return c; } bindBoard() {} lockTurn() { return -1; } unlockTurn() {}
   get turn() { return -1; }
   event() {} trace() {} write() {} sessionRecord() {}
@@ -336,6 +403,7 @@ class NoopLogger {
 }
 
 let _instance = __DEV__ ? new FileLogger() : new NoopLogger();
+
 export function installNoopLogger() { _instance.close(); _instance = new NoopLogger(); refreshFlags(0); }
 export function installRealLogger() { _instance.close(); _instance = new FileLogger(); }
 

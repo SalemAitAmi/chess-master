@@ -48,6 +48,8 @@ const EP_NONE_KEY = EN_PASSANT_KEYS[16];
 const ROOT_VERIFY_LIMIT = 6;
 const DEFAULT_HASH_MB = 64;
 const ROOT_SCORE_DUMP = 8;
+/** Root moves that get a `root-move` record (order.ndjson), in final score order. */
+const ROOT_MOVE_DUMP = 48;
 /** Lazy SMP depth skipping (Stockfish 8 tables). Helper k uses row (k-1) % 20. */
 const SKIP_SIZE  = [1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4];
 const SKIP_PHASE = [0, 1, 0, 1, 2, 3, 0, 1, 2, 3, 4, 5, 0, 1, 2, 3, 4, 5, 6, 7];
@@ -118,6 +120,20 @@ function skipDepth(threadIndex, d, target) {
   if (threadIndex <= 0 || d <= 1 || d >= target) return false;
   const i = (threadIndex - 1) % 20;
   return (((d + SKIP_PHASE[i]) / SKIP_SIZE[i]) | 0) % 2 === 1;
+}
+/** The ordering tier that got a root move tried first. Binary facts only. */
+function rootMoveWhy(m) {
+  if (m.isTTMove) return 'tt';
+  if (m.isBookMove) return 'book';
+  if (m.isPromotion) return 'promo';
+  if (m.capturedPiece !== null) {
+    if (m.seeScore > SEE_EQUAL_BAND) return 'win-capture';
+    if (m.seeScore >= -SEE_EQUAL_BAND) return 'even-capture';
+    return 'lose-capture';
+  }
+  if (m.isKiller) return 'killer';
+  if (m.isCounterMove) return 'counter';
+  return 'quiet';
 }
 // ═══════════════════════════════════════════════════════════════════════════
 export class SearchEngine {
@@ -642,6 +658,7 @@ export class SearchEngine {
       const top = scores.slice(0, ROOT_SCORE_DUMP)
         .map(s => `${s.move.algebraic}:${s.score}:${s.exact ? 1 : 0}`).join('|');
       logger.event(CAT.MOVE_ORDER, 'root-scores', { n: scores.length, top });
+      this._logRootMoves(board, bestMove);
     }
     if (this._stageInfo !== null && this._stageInfo.stage === GAME_STAGE.OPENING &&
         bestMove !== null && this.config.useOpeningPrinciples) {
@@ -655,6 +672,42 @@ export class SearchEngine {
     if (LOG.tt && this.tt !== null) logger.event(CAT.TT, 'stats', { tt: this.tt.id, ...this.tt.getStats() });
     if (LOG.time) {
       logger.event(CAT.TIME, 'search-end', { ms, nodes: this.nodes, depth: this._completedDepth });
+    }
+  }
+  /**
+   * One COMPLETE `root-move` record per root move (order.ndjson), in final
+   * score order: the score / exactness / effort the search assigned it, the
+   * ordering tier that got it tried, and the STATIC evaluation of the position
+   * after it — per term, from the mover's point of view.
+   *
+   * This is what lets a replay attribute heuristics to a move: the sampled
+   * `leaf` traces are positions deep in the tree and cannot be tied to a root
+   * move after the fact. Cost: one evaluation per root move, once per turn,
+   * only when MOVE_ORDER logging is on. Never sampled.
+   */
+  _logRootMoves(board, bestMove) {
+    const scores = this._rootScores;
+    const n = Math.min(scores.length, ROOT_MOVE_DUMP);
+    for (let i = 0; i < n; i++) {
+      const s = scores[i], m = s.move;
+      if (m === null || m === undefined) continue;
+      board.makeMove(m.fromSquare, m.toSquare, m.promotionPiece);
+      const r = this.evaluator.evaluate(board, this.searchColor, true);
+      const bd = r.breakdown;   // shared object: copy the fields before undo
+      const rec = {
+        rank: i, alg: m.algebraic, cp: s.score, exact: s.exact ? 1 : 0,
+        played: m === bestMove ? 1 : 0,
+        order: s.orderScore | 0, nodes: s.nodes | 0, why: rootMoveWhy(m),
+        piece: PIECE_CHARS[m.piece],
+        cap: m.capturedPiece !== null ? PIECE_CHARS[m.capturedPiece] : null,
+        see: m.seeScore, promo: m.isPromotion ? 1 : 0,
+        staticCp: r.score,
+        material: bd.material, centerControl: bd.centerControl, development: bd.development,
+        pawnStructure: bd.pawnStructure, kingSafety: bd.kingSafety,
+        initiative: bd.initiative, mopUp: bd.mopUp,
+      };
+      board.undoMove();
+      logger.event(CAT.MOVE_ORDER, 'root-move', rec);
     }
   }
   // ═══════════════════════════════════════════════════════════════════════

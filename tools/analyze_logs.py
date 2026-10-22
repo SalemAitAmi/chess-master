@@ -347,6 +347,13 @@ GLOSSARY = {
                               "Distance from THIS RUN's typical behaviour — not absolute severity."),
  "_pk suffix":  ("DERIVED", "Event rate per 1000 nodes, e.g. futilityCutoffs_pk. Normalises a raw "
                             "count so two engines with different node budgets are comparable."),
+  "ti":       ("LOG KEY", "SAMPLED records only: the per-category trace counter at emission. "
+                         "Dropped traces between two samples = ti[k] - ti[k-1] - 1, exactly."),
+ "sampleRate": ("LOG KEY", "Traces kept 1-in-N per category per game. Fixed for the whole "
+                           "session (session.json); the engine refuses to change it after game 1 begins."),
+ "root-move": ("LOG KEY", "order.ndjson, one per root move, final score order: rank, alg, cp, exact, "
+                          "played, order (ordering score), nodes, why (tier), piece, cap, see, promo, "
+                          "staticCp and the per-term static eval of the position AFTER the move, mover POV."),
 }
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -373,7 +380,7 @@ REPLAY_TURN_FIELDS = [
 ]
 
 
-def export_replay(turns, iters, instances, out):
+def export_replay(turns, iters, instances, out, meta=None, order=None, sample_rate=None):
     """Write out/replay/index.json + out/replay/game-N.json."""
     if turns.empty:
         return []
@@ -402,17 +409,20 @@ def export_replay(turns, iters, instances, out):
             by_turn = {}
             for (eng, t), isub in itg.groupby(["eng", "t"]):
                 by_turn[(eng, t)] = json.loads(
-                    isub.sort_values("d")[[c for c in ("d", "cp", "changed", "nodes",
+                    isub.sort_values("d")[[c for c in ("d", "best", "cp", "changed", "nodes",
                                                        "qnodes", "ms", "seldepth")
                                            if c in isub.columns]].to_json(orient="records"))
+        rm = order[(order["game"] == game) & (order["label"] == "root-move")] \
+            if order is not None and not order.empty and "label" in order.columns else pd.DataFrame()
+        if not rm.empty:
+            cols = [c for c in REPLAY_ROOT_MOVE_FIELDS if c in rm.columns]
+            by_turn_rm = {k: json.loads(g.sort_values("rank")[cols].to_json(orient="records"))
+                          for k, g in rm.groupby(["eng", "t"])}
             for rec in records:
-                rec["iterations"] = by_turn.get((rec.get("eng"), rec.get("t")), [])
-
+                rec["rootMoves"] = by_turn_rm.get((rec.get("eng"), rec.get("t")), [])
         payload = {
-            "game": int(game),
-            "engines": engines,
-            "turns": records,
-            "turnCount": len(records),
+            "game": int(game), "engines": engines, "turns": records,
+            "turnCount": len(records), "sampleRate": sample_rate,
         }
         name = f"game-{int(game)}.json"
         (rdir / name).write_text(json.dumps(payload), encoding="utf-8")
@@ -421,7 +431,8 @@ def export_replay(turns, iters, instances, out):
                       "engines": sorted(sub["eng"].dropna().unique().tolist())})
 
     (rdir / "index.json").write_text(
-        json.dumps({"games": index, "engines": engines}, indent=2), encoding="utf-8")
+        json.dumps({"games": index, "engines": engines, "sampleRate": sample_rate,
+                    "session": (meta or {}).get("session")}, indent=2), encoding="utf-8")
     return index
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -479,8 +490,29 @@ def load_session(session: Path):
 
     inst_path = session / "instances.ndjson"
     instances = read_ndjson(inst_path) if inst_path.exists() else pd.DataFrame()
-    return merged, instances
+    meta_path = session / "session.json"
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.exists() else {}
+    except json.JSONDecodeError:
+        meta = {}
+    return merged, instances, meta
 
+def resolve_sample_rate(meta, logs):
+    """session.json first; else the gcd of every `ti` seen; else the engine default, flagged."""
+    if isinstance(meta.get("sampleRate"), (int, float)):
+        return int(meta["sampleRate"]), "session.json"
+    g = 0
+    for df in logs.values():
+        if "ti" in df.columns:
+            for v in pd.to_numeric(df["ti"], errors="coerce").dropna().astype(int):
+                g = math.gcd(g, int(v))
+    if g > 0:
+        return g, "inferred (gcd of ti)"
+    return 256, "assumed (engine default)"
+
+REPLAY_ROOT_MOVE_FIELDS = ["rank", "alg", "cp", "exact", "played", "order", "nodes", "why", "piece",
+                           "cap", "see", "promo", "staticCp", "material", "centerControl",
+                           "development", "pawnStructure", "kingSafety", "initiative", "mopUp"]
 
 # ══════════════════════════════════════════════════════════════════════════
 # Derivation
@@ -1157,7 +1189,7 @@ def write_outputs(session, out, tidy, agg, figures, args):
         "\n".join(f"| `{k}` | {GLOSSARY[k][0]} | {GLOSSARY[k][1]}" for k in sorted(GLOSSARY)),
         encoding="utf-8")
 
-def write_summary(session, out, turns, agg, args, replay_index):
+def write_summary(session, out, turns, agg, args, replay_index, sample_rate):
     """
     Machine-readable run summary. tools/aggregate_runs.py consumes ONLY this,
     so a cross-run comparison never has to re-parse report.md.
@@ -1171,6 +1203,7 @@ def write_summary(session, out, turns, agg, args, replay_index):
         "games": int(turns["game"].nunique()) if not turns.empty else 0,
         "engines": {},
         "replay_games": len(replay_index),
+        "sampleRate": sample_rate,
     }
     prof = agg.get("engine_profiles")
     mq = agg.get("move_quality_by_engine")
@@ -1223,8 +1256,9 @@ def main():
         session = newest_session(session)
     out = args.out or (session / "analysis")
 
-    logs, instances = load_session(session)
-    print(f"session : {session}")
+    logs, instances, meta = load_session(session)
+    sample_rate, rate_source = resolve_sample_rate(meta, logs)
+    print(f"session : {session}  (trace sampling 1/{sample_rate}, {rate_source})")
     print(f"loaded  : {', '.join(f'{k}({len(v)})' for k, v in sorted(logs.items()))}")
 
     turns = build_turns(logs.get("search"))
@@ -1247,7 +1281,8 @@ def main():
 
     write_outputs(session, out, tidy, agg, figs, args)
 
-    replay_index = export_replay(turns, iters, instances, out) if args.export_replay else []
+    replay_index = export_replay(turns, iters, instances, out, meta,
+                                 logs.get("order"), sample_rate) if args.export_replay else []
     write_summary(session, out, turns, agg, args, replay_index)
 
     print(f"output  : {out}  ({len(figs)} figures, "

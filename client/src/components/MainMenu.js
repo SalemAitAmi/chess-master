@@ -195,10 +195,26 @@ const MainMenu = ({ onGameStart }) => {
             with a private transposition table — neither can read the other's search.
           </p>
         </div>
-      </div>
 
+        {/* Sandbox — replay debugger. Needs no engine: it reads log files. */}
+        <div className="bg-gray-700 rounded-lg p-4">
+          <button
+            onClick={() => onGameStart('sandbox')}
+            className="w-full py-4 text-xl font-bold rounded-lg transition-all duration-200 shadow-lg
+              bg-amber-600 hover:bg-amber-700 text-white hover:shadow-xl"
+          >
+            🧪 Sandbox
+          </button>
+          <p className="mt-3 text-gray-400 text-xs">
+            Replay a logged session like a debugger: step over turns, step into a decision and walk it
+            backwards through root policy, iterations and sampled traces. Click pieces and candidate
+            squares on the board to drive the views. Reads <span className="font-mono">engine/logs/&lt;session&gt;</span> directly
+            (or an <span className="font-mono">analysis/replay</span> export) — no engine connection required.
+          </p>
+        </div>
+      </div>
       <p className="mt-8 text-gray-500 text-sm">
-        Engine required for all game modes
+        Engine required for play · Sandbox replays logs offline
       </p>
     </div>
   );

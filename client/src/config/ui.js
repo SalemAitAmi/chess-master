@@ -45,7 +45,8 @@ const UI = {
   RepetitionMargin: p('contempt', 'Repetition margin (cp)', null, { step: 10 }),
   RepetitionContempt: p('contempt', 'Repetition contempt (cp)', null, { step: 5 }),
   LogMask: s('logging', 'Log category bitmask', '0 = silent, 8191 = everything (0x1000 = smp).'),
-  LogSampleRate: s('logging', 'Trace sample rate (1-in-N)'),
+  LogSampleRate: s('logging', 'Trace sample rate (1-in-N)',
+                   'Fixed for the whole log session once its first game begins; the engine refuses a later change.'),
   SmpLog: s('logging', 'SMP worker log scheme',
             'winner · summary · triggered (summary + trails on anomalies) · full'),
 };
