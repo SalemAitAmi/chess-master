@@ -1,24 +1,35 @@
-import Panel, { KV, Section } from './Panel';
+import { Panel, KV, Section } from '../../components/primitives';
 import HeuristicBars from './HeuristicBars';
+import Icon from '../../components/Icon';
 import { COMPONENTS, COMPONENT_LABEL } from '../model';
 import { fmtCp, fmtInt, WHY_LABEL } from '../format';
 
 /** One candidate in depth: search view, ordering view, and its static terms against the played move. */
-const MoveView = ({ view, nav, dispatch }) => {
+const MoveView = ({ view, dispatch }) => {
   const { picked, played, turn } = view;
   if (!turn || !picked) return null;
-  const ref = played && played !== picked ? played : null;
+
+  // ── Derived ──
+  const ref = played && played !== picked ? played : null;   // comparison bars
   const rows = picked.breakdown
-    ? COMPONENTS.map(k => ({ key: k, label: COMPONENT_LABEL[k], value: picked.breakdown[k] ?? null,
-                             ref: ref && ref.breakdown ? ref.breakdown[k] ?? null : undefined }))
+    ? COMPONENTS.map(k => ({
+        key: k, label: COMPONENT_LABEL[k], value: picked.breakdown[k] ?? null,
+        ref: ref && ref.breakdown ? ref.breakdown[k] ?? null : undefined,
+      }))
     : [];
+  const lossClass = picked.delta === 0 ? 'text-green-300' : picked.delta > 120 ? 'text-red-300' : 'text-gray-100';
+
+  // ── Render ──
   return (
     <Panel title={`Move ${picked.alg}${picked.played ? ' (played)' : ''}`}
       sub={ref ? `vs played ${ref.alg} (grey bars)` : 'static terms after the move, mover POV'}
-      right={<button onClick={() => dispatch({ type: 'pick-move', alg: picked.alg })} className="text-gray-400 hover:text-white text-sm">✕</button>}>
+      right={
+        <button onClick={() => dispatch({ type: 'pick-move', alg: picked.alg })} title="Close"
+          className="text-gray-400 hover:text-white rounded-full p-1 hover:bg-gray-700"><Icon name="close" size={14} /></button>
+      }>
       <KV items={[
         ['Search score', `${fmtCp(picked.cp)}${picked.exact === false ? ' (bound)' : ''}`],
-        ['Loss vs best', picked.delta === null ? '–' : fmtCp(-picked.delta), picked.delta === 0 ? 'text-green-300' : picked.delta > 120 ? 'text-red-300' : 'text-gray-100'],
+        ['Loss vs best', picked.delta === null ? '–' : fmtCp(-picked.delta), lossClass],
         ['Final rank', picked.rank === null ? '–' : `#${picked.rank + 1}`],
         ['Ordering rank', picked.orderRank === null ? '–' : `#${picked.orderRank + 1} (${fmtInt(picked.order)})`],
         ['Ordering tier', picked.why ? WHY_LABEL[picked.why] ?? picked.why : '–'],
@@ -40,4 +51,5 @@ const MoveView = ({ view, nav, dispatch }) => {
     </Panel>
   );
 };
+
 export default MoveView;

@@ -1,14 +1,19 @@
 /**
  * Game session — the state every page shares: the engine's gamestate block,
- * the client-side SAN history (the engine only sends a 20-move window), the
+ * the client-side move history (the engine only sends a 20-move window), the
  * init/restart lifecycle, and a busy flag.
  *
- * MULTI-ENGINE. Accepts either one engine or an array of engines. With an
- * array, engines[0] is the ARBITER: its gamestate block is the one rendered.
- * Every engine receives `ucinewgame` (and, from the page, every `makemove`),
- * so each keeps its own independent board and can detect threefold / 50-move
- * on its own. The engines are read through a ref so this hook's callbacks stay
- * stable even though `useEngine` returns a new object on every status change.
+ * HISTORY is kept twice, in lock-step:
+ *   moveHistory  SAN, for display
+ *   uciHistory   UCI, the replayable record (saved for Sandbox analysis of
+ *                human games — see sandbox/humanGames.js)
+ *
+ * MULTI-ENGINE. Accepts one engine or an array. With an array, engines[0] is
+ * the ARBITER: its gamestate block is the one rendered. Every engine receives
+ * `ucinewgame` (and, from the page, every `makemove`), so each keeps its own
+ * independent board and detects threefold / 50-move on its own. Engines are
+ * read through a ref so the callbacks stay stable even though `useEngine`
+ * returns a new object on every status change.
  *
  * Failure paths:
  *   - ucinewgame/gamestate rejects        → sessionError, stack dumped
@@ -16,38 +21,49 @@
  *   - no gamestate within INIT_WATCHDOG   → sessionError ("engine did not respond")
  * A page never sits on "Initializing" without a reason and a retry button.
  */
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { INITIAL_GAME_STATE, TIMEOUTS } from '../constants/gameConstants';
+import { getSettings } from '../config/settings';
 import { reportFailure } from '../utils/failure';
 
+/**
+ * The configured start FEN ('' = standard), read ONCE per page mount. Settings
+ * are locked during games, so a mid-page change cannot happen anyway; reading
+ * once makes that explicit.
+ */
+export function useStartFen() {
+  return useMemo(() => (getSettings().client.startFen || '').trim(), []);
+}
+
 export function useGameSession(engineOrEngines, options = {}) {
-  // ── Hooks: state ──
+  // ── State ──
   const [gameState, setGameState] = useState(INITIAL_GAME_STATE);
   const [moveHistory, setMoveHistory] = useState([]);
+  const [uciHistory, setUciHistory] = useState([]);
   const [initialized, setInitialized] = useState(false);
   const [busy, setBusy] = useState(false);
   const [sessionError, setSessionError] = useState(null);
 
-  // ── Hooks: refs ──
+  // ── Refs ──
   const mountedRef = useRef(true);
   const initStartedRef = useRef(false);
   const enginesRef = useRef([]);
   const startFenRef = useRef('');
 
+  // Written on every render, READ (never closed over) by the callbacks below.
   startFenRef.current = (options.startFen || '').trim();
-
-  // Updated on every render; read (never closed over) by the callbacks below.
   enginesRef.current = Array.isArray(engineOrEngines) ? engineOrEngines : [engineOrEngines];
 
+  // ── Derived ──
   // Primitive, so effects depending on it are stable.
-  const allConnected = enginesRef.current.length > 0 &&
-                       enginesRef.current.every(e => e && e.connected);
+  const allConnected = enginesRef.current.length > 0 && enginesRef.current.every(e => e && e.connected);
 
   // ── Callbacks: state mutation ──
+
   /**
-   * Merge an engine gamestate block. `appendHistory` must be false for undo
-   * (the returned block's lastmovesan is the move BEFORE the undone one and
-   * would otherwise be pushed twice).
+   * Merge an engine gamestate block. `appendHistory` must be false for undo:
+   * the returned block's lastmove is the move BEFORE the undone one and would
+   * otherwise be pushed twice.
    */
   const applyEngineState = useCallback((state, appendHistory = true) => {
     if (!state || typeof state.fen !== 'string') {
@@ -57,32 +73,31 @@ export function useGameSession(engineOrEngines, options = {}) {
     setGameState(prev => ({ ...prev, ...state }));
     if (appendHistory && typeof state.lastmovesan === 'string') {
       setMoveHistory(prev => [...prev, state.lastmovesan]);
+      setUciHistory(prev => [...prev, state.lastmove ?? '?']);
     }
     return true;
   }, []);
 
   const rollbackHistory = useCallback((count) => {
-    setMoveHistory(prev => prev.slice(0, Math.max(0, prev.length - count)));
+    const drop = (prev) => prev.slice(0, Math.max(0, prev.length - count));
+    setMoveHistory(drop);
+    setUciHistory(drop);
   }, []);
 
   const resign = useCallback((loserColor) => {
-    setGameState(prev => ({
-      ...prev,
-      status: 'resignation',
-      winner: loserColor === 'white' ? 'black' : 'white',
-    }));
+    setGameState(prev => ({ ...prev, status: 'resignation', winner: loserColor === 'white' ? 'black' : 'white' }));
   }, []);
 
   // ── Callbacks: lifecycle ──
+
   const startNewGame = useCallback(async () => {
     setSessionError(null);
     setBusy(true);
     try {
       const engines = enginesRef.current;
       if (engines.length === 0) throw new Error('no engines bound to session');
-
-      // Reset every instance. The server rotates the log game directory only
-      // once all of them have reset.
+      // Validate once on the arbiter, then reset every instance. The server
+      // rotates the log game directory only once all of them have reset.
       const fen = startFenRef.current;
       if (fen !== '') {
         const v = await engines[0].validateFen(fen);
@@ -92,15 +107,14 @@ export function useGameSession(engineOrEngines, options = {}) {
         await e.newGame();
         if (fen !== '') await e.setPosition(fen);
       }
-
       const state = await engines[0].getGameState();
       if (!state || typeof state.fen !== 'string') {
         throw new Error(`gamestate response missing fen: ${JSON.stringify(state)}`);
       }
       if (!mountedRef.current) return false;
-
       setGameState({ ...INITIAL_GAME_STATE, ...state });
       setMoveHistory([]);
+      setUciHistory([]);
       setInitialized(true);
       return true;
     } catch (err) {
@@ -119,6 +133,7 @@ export function useGameSession(engineOrEngines, options = {}) {
   }, [startNewGame]);
 
   // ── Effects ──
+
   useEffect(() => {
     mountedRef.current = true;
     return () => { mountedRef.current = false; };
@@ -133,7 +148,7 @@ export function useGameSession(engineOrEngines, options = {}) {
 
   // Watchdog: connected but no state after INIT_WATCHDOG → fail loud.
   useEffect(() => {
-    if (!allConnected || initialized || sessionError !== null) return;
+    if (!allConnected || initialized || sessionError !== null) return undefined;
     const timer = setTimeout(() => {
       if (!mountedRef.current) return;
       const err = new Error(`No gamestate within ${TIMEOUTS.INIT_WATCHDOG}ms of connecting`);
@@ -146,7 +161,7 @@ export function useGameSession(engineOrEngines, options = {}) {
   // ── Return ──
   return {
     gameState, setGameState,
-    moveHistory,
+    moveHistory, uciHistory,
     initialized, busy, setBusy, sessionError,
     startNewGame, retryInit,
     applyEngineState, rollbackHistory, resign,

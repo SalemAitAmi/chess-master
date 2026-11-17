@@ -21,16 +21,24 @@
  * whole log session (the engine refuses to change it once game 1 begins), so
  * ONE value applies to every game here; `sampleRate.source` says where it
  * came from and `warnings` lists any record that contradicts it.
+ *
+ * KIND. `session.kind` is 'engine' (logger output / replay export), 'human'
+ * (client match records, see humanGames.js) or 'mixed'. Human games are
+ * converted to the same record shape BEFORE this module runs, so nothing
+ * below branches on it; it exists for display and for future annotation.
  */
 import { pieceLetterAt } from './fenUtils';
+import { MATE_THRESHOLD } from '../constants/gameConstants';
 
-export const MATE_THRESHOLD = 49000;
+export { MATE_THRESHOLD };
 export const DEFAULT_SAMPLE_RATE = 256;
 export const COMPONENTS = ['material', 'centerControl', 'development', 'pawnStructure', 'kingSafety', 'initiative', 'mopUp'];
 export const COMPONENT_LABEL = {
   material: 'Material + PST', centerControl: 'Center control', development: 'Development',
   pawnStructure: 'Pawn structure', kingSafety: 'King safety', initiative: 'Initiative', mopUp: 'Mop-up',
 };
+
+/** Per-engine colours, assigned in sorted `eng` order. */
 const ACCENTS = [
   { text: 'text-cyan-300', hex: '#67e8f9', bg: 'bg-cyan-900' },
   { text: 'text-pink-300', hex: '#f9a8d4', bg: 'bg-pink-900' },
@@ -51,36 +59,44 @@ export function isSampledRecord(r) {
   return false;
 }
 
+/** Engine descriptor with every field present, so consumers never guard the shape. */
+function engineEntry(eng, src = {}) {
+  return {
+    eng, profile: src.profile ?? null, label: src.label ?? src.profile ?? null,
+    configHash: src.configHash ?? null, description: src.description ?? '',
+    overrides: src.overrides ?? {}, tt: src.tt ?? null, rev: src.rev ?? null,
+  };
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Session
 // ═══════════════════════════════════════════════════════════════════════════
+
 export function buildSession(raw) {
   const warnings = [...raw.warnings];
+
+  // Engines: instances.ndjson (last record per eng wins — it is the config in
+  // force at the end), then the replay index, then anything seen on a turn.
   const engines = new Map();
-  for (const r of raw.instances) {
-    if (!r.eng) continue;
-    engines.set(r.eng, {
-      eng: r.eng, profile: r.profile ?? null, label: r.label ?? r.profile ?? null,
-      configHash: r.configHash ?? null, description: r.description ?? '',
-      overrides: r.overrides ?? {}, tt: r.tt ?? null, rev: r.rev ?? null,
-    });
-  }
+  for (const r of raw.instances) if (r.eng) engines.set(r.eng, engineEntry(r.eng, r));
   if (raw.replayIndex && raw.replayIndex.engines) {
     for (const [eng, e] of Object.entries(raw.replayIndex.engines)) {
-      if (!engines.has(eng)) engines.set(eng, { eng, profile: e.profile ?? null, label: e.label ?? null, configHash: e.configHash ?? null, description: e.description ?? '', overrides: {}, tt: e.tt ?? null, rev: null });
+      if (!engines.has(eng)) engines.set(eng, engineEntry(eng, e));
     }
   }
+
   const all = [];
   for (const g of raw.games.values()) for (const r of g.records) all.push(r);
   const sampleRate = resolveSampleRate(raw, all, warnings);
+
   const games = [...raw.games.values()].sort((a, b) => a.index - b.index).map(g => buildGame(g, sampleRate.value));
-  for (const g of games) for (const t of g.turns) {
-    if (!engines.has(t.eng)) engines.set(t.eng, { eng: t.eng, profile: null, label: null, configHash: null, description: '', overrides: {}, tt: null, rev: null });
-  }
+  for (const g of games) for (const t of g.turns) if (!engines.has(t.eng)) engines.set(t.eng, engineEntry(t.eng));
+
   const accents = {};
   [...engines.keys()].sort().forEach((e, i) => { accents[e] = ACCENTS[i % ACCENTS.length]; });
+
   return {
-    name: raw.name, meta: raw.meta, sampleRate,
+    name: raw.name, meta: raw.meta, kind: raw.kind ?? 'engine', sampleRate,
     mask: raw.meta ? (raw.meta.mask ?? null) : null,
     engines, accents, games, warnings,
     turnCount: games.reduce((s, g) => s + g.turns.length, 0),
@@ -88,6 +104,7 @@ export function buildSession(raw) {
   };
 }
 
+/** session.json → game-begin record → replay index → gcd(ti) → engine default. */
 function resolveSampleRate(raw, all, warnings) {
   let out = null;
   if (raw.meta && num(raw.meta.sampleRate) !== null) {
@@ -120,6 +137,8 @@ function resolveSampleRate(raw, all, warnings) {
 // ═══════════════════════════════════════════════════════════════════════════
 // Game
 // ═══════════════════════════════════════════════════════════════════════════
+
+/** Replay export → the same flat record shape as the raw NDJSON. */
 function replayRecords(p) {
   const out = [];
   for (const t of p.turns || []) {
@@ -135,7 +154,12 @@ function buildGame(g, rate) {
   let records = g.records;
   if (g.replay) records = records.concat(replayRecords(g.replay));
   records.sort((a, b) => (num(a.seq) ?? 0) - (num(b.seq) ?? 0));
-  const game = { index: g.index, turns: [], system: [], orphans: 0, records: records.length, engines: [], lite: g.records.length === 0 && g.replay !== null };
+  const game = {
+    index: g.index, turns: [], system: [], orphans: 0, records: records.length, engines: [],
+    lite: g.records.length === 0 && g.replay !== null,
+  };
+
+  // Pass 1: turns, indexed by (eng, t).
   const byKey = new Map();
   for (const r of records) {
     if (r.cat === 'search' && r.label === 'turn' && num(r.t) !== null && r.t >= 0) {
@@ -148,18 +172,22 @@ function buildGame(g, rate) {
   }
   game.turns.sort((a, b) => a.seq - b.seq || a.t - b.t);
   game.turns.forEach((t, i) => { t.index = i; });
+
+  // Pass 2: every other record → the nearest turn (by seq) of the same (eng, t).
   for (const r of records) {
     if (r.cat === 'search' && r.label === 'turn') continue;
     if (r.cat === 'system') { game.system.push(r); continue; }
     const list = byKey.get(`${r.eng}|${r.t}`);
     if (!list) { game.orphans++; continue; }
-    let best = list[0], bd = Math.abs((num(r.seq) ?? 0) - best.seq);
+    const seq = num(r.seq) ?? 0;
+    let best = list[0], bd = Math.abs(seq - best.seq);
     for (let i = 1; i < list.length; i++) {
-      const d = Math.abs((num(r.seq) ?? 0) - list[i].seq);
+      const d = Math.abs(seq - list[i].seq);
       if (d < bd) { best = list[i]; bd = d; }
     }
     attach(best, r);
   }
+
   for (const t of game.turns) finalizeTurn(t, rate);
   deriveAcrossTurns(game.turns);
   game.engines = [...new Set(game.turns.map(t => t.eng))].sort();
@@ -169,6 +197,7 @@ function buildGame(g, rate) {
 // ═══════════════════════════════════════════════════════════════════════════
 // Turn
 // ═══════════════════════════════════════════════════════════════════════════
+
 function newTurn(rec, gameIndex) {
   const cp = num(rec.cp);
   return {
@@ -196,6 +225,7 @@ function newTurn(rec, gameIndex) {
   };
 }
 
+/** `root-scores.top` = "alg:score:exact|…". */
 function parseRootScores(top) {
   if (typeof top !== 'string' || !top) return [];
   return top.split('|').map(s => {
@@ -204,6 +234,7 @@ function parseRootScores(top) {
   }).filter(x => x.alg && Number.isFinite(x.score));
 }
 
+/** Route one record into the turn's buckets and widen the turn's seq window. */
 function attach(turn, r) {
   const seq = num(r.seq);
   if (seq !== null) {
@@ -252,6 +283,7 @@ function finalizeTurn(turn, rate) {
   turn.iterations.sort((a, b) => a.d - b.d || ((a.seq ?? 0) - (b.seq ?? 0)));
   let prevNodes = 0;
   for (const it of turn.iterations) {
+    // Line per depth: pv.ndjson if logged; else the turn PV for the final depth; else just the best move.
     it.pv = turn.pvLines.get(it.d) ?? (it.d === turn.depth && turn.pvMoves.length ? turn.pvMoves : (it.best ? [it.best] : []));
     it.nodesDelta = it.nodes !== null ? it.nodes - prevNodes : 0;
     if (it.nodes !== null) prevNodes = it.nodes;
@@ -273,11 +305,17 @@ function frame(kind, title, lo, hi, turn) {
   return { kind, title, lo, hi, samples: [], rootOrders: [], focus: null, it: null, d: null, index: 0, turnIndex: turn.index };
 }
 
+/**
+ * Split the turn window into Setup · Iteration d=1..N · Root policy · Result.
+ * Each iteration frame ends at its own `iteration` record; setup ends at the
+ * first root ordering. Returned in REVERSE chronology (navigation order).
+ */
 function buildFrames(turn) {
   const start = turn.window.start, end = turn.window.end;
   const firstRoot = turn.rootOrders.length > 0 ? num(turn.rootOrders[0].seq) : null;
   const setupEnd = firstRoot !== null ? firstRoot : start;
   const setup = frame('setup', 'Setup', start, setupEnd, turn);
+
   const iterFrames = [];
   let prevEnd = setupEnd;
   for (const it of turn.iterations) {
@@ -292,12 +330,14 @@ function buildFrames(turn) {
   const frames = [result, policy, ...iterFrames.slice().reverse(), setup];
   const chrono = [setup, ...iterFrames, policy, result];
 
+  // What each frame draws on the board.
   const searchBest = turn.rootScores.length > 0 ? turn.rootScores[0].alg : null;
   result.focus = { best: turn.best, pv: turn.pvMoves, alt: null };
   policy.focus = { best: turn.best, pv: turn.pvMoves, alt: searchBest !== null && searchBest !== turn.best ? searchBest : null };
   for (const f of iterFrames) f.focus = { best: f.it.best, pv: f.it.pv, alt: null };
   setup.focus = { best: turn.rootOrders.length > 0 ? (turn.rootOrders[0].top ?? null) : null, pv: [], alt: null };
 
+  // Place samples and root orderings into the frame whose window holds them.
   const locate = (seq) => {
     for (const f of chrono) if (seq >= f.lo && seq <= f.hi) return f;
     return seq < setup.lo ? setup : result;
@@ -314,21 +354,29 @@ function buildFrames(turn) {
   return frames;
 }
 
+/**
+ * One candidate per root move, merged from every source that mentions it:
+ * root-move records (full), root-scores (score only), iterations (best at
+ * depth d), the turn (played). Sorted by final rank, then score.
+ */
 function buildCandidates(turn) {
   const byAlg = new Map();
   const add = (alg, fields) => {
     if (!alg) return null;
     let c = byAlg.get(alg);
     if (!c) {
-      c = { alg, from: alg.slice(0, 2), to: alg.slice(2, 4), promoChar: alg.length > 4 ? alg[4] : null,
-            cp: null, exact: null, rank: null, nodes: null, order: null, why: null, piece: null, cap: null,
-            see: null, staticCp: null, breakdown: null, played: false, bestAtDepths: [], source: null,
-            delta: null, orderRank: null, nodeShare: null };
+      c = {
+        alg, from: alg.slice(0, 2), to: alg.slice(2, 4), promoChar: alg.length > 4 ? alg[4] : null,
+        cp: null, exact: null, rank: null, nodes: null, order: null, why: null, piece: null, cap: null,
+        see: null, staticCp: null, breakdown: null, played: false, bestAtDepths: [], source: null,
+        delta: null, orderRank: null, nodeShare: null,
+      };
       byAlg.set(alg, c);
     }
     Object.assign(c, fields);
     return c;
   };
+
   for (const rm of turn.rootMoves) {
     const bd = {};
     let has = false;
@@ -357,11 +405,14 @@ function buildCandidates(turn) {
     c.played = true;
     if (c.cp === null) c.cp = turn.cp;
   }
+
+  // Derived per-candidate values: loss vs best, piece letter, share of effort.
   const list = [...byAlg.values()];
-  let topCp = null;
-  for (const c of list) if (c.cp !== null && (topCp === null || c.cp > topCp)) topCp = c.cp;
-  let maxNodes = 0;
-  for (const c of list) if (c.nodes !== null && c.nodes > maxNodes) maxNodes = c.nodes;
+  let topCp = null, maxNodes = 0;
+  for (const c of list) {
+    if (c.cp !== null && (topCp === null || c.cp > topCp)) topCp = c.cp;
+    if (c.nodes !== null && c.nodes > maxNodes) maxNodes = c.nodes;
+  }
   for (const c of list) {
     c.delta = (c.cp !== null && topCp !== null) ? topCp - c.cp : null;
     if (c.piece === null && turn.fen) c.piece = pieceLetterAt(turn.fen, c.from);
@@ -417,6 +468,7 @@ function deriveAcrossTurns(turns) {
       t.cpNextOwn = nextEff;
       t.evalDrop = (cpEff !== null && nextEff !== null) ? cpEff - nextEff : null;
       t.wpLoss = (cpEff !== null && nextEff !== null) ? Math.max(0, winProb(cpEff) - winProb(nextEff)) : null;
+      // Shuffle: this move exactly reverses the same engine's previous move.
       t.shuffle = !!(p && p.best && t.best && t.best.length >= 4 && p.best.length >= 4 &&
                      t.best.slice(0, 4) === p.best.slice(2, 4) + p.best.slice(0, 2));
     }

@@ -1,71 +1,86 @@
 /**
  * Chess utilities for UI rendering and coordinate plumbing.
- * All game logic is handled by the engine.
+ * All game LOGIC is handled by the engine; nothing here decides legality.
+ *
+ * Coordinates: UI (row, col) has row 0 = rank 8 (top of an unflipped board),
+ * col 0 = file a. Square names are UCI ("e4").
  */
-
 import { PIECES } from '../constants/gameConstants.js';
 import { indexToSquare, rowColToIndex, squareToIndex, indexToRowCol } from './bitboard.js';
 
-const FEN_PIECE_MAP = {
-  'k': PIECES.KING, 'q': PIECES.QUEEN, 'r': PIECES.ROOK,
-  'b': PIECES.BISHOP, 'n': PIECES.KNIGHT, 'p': PIECES.PAWN
+/** FEN piece letter (lower case) → PIECES type. */
+export const PIECE_FROM_CHAR = {
+  k: PIECES.KING, q: PIECES.QUEEN, r: PIECES.ROOK,
+  b: PIECES.BISHOP, n: PIECES.KNIGHT, p: PIECES.PAWN,
 };
 
-/** Create empty 8x8 board */
+// ═══════════════════════════════════════════════════════════════════════════
+// Colours / results
+// ═══════════════════════════════════════════════════════════════════════════
+
+export const otherColor = (color) => (color === 'white' ? 'black' : 'white');
+
+/** 'white' | 'black' when the gamestate names a winner; null while ongoing or drawn. */
+export function winnerColor(gameState) {
+  const w = gameState.winner;
+  return w === 'white' || w === 'black' ? w : null;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Board parsing
+// ═══════════════════════════════════════════════════════════════════════════
+
 export function createEmptyBoard() {
-  return Array(8).fill(null).map(() => Array(8).fill(null));
+  return Array.from({ length: 8 }, () => Array(8).fill(null));
 }
 
 /**
- * Parse FEN string to get board position for rendering. Always returns a full
- * 8x8 array (truncated ranks are padded), so callers index without guards.
- * @param {string} fen
- * @returns {Array} 8x8 array of {type, color} or null
+ * FEN placement → 8×8 array of {type, color} | null. Always returns a full
+ * board (truncated ranks are padded), so callers index without guards.
  */
 export function parseFenToBoard(fen) {
   if (!fen) return createEmptyBoard();
-
+  const rows = fen.split(' ')[0].split('/');
   const board = [];
-  const position = fen.split(' ')[0];
-  const rows = position.split('/');
-
   for (let row = 0; row < 8; row++) {
     board[row] = [];
     let col = 0;
-    const rankStr = rows[row] !== undefined ? rows[row] : '8';
-
-    for (const char of rankStr) {
+    for (const char of rows[row] ?? '8') {
       if (char >= '1' && char <= '8') {
-        const empty = parseInt(char, 10);
-        for (let i = 0; i < empty && col < 8; i++) board[row][col++] = null;
+        for (let i = 0; i < Number(char) && col < 8; i++) board[row][col++] = null;
       } else if (col < 8) {
-        const isWhite = char === char.toUpperCase();
-        const pieceType = FEN_PIECE_MAP[char.toLowerCase()];
-        board[row][col++] = pieceType !== undefined
-          ? { type: pieceType, color: isWhite ? 'white' : 'black' }
+        const type = PIECE_FROM_CHAR[char.toLowerCase()];
+        board[row][col++] = type !== undefined
+          ? { type, color: char === char.toUpperCase() ? 'white' : 'black' }
           : null;
       }
     }
     while (col < 8) board[row][col++] = null;
   }
-
   return board;
 }
 
-/** UI (row, col) → UCI square name, e.g. (6, 4) → "e2". */
+// ═══════════════════════════════════════════════════════════════════════════
+// Coordinates
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** UI (row, col) → UCI square, e.g. (6, 4) → "e2". */
 export function squareFromRowCol(row, col) {
   return indexToSquare(rowColToIndex(row, col));
 }
 
-/**
- * `lastmove` from the engine ("e2e4") → { from:[r,c], to:[r,c] } or null.
- */
+/** UCI square → [row, col], or null when malformed. */
+export function squareToRowCol(square) {
+  const index = squareToIndex(square);
+  return index === -1 ? null : indexToRowCol(index);
+}
+
+/** Engine `lastmove` ("e2e4") → { from:[r,c], to:[r,c] } or null. */
 export function lastMoveToCoords(lastmove) {
   if (typeof lastmove !== 'string' || lastmove.length < 4) return null;
-  const from = squareToIndex(lastmove.slice(0, 2));
-  const to = squareToIndex(lastmove.slice(2, 4));
-  if (from === -1 || to === -1) return null;
-  return { from: indexToRowCol(from), to: indexToRowCol(to) };
+  const from = squareToRowCol(lastmove.slice(0, 2));
+  const to = squareToRowCol(lastmove.slice(2, 4));
+  return from && to ? { from, to } : null;
 }
 
 /**
@@ -74,10 +89,6 @@ export function lastMoveToCoords(lastmove) {
  */
 export function selectionToBoard(selected, legalMoves) {
   if (!selected) return null;
-  const moves = [];
-  for (const m of legalMoves) {
-    const toIdx = squareToIndex(m.slice(2, 4));
-    if (toIdx !== -1) moves.push(indexToRowCol(toIdx));
-  }
+  const moves = legalMoves.map(m => squareToRowCol(m.slice(2, 4))).filter(Boolean);
   return { row: selected[0], col: selected[1], moves };
 }

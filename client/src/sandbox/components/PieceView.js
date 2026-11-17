@@ -1,9 +1,8 @@
-import Panel from './Panel';
+import { Panel } from '../../components/primitives';
+import { PIECE_LETTERS, PIECE_NAMES } from '../../constants/gameConstants';
 import { pieceAt } from '../fenUtils';
-import { PIECE_NAME, fmtCp, fmtInt, WHY_LABEL } from '../format';
+import { fmtCp, fmtInt, WHY_LABEL } from '../format';
 import { scoreColor } from '../view';
-
-const LETTER = ['K', 'Q', 'R', 'B', 'N', 'P'];
 
 /**
  * Everything logged about the piece on the selected square for this turn:
@@ -14,9 +13,13 @@ const PieceView = ({ view, nav, dispatch }) => {
   const { turn, selectedCandidates, line } = view;
   const sq = nav.selected;
   if (!turn || !sq) return null;
+
+  // ── Derived ──
   const piece = pieceAt(turn.fen, sq);
-  const name = piece ? `${piece.color} ${PIECE_NAME[LETTER[piece.type]] ?? '?'}` : 'empty square';
+  const name = piece ? `${piece.color} ${PIECE_NAMES[PIECE_LETTERS[piece.type]] ?? '?'}` : 'empty square';
   const inLine = line.map((m, i) => (m.slice(0, 2) === sq ? i + 1 : null)).filter(Boolean);
+
+  // ── Render ──
   return (
     <Panel title={`${name} on ${sq}`} sub={`${selectedCandidates.length} logged root move(s) · click a row or its destination square`}>
       {selectedCandidates.length === 0 ? (
@@ -44,4 +47,5 @@ const PieceView = ({ view, nav, dispatch }) => {
     </Panel>
   );
 };
+
 export default PieceView;

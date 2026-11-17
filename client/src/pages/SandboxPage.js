@@ -12,17 +12,28 @@
  *
  * No engine connection is used: everything comes from the loaded records, and
  * positions along a line are rendered (not validated) from the logged FEN.
+ *
+ * LAYOUT (xl): one viewport tall, nothing scrolls the page.
+ *   header (Main Menu · Load New Session chip) → debugger bar →
+ *   [session / search profile / trace] [board + line] [turn / piece / move] →
+ *   timeline.
+ * The board column's basis is the height left after the chrome (≈25rem), so
+ * the board is as large as the height allows and side columns take the rest.
  */
 import { useState, useCallback, useMemo, useRef, useEffect } from 'react';
 import ChessBoard from '../components/ChessBoard';
+import Icon from '../components/Icon';
+import { PAGE_BG, PageHeader } from '../components/GamePageLayout';
+import { Chip, Panel } from '../components/primitives';
 import { loadSessionFiles } from '../sandbox/ndjson';
+import { preprocessMatchRecords } from '../sandbox/humanGames';
 import { buildSession } from '../sandbox/model';
 import { initialNav, navReduce } from '../sandbox/nav';
 import { deriveView } from '../sandbox/view';
-import { rcToSquare } from '../sandbox/fenUtils';
-import { lastMoveToCoords } from '../utils/chessUtils';
+import { lastMoveToCoords, squareFromRowCol } from '../utils/chessUtils';
 import { reportFailure } from '../utils/failure';
 import SessionPanel from '../sandbox/components/SessionPanel';
+import SessionLoader, { LoadSessionModal } from '../sandbox/components/SessionLoader';
 import DebuggerControls from '../sandbox/components/DebuggerControls';
 import FrameList from '../sandbox/components/FrameList';
 import TurnSummary from '../sandbox/components/TurnSummary';
@@ -32,56 +43,127 @@ import LinePanel from '../sandbox/components/LinePanel';
 import SearchProfile from '../sandbox/components/SearchProfile';
 import Timeline from '../sandbox/components/Timeline';
 
-const PAGE_BG = 'min-h-screen bg-gradient-to-br from-gray-800 to-gray-900 font-sans';
-const KEYS = { ArrowRight: 'step-over', ArrowLeft: 'step-back', ArrowDown: 'step-into', ArrowUp: 'step-out', Home: 'first', End: 'last' };
+// ── Keyboard ──
+/** Navigation keys (default browser action suppressed: they would scroll). */
+const NAV_KEYS = {
+  ArrowRight: { type: 'step-over' }, ArrowLeft: { type: 'step-back' },
+  ArrowDown: { type: 'step-into' }, ArrowUp: { type: 'step-out' },
+  Home: { type: 'first' }, End: { type: 'last' },
+};
+/** View toggles. */
+const TOGGLE_KEYS = {
+  Escape: { type: 'clear-selection' },
+  a: { type: 'toggle-after' },
+  f: { type: 'toggle-flip' },
+  ']': { type: 'pv-step', dir: 1 },
+  '[': { type: 'pv-step', dir: -1 },
+};
+const TYPING_TAGS = new Set(['INPUT', 'SELECT', 'TEXTAREA']);
+
+// ── Layout ──
+const SIDE = 'w-full shrink-0 xl:w-auto xl:flex-1 xl:min-h-0 xl:overflow-y-auto flex flex-col gap-3 move-history-scroll';
+const LEFT_COLUMN = `${SIDE} order-2 xl:order-1 xl:min-w-[18rem] xl:max-w-[28rem]`;
+const RIGHT_COLUMN = `${SIDE} order-3 xl:min-w-[20rem] xl:max-w-[34rem]`;
+/** Basis = board size: height when stacked, width at xl (see header). */
+const BOARD_COLUMN = 'order-1 xl:order-2 flex flex-col gap-2 min-w-0 shrink-0 ' +
+                     'basis-[calc(100vh_-_12rem)] xl:basis-[calc(100vh_-_25rem)] xl:shrink xl:min-h-0';
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Empty state
+// ═══════════════════════════════════════════════════════════════════════════
+
+const EmptyState = ({ onLoad, loading, error }) => (
+  <main className="flex-1 min-h-0 overflow-y-auto flex items-start justify-center px-4 pb-4 move-history-scroll">
+    <div className="w-full max-w-2xl space-y-4 pt-4">
+      {/* Loader */}
+      <Panel size="md" title="Open a log session">
+        <SessionLoader onLoad={onLoad} loading={loading} error={error} />
+      </Panel>
+
+      {/* Help */}
+      <Panel size="md" title="How it works">
+        <div className="text-sm text-gray-300 space-y-2">
+          <p>
+            Open <span className="font-mono">engine/logs/&lt;session&gt;</span> (the folder with <span className="font-mono">game-N/</span> directories),
+            or an <span className="font-mono">analysis/replay</span> export from <span className="font-mono">analyze_logs.py --export-replay</span> (lighter: no sampled traces).
+          </p>
+          <p className="text-gray-400">Keys: ← → step · ↓ step into · ↑ step out · Home/End · a after · f flip · [ ] walk the line · Esc clear.</p>
+          <p className="text-gray-500 text-xs">
+            The engine is not contacted. Sampled traces are reconciled with the session's sample rate
+            (from <span className="font-mono">session.json</span>, or inferred from <span className="font-mono">ti</span> fields).
+          </p>
+        </div>
+      </Panel>
+    </div>
+  </main>
+);
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Page
+// ═══════════════════════════════════════════════════════════════════════════
 
 const SandboxPage = ({ onBackToMenu }) => {
+  // ── State ──
   const [session, setSession] = useState(null);
-  const sessionRef = useRef(null);
+  const [nav, setNav] = useState(initialNav);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [nav, setNav] = useState(initialNav);
-  const dispatch = useCallback((a) => setNav(prev => navReduce(prev, a, sessionRef.current)), []);
+  const [loaderOpen, setLoaderOpen] = useState(false);
 
+  // ── Refs ──
+  // navReduce needs the session, but dispatch must keep a stable identity
+  // (it is bound to the keyboard handler and passed to every panel), so the
+  // reducer reads the session through a ref instead of closing over it.
+  const sessionRef = useRef(null);
+
+  // ── Derived ──
+  const view = useMemo(() => (session ? deriveView(session, nav) : null), [session, nav]);
+  const turn = view ? view.turn : null;
+  const subtitle = session
+    ? `${session.name} · ${session.games.length} game(s) · ${session.turnCount} decisions`
+    : 'replay debugger — load a log session';
+
+  // ── Callbacks ──
+
+  const dispatch = useCallback((action) => setNav(prev => navReduce(prev, action, sessionRef.current)), []);
+
+  /** @returns {Promise<boolean>} true when a new session replaced the old one */
   const load = useCallback(async (files) => {
-    if (!files || files.length === 0) return;
-    setLoading(true); setError(null);
+    if (!files || files.length === 0) return false;
+    setLoading(true);
+    setError(null);
     try {
       const raw = await loadSessionFiles(files);
+      // Human games arrive as bare move lists; bring them to the same raw shape.
+      // TODO(human-analysis): pass an engine-backed analyzer once the engine
+      // can return full root rankings (see sandbox/humanGames.js).
+      if (raw.matchRecords.length > 0) await preprocessMatchRecords(raw);
       const model = buildSession(raw);
       sessionRef.current = model;
       setSession(model);
       setNav(initialNav());
+      return true;
     } catch (err) {
       reportFailure('SandboxPage.load', err);
       setError(err.message);
+      return false;
     } finally {
       setLoading(false);
     }
   }, []);
 
-  const view = useMemo(() => (session ? deriveView(session, nav) : null), [session, nav]);
+  const openLoader = useCallback(() => { setError(null); setLoaderOpen(true); }, []);
+  const closeLoader = useCallback(() => setLoaderOpen(false), []);
+  const loadFromModal = useCallback(async (files) => { if (await load(files)) setLoaderOpen(false); }, [load]);
 
-  useEffect(() => {
-    const onKey = (e) => {
-      const tag = e.target && e.target.tagName;
-      if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA') return;
-      if (!sessionRef.current) return;
-      const a = KEYS[e.key];
-      if (a) { e.preventDefault(); dispatch({ type: a }); return; }
-      if (e.key === 'Escape') dispatch({ type: 'clear-selection' });
-      else if (e.key === 'a') dispatch({ type: 'toggle-after' });
-      else if (e.key === 'f') dispatch({ type: 'toggle-flip' });
-      else if (e.key === ']') dispatch({ type: 'pv-step', dir: 1 });
-      else if (e.key === '[') dispatch({ type: 'pv-step', dir: -1 });
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [dispatch]);
-
+  /**
+   * Board clicks, in priority order: a destination of the selected piece
+   * opens that move; a square with candidates selects it; outside the Result
+   * lens any destination dot opens its move; anything else clears.
+   */
   const onSquareClick = useCallback((row, col) => {
     if (!view || !view.turn) return;
-    const sq = rcToSquare(row, col);
+    const sq = squareFromRowCol(row, col);
     const cands = view.turn.candidates;
     if (nav.selected) {
       const hit = cands.find(c => c.from === nav.selected && c.to === sq);
@@ -93,84 +175,96 @@ const SandboxPage = ({ onBackToMenu }) => {
     dispatch({ type: 'clear-selection' });
   }, [view, nav.selected, nav.lens, dispatch]);
 
-  const header = (
-    <header className="flex items-center justify-between px-4 pt-4 pb-2 gap-4">
-      <div className="w-32 flex-shrink-0">
-        <button onClick={onBackToMenu}
-          className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 transition-all duration-200 shadow-md text-sm font-semibold">
-          ← Main Menu
-        </button>
-      </div>
-      <div className="text-center flex-1 min-w-0">
-        <h1 className="text-3xl md:text-4xl font-bold text-white leading-tight truncate">🧪 Sandbox</h1>
-        <div className="text-gray-400 text-sm mt-1 truncate">
-          {session ? `${session.name} · ${session.games.length} game(s) · ${session.turnCount} decisions` : 'replay debugger — load a log session'}
-        </div>
-      </div>
-      <div className="w-32 flex-shrink-0" aria-hidden="true" />
-    </header>
-  );
+  // ── Effects ──
 
-  if (!session || !view) {
-    return (
-      <div className={`${PAGE_BG} flex flex-col`}>
-        {header}
-        <main className="flex-1 flex items-start justify-center px-4 pb-4">
-          <div className="w-full max-w-2xl space-y-4">
-            <SessionPanel session={null} nav={nav} dispatch={dispatch} onLoad={load} loading={loading} error={error} />
-            <div className="bg-gray-800 rounded-lg p-4 shadow-lg text-sm text-gray-300 space-y-2">
-              <p>Open <span className="font-mono">engine/logs/&lt;session&gt;</span> (the folder with <span className="font-mono">game-N/</span> directories), or a <span className="font-mono">analysis/replay</span> export from <span className="font-mono">analyze_logs.py --export-replay</span> (lighter: no sampled traces).</p>
-              <p className="text-gray-400">Keys: ← → step · ↓ step into · ↑ step out · Home/End · a after · f flip · [ ] walk the line · Esc clear.</p>
-              <p className="text-gray-500 text-xs">The engine is not contacted. Sampled traces are reconciled with the session's sample rate (from <span className="font-mono">session.json</span>, or inferred from <span className="font-mono">ti</span> fields).</p>
-            </div>
-          </div>
-        </main>
-      </div>
-    );
-  }
+  // Debugger keys. Quiet while typing and while ANY dialog (Settings, Load)
+  // is open, so Escape closes the dialog instead of clearing the selection.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (!sessionRef.current) return;
+      if (e.target && TYPING_TAGS.has(e.target.tagName)) return;
+      if (document.querySelector('[role="dialog"]')) return;
+      const navAction = NAV_KEYS[e.key];
+      if (navAction) { e.preventDefault(); dispatch(navAction); return; }
+      const toggle = TOGGLE_KEYS[e.key];
+      if (toggle) dispatch(toggle);
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [dispatch]);
 
-  const { turn } = view;
+  // ── Render ──
+  const boardCaption = turn && [
+    view.afterApplied ? `after ${view.lastMove}`
+      : nav.pvPly > 0 ? `line ply ${nav.pvPly}: ${view.lastMove}`
+      : `root position · ${view.sideToMove} to move`,
+    nav.selected && `${nav.selected} selected`,
+    nav.pick,
+  ].filter(Boolean).join(' · ');
+
   return (
-    <div className={`${PAGE_BG} relative flex flex-col`}>
-      {header}
-      <div className="px-4 pb-2">
-        <DebuggerControls session={session} nav={nav} dispatch={dispatch} view={view} />
-      </div>
-      <main className="flex-1 min-h-0 px-4 pb-2 flex justify-center">
-        <div className="w-full max-w-[1600px] flex flex-wrap xl:flex-nowrap gap-4 items-start justify-center">
-          <aside className="w-80 flex flex-col gap-4 order-2 xl:order-1">
-            <SessionPanel session={session} nav={nav} dispatch={dispatch} onLoad={load} loading={loading} error={error} />
-            <FrameList view={view} nav={nav} dispatch={dispatch} session={session} />
-          </aside>
-          <section className="flex flex-col items-center gap-3 order-1 xl:order-2 flex-shrink-0">
-            {turn ? (
-              <>
-                <div className="text-xs text-gray-400 font-mono">
-                  {view.afterApplied ? `after ${view.lastMove}` : nav.pvPly > 0 ? `line ply ${nav.pvPly}: ${view.lastMove}` : `root position · ${view.sideToMove} to move`}
-                  {nav.selected && ` · ${nav.selected} selected`}
-                  {nav.pick && ` · ${nav.pick}`}
-                </div>
-                <ChessBoard fen={view.fen} selected={null} legalMoves={[]} lastMove={lastMoveToCoords(view.lastMove)}
-                  onSquareClick={onSquareClick} flipped={nav.flip} disabled={false} marks={view.marks} arrows={view.arrows} />
-                <div className="w-full max-w-[40rem] space-y-3">
+    <div className={`${PAGE_BG} relative h-screen flex flex-col overflow-hidden`}>
+      {/* ── HEADER: navigation · Load New Session chip · title ── */}
+      <PageHeader title="🧪 Sandbox" subtitle={subtitle} onBackToMenu={onBackToMenu}
+        actions={session && (
+          <Chip icon={<Icon name="folder" size={14} />} onClick={openLoader} title="Replace the loaded session">
+            Load New Session
+          </Chip>
+        )} />
+
+      {!session ? (
+        <EmptyState onLoad={load} loading={loading} error={error} />
+      ) : (
+        <>
+          {/* ── DEBUGGER CONTROLS ── */}
+          <div className="flex-none px-4 pb-2">
+            <DebuggerControls nav={nav} dispatch={dispatch} view={view} />
+          </div>
+
+          {/* ── MAIN ── */}
+          <main className="flex-1 min-h-0 px-4 pb-2 flex flex-col xl:flex-row xl:justify-center gap-3 overflow-y-auto xl:overflow-hidden move-history-scroll">
+            {/* LEFT: what was loaded, how the search evolved, the decision trace */}
+            <aside className={LEFT_COLUMN}>
+              <SessionPanel session={session} nav={nav} dispatch={dispatch} />
+              {turn && <SearchProfile turn={turn} nav={nav} view={view} dispatch={dispatch} />}
+              <FrameList view={view} nav={nav} dispatch={dispatch} session={session} />
+            </aside>
+
+            {/* CENTER: board (fills) + the line it is showing */}
+            <section className={BOARD_COLUMN}>
+              {turn ? (
+                <>
+                  <div className="flex-none text-xs text-gray-400 font-mono text-center truncate">{boardCaption}</div>
+                  <div className="flex w-full flex-1 min-h-0">
+                    <ChessBoard fen={view.fen} lastMove={lastMoveToCoords(view.lastMove)} onSquareClick={onSquareClick}
+                      flipped={nav.flip} marks={view.marks} arrows={view.arrows} />
+                  </div>
                   <LinePanel view={view} nav={nav} dispatch={dispatch} />
-                  <SearchProfile turn={turn} nav={nav} view={view} dispatch={dispatch} />
+                </>
+              ) : (
+                <div className="text-gray-400 p-8 text-center">
+                  This game has no <span className="font-mono">turn</span> records (SEARCH logging was off).
                 </div>
-              </>
-            ) : (
-              <div className="text-gray-400 p-8">This game has no <span className="font-mono">turn</span> records (SEARCH logging was off).</div>
-            )}
-          </section>
-          <aside className="w-96 flex flex-col gap-4 order-3">
-            <TurnSummary view={view} session={session} />
-            <PieceView view={view} nav={nav} dispatch={dispatch} />
-            <MoveView view={view} nav={nav} dispatch={dispatch} />
-          </aside>
-        </div>
-      </main>
-      <footer className="px-4 pb-4">
-        <Timeline game={view.game} nav={nav} dispatch={dispatch} accents={session.accents} />
-      </footer>
+              )}
+            </section>
+
+            {/* RIGHT: the focused decision, piece and move */}
+            <aside className={RIGHT_COLUMN}>
+              <TurnSummary view={view} session={session} />
+              <PieceView view={view} nav={nav} dispatch={dispatch} />
+              <MoveView view={view} dispatch={dispatch} />
+            </aside>
+          </main>
+
+          {/* ── TIMELINE ── */}
+          <footer className="flex-none px-4 pb-3">
+            <Timeline game={view.game} nav={nav} dispatch={dispatch} accents={session.accents} />
+          </footer>
+        </>
+      )}
+
+      {/* ── OVERLAYS ── */}
+      <LoadSessionModal open={loaderOpen} onClose={closeLoader} onLoad={loadFromModal} loading={loading} error={error} />
     </div>
   );
 };

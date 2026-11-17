@@ -8,11 +8,15 @@
  *   …/replay/game-N.json                analyze_logs.py --export-replay (LITE: turns +
  *                                       iterations + root moves, no sampled traces)
  *   …/replay/index.json                 replay index (engines, sampleRate)
+ *   *.match.json                        client-saved human game (move list only;
+ *                                       see humanGames.js — preprocessed before buildSession)
  * boot/, session.log and analysis tables are ignored.
  *
  * Nothing here interprets chess or search. It turns text into records tagged
  * with { cat, label } and hands them to model.js.
  */
+import { MATCH_RECORD_SUFFIX, isMatchRecord } from './humanGames';
+
 const CATS = new Set(['search', 'eval', 'order', 'tt', 'uci', 'book', 'heuristics', 'moves',
                       'pv', 'time', 'stage', 'system', 'smp']);
 
@@ -26,24 +30,31 @@ function normalise(inputs) {
   });
 }
 
+const categoryOf = (name) => {
+  const cat = name.slice(0, -'.ndjson'.length);
+  return CATS.has(cat) ? cat : null;
+};
+
 export function classify(path) {
   const parts = path.split('/');
   const name = parts[parts.length - 1];
   if (parts.includes('boot')) return null;
   if (name === 'session.json') return { kind: 'meta' };
   if (name === 'instances.ndjson') return { kind: 'instances' };
+  if (name.endsWith(MATCH_RECORD_SUFFIX)) return { kind: 'match-record' };
+
   const gm = path.match(/(?:^|\/)game-(\d+)\//);
   if (gm && name.endsWith('.ndjson')) {
-    const cat = name.slice(0, -'.ndjson'.length);
-    return CATS.has(cat) ? { kind: 'ndjson', game: parseInt(gm[1], 10), cat } : null;
+    const cat = categoryOf(name);
+    return cat ? { kind: 'ndjson', game: parseInt(gm[1], 10), cat } : null;
   }
   const rm = name.match(/^game-(\d+)\.json$/);
   if (rm) return { kind: 'replay', game: parseInt(rm[1], 10) };
   if (name === 'index.json') return { kind: 'replay-index' };
   if (name.endsWith('.ndjson')) {
     // Loose file without a game directory: treat as game 1.
-    const cat = name.slice(0, -'.ndjson'.length);
-    return CATS.has(cat) ? { kind: 'ndjson', game: 1, cat } : null;
+    const cat = categoryOf(name);
+    return cat ? { kind: 'ndjson', game: 1, cat } : null;
   }
   return null;
 }
@@ -66,12 +77,15 @@ function gameSlot(raw, idx) {
 }
 
 /**
- * @returns raw session: { name, meta, instances, replayIndex, games: Map<idx, {records, replay}>, warnings, fileCount }
+ * @returns raw session: { name, meta, instances, replayIndex, games: Map<idx, {records, replay}>,
+ *                         matchRecords, warnings, fileCount }
  */
 export async function loadSessionFiles(inputs) {
-  const items = normalise(inputs);
-  const raw = { name: null, meta: null, instances: [], replayIndex: null, games: new Map(), warnings: [], fileCount: 0 };
-  for (const { file, path } of items) {
+  const raw = {
+    name: null, meta: null, instances: [], replayIndex: null, games: new Map(),
+    matchRecords: [], warnings: [], fileCount: 0,
+  };
+  for (const { file, path } of normalise(inputs)) {
     const c = classify(path);
     if (c === null) continue;
     raw.fileCount++;
@@ -104,10 +118,19 @@ export async function loadSessionFiles(inputs) {
       case 'replay-index':
         try { raw.replayIndex = JSON.parse(text); } catch { /* optional */ }
         break;
+      case 'match-record': {
+        let rec = null;
+        try { rec = JSON.parse(text); } catch { /* reported below */ }
+        if (isMatchRecord(rec)) raw.matchRecords.push(rec);
+        else raw.warnings.push(`${path}: not a valid match record`);
+        break;
+      }
       default: break;
     }
   }
-  if (raw.games.size === 0) throw new Error('No game-N/*.ndjson or replay game-N.json files found in the selection');
+  if (raw.games.size === 0 && raw.matchRecords.length === 0) {
+    throw new Error('No game-N/*.ndjson, replay game-N.json or *.match.json files found in the selection');
+  }
   return raw;
 }
 
